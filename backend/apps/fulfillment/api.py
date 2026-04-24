@@ -112,7 +112,12 @@ def fulfillment_orders(request):
 
 @require_GET
 def delivery_orders(request):
-    rows = DeliveryOrder.objects.order_by("-created_at")[:100]
+    qs = DeliveryOrder.objects.order_by("-created_at")
+    if status := request.GET.get("status"):
+        qs = qs.filter(status=status)
+    if delivery_mode := request.GET.get("delivery_mode"):
+        qs = qs.filter(delivery_mode__icontains=delivery_mode)
+    rows = qs[:100]
     return json_response(
         {
             "results": [
@@ -121,6 +126,7 @@ def delivery_orders(request):
                     "delivery_number": row.delivery_number,
                     "status": row.status,
                     "delivery_mode": row.delivery_mode,
+                    "warehouse_ref": row.warehouse_ref,
                     "planned_date": row.planned_date.isoformat() if row.planned_date else None,
                 }
                 for row in rows

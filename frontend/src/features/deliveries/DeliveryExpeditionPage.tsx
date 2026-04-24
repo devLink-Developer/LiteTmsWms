@@ -399,12 +399,12 @@ export function DeliveryExpeditionPage() {
       reference: "Pendiente de confirmacion",
       lines: activeOrder.lines.map((line) => ({
         lineId: line.id,
-        qty: line.maxDispatchableQty,
+        qty: 0,
       })),
     };
     setDraftState({ orderId: activeOrder.id, delivery: draft });
     setActiveDeliveryId(draft.id);
-    setMessage({ tone: "info", text: "Completa cantidades y confirma la entrega para reservar stock." });
+    setMessage({ tone: "info", text: "Completa cantidades manualmente o usa Entregar todo para cargar el maximo entregable." });
   }
 
   function updateDraftDelivery(updater: (delivery: DeliveryDraft) => DeliveryDraft) {
@@ -432,6 +432,22 @@ export function DeliveryExpeditionPage() {
       return;
     }
     updateDraftDelivery((delivery) => ({ ...delivery, [field]: value }));
+  }
+
+  function fillActiveDeliveryWithMaxQty() {
+    if (!canEditActiveDelivery || !activeOrder || !activeDelivery || activeDelivery.status !== "draft") {
+      return;
+    }
+    updateDraftDelivery((delivery) => ({
+      ...delivery,
+      lines: delivery.lines.map((deliveryLine) => {
+        const orderLine = activeOrder.lines.find((line) => line.id === deliveryLine.lineId);
+        return {
+          ...deliveryLine,
+          qty: orderLine ? getMaxDispatchableQty(orderLine, delivery) : 0,
+        };
+      }),
+    }));
   }
 
   async function persistDraftDelivery(delivery: DeliveryDraft) {
@@ -576,6 +592,14 @@ export function DeliveryExpeditionPage() {
       <button
         type="button"
         disabled={!activeDelivery || activeDelivery.status !== "draft" || processing}
+        onClick={fillActiveDeliveryWithMaxQty}
+        className="min-h-10 rounded border border-borderSoft bg-white px-3 text-[12px] font-semibold text-night transition hover:border-primary hover:text-primaryHover focus:outline-none focus:ring-2 focus:ring-primary/20 disabled:bg-softStart"
+      >
+        Entregar todo
+      </button>
+      <button
+        type="button"
+        disabled={!activeDelivery || activeDelivery.status !== "draft" || activeDeliveryQty <= 0 || processing}
         onClick={() => void confirmActiveDelivery()}
         className="min-h-10 rounded border border-primary/30 bg-primary/10 px-3 text-[12px] font-semibold text-primaryHover transition hover:bg-primary/15 focus:outline-none focus:ring-2 focus:ring-primary/20 disabled:bg-softStart"
       >

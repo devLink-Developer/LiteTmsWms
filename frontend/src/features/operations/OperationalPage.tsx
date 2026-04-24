@@ -79,12 +79,15 @@ export function OperationalPage({ module }: OperationalPageProps) {
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <StatusBadge label={module.permissions[0]} tone="info" />
-            <button
-              type="button"
-              className="h-9 rounded bg-primary px-3 text-[12px] font-semibold text-white transition hover:bg-primaryHover focus:outline-none focus:ring-2 focus:ring-primary/30"
-            >
-              {module.primaryAction}
-            </button>
+            {module.readOnly && <StatusBadge label="solo lectura" tone="neutral" />}
+            {!module.readOnly && module.primaryAction && (
+              <button
+                type="button"
+                className="h-9 rounded bg-primary px-3 text-[12px] font-semibold text-white transition hover:bg-primaryHover focus:outline-none focus:ring-2 focus:ring-primary/30"
+              >
+                {module.primaryAction}
+              </button>
+            )}
           </div>
         </header>
         <KpiStrip items={kpis} />

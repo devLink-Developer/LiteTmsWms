@@ -6,7 +6,12 @@ from apps.shipping.models import Shipment
 
 @require_GET
 def shipments(request):
-    rows = Shipment.objects.order_by("-created_at")[:100]
+    qs = Shipment.objects.order_by("-created_at")
+    if status := request.GET.get("status"):
+        qs = qs.filter(status=status)
+    if event_type := request.GET.get("event_type"):
+        qs = qs.filter(events__event_type=event_type).distinct()
+    rows = qs[:100]
     return json_response(
         {
             "results": [

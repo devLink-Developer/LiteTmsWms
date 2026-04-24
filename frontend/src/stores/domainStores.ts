@@ -47,12 +47,15 @@ export const useReceiptsStore = createDomainStore();
 export const useTransfersStore = createDomainStore();
 export const useOrdersStore = createDomainStore();
 export const useDeliveriesStore = createDomainStore();
+export const useDistributionStore = createDomainStore();
 export const useRoutesStore = createDomainStore();
 export const useVehiclesStore = createDomainStore();
 export const useInventoryStore = createDomainStore();
+export const useStockMovementsStore = createDomainStore();
 export const useAuditsStore = createDomainStore();
 export const useDispatchStore = createDomainStore();
 export const useShippingStore = createDomainStore();
+export const useReturnsStore = createDomainStore();
 
 export function storeForModule(moduleKey: string) {
   const stores: Record<string, typeof useReceiptsStore> = {
@@ -60,12 +63,15 @@ export function storeForModule(moduleKey: string) {
     transfers: useTransfersStore,
     orders: useOrdersStore,
     deliveries: useDeliveriesStore,
+    distribution: useDistributionStore,
     routes: useRoutesStore,
     vehicles: useVehiclesStore,
     stock: useInventoryStore,
+    "stock-movements": useStockMovementsStore,
     audits: useAuditsStore,
     dispatch: useDispatchStore,
     shipping: useShippingStore,
+    returns: useReturnsStore,
   };
   return stores[moduleKey] ?? useReceiptsStore;
 }

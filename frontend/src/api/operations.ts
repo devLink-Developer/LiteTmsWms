@@ -31,9 +31,20 @@ function first(record: ApiRecord, keys: string[], fallback = "-") {
   return text(value, fallback);
 }
 
+function objectValue(record: ApiRecord, key: string): ApiRecord {
+  const value = record[key];
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as ApiRecord) : {};
+}
+
 function quantityFor(record: ApiRecord, moduleKey: string) {
-  if (moduleKey === "stock" || moduleKey === "receipts") {
+  if (moduleKey === "stock" || moduleKey === "stock-movements") {
     return `${first(record, ["quantity"], "0")} ${first(record, ["uom"], "")}`.trim();
+  }
+  if (moduleKey === "receipts") {
+    return first(record, ["lines_count", "quantity"], "-");
+  }
+  if (moduleKey === "tasks") {
+    return `${first(record, ["total_qty"], "0")} ${first(Array.isArray(record.lines) ? (record.lines[0] as ApiRecord) : {}, ["uom"], "")}`.trim();
   }
   if (moduleKey === "routes") {
     return `${first(record, ["planned_weight_kg"], "0")} kg / ${first(record, ["planned_volume_m3"], "0")} m3`;
@@ -49,32 +60,48 @@ function quantityFor(record: ApiRecord, moduleKey: string) {
 
 function refFor(record: ApiRecord, moduleKey: string) {
   const keysByModule: Record<string, string[]> = {
-    receipts: ["document_ref", "id"],
+    receipts: ["purchase_order_ref", "document_ref", "id"],
     transfers: ["transfer_number", "id"],
     orders: ["fulfillment_number", "sales_order_number", "id"],
+    tasks: ["id"],
     deliveries: ["delivery_number", "id"],
+    distribution: ["delivery_number", "id"],
     routes: ["route_number", "id"],
     vehicles: ["code", "plate", "id"],
     stock: ["item_ref", "id"],
+    "stock-movements": ["document_ref", "id"],
     audits: ["audit_number", "id"],
     dispatch: ["dispatch_number", "id"],
     shipping: ["shipment_number", "id"],
+    returns: ["shipment_number", "id"],
   };
+  if (moduleKey === "tasks") {
+    return first(objectValue(record, "delivery"), ["delivery_number"], first(record, ["id"]));
+  }
   return first(record, keysByModule[moduleKey] ?? ["id"]);
 }
 
 function ownerFor(record: ApiRecord, moduleKey: string) {
   const keysByModule: Record<string, string[]> = {
     transfers: ["destination_warehouse_ref"],
+    receipts: ["supplier_ref"],
+    tasks: ["assigned_employee_ref", "prepared_by"],
     orders: ["customer_ref", "sales_order_number"],
     deliveries: ["delivery_mode", "sales_order_number"],
+    distribution: ["delivery_mode", "sales_order_number"],
     routes: ["vehicle"],
     vehicles: ["plate"],
     stock: ["stock_state"],
+    "stock-movements": ["document_type", "source_ref", "stock_state"],
     audits: ["blind_count"],
     dispatch: ["customer_ref"],
     shipping: ["delivery_ref", "route_ref"],
+    returns: ["delivery_ref", "route_ref"],
   };
+  if (moduleKey === "tasks") {
+    const order = objectValue(record, "order");
+    return first(record, keysByModule.tasks, first(order, ["customer_ref", "sales_order_number"]));
+  }
   return first(record, keysByModule[moduleKey] ?? ["document_type", "source_ref", "customer_ref"]);
 }
 

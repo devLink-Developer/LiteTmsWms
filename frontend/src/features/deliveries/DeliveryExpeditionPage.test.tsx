@@ -233,6 +233,13 @@ describe("DeliveryExpeditionPage", () => {
 
     await waitFor(() => expect(screen.getByRole("button", { name: "Agregar entrega" })).toBeInTheDocument());
     fireEvent.click(screen.getByRole("button", { name: "Agregar entrega" }));
+    const qtyInput = screen.getByLabelText("Cantidad a entregar CER-104") as HTMLInputElement;
+    expect(qtyInput.value).toBe("0");
+    expect(screen.getByRole("button", { name: "Confirmar entrega" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Entregar todo" })).not.toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Entregar todo" }));
+    expect(qtyInput.value).toBe("4");
     await waitFor(() => expect(screen.getByRole("button", { name: "Confirmar entrega" })).not.toBeDisabled());
     expect(screen.getByRole("button", { name: "Enviar a preparar" })).toBeDisabled();
 

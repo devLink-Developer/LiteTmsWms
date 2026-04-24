@@ -6,7 +6,16 @@ from apps.transfers.models import TransferOrder
 
 @require_GET
 def transfer_orders(request):
-    rows = TransferOrder.objects.order_by("-created_at")[:100]
+    qs = TransferOrder.objects.order_by("-created_at")
+    if origin_warehouse := request.GET.get("origin_warehouse"):
+        qs = qs.filter(origin_warehouse_ref=origin_warehouse)
+    if destination_warehouse := request.GET.get("destination_warehouse"):
+        qs = qs.filter(destination_warehouse_ref=destination_warehouse)
+    if status := request.GET.get("status"):
+        qs = qs.filter(status=status)
+    if transfer_number := request.GET.get("transfer_number"):
+        qs = qs.filter(transfer_number=transfer_number)
+    rows = qs[:100]
     return json_response(
         {
             "results": [

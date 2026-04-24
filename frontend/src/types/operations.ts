@@ -35,7 +35,35 @@ export type OperationModule = {
   path: string;
   description: string;
   apiPath: string;
-  primaryAction: string;
+  primaryAction?: string;
   columns: string[];
   permissions: string[];
+  hiddenFromNavigation?: boolean;
+  placeholder?: boolean;
+  readOnly?: boolean;
+  showInDashboard?: boolean;
+};
+
+export type PlaceholderPageConfig = {
+  key: string;
+  label: string;
+  path: string;
+  groupLabel: string;
+  description: string;
+  checkpoints: string[];
+};
+
+export type NavigationLink = {
+  key: string;
+  label: string;
+  path: string;
+  end?: boolean;
+};
+
+export type NavigationEntry = NavigationLink | {
+  key: string;
+  label: string;
+  items: NavigationLink[];
+  path?: never;
+  end?: never;
 };

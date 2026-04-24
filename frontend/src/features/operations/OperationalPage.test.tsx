@@ -1,7 +1,7 @@
 import { render, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { operationModules } from "../../shared/data/modules";
+import { operationModuleByKey } from "../../shared/data/modules";
 import { OperationalPage } from "./OperationalPage";
 
 describe("OperationalPage", () => {
@@ -14,13 +14,11 @@ describe("OperationalPage", () => {
           results: [
             {
               id: "ledger-1",
-              document_ref: "REC-000184",
-              movement_type: "receipt",
+              purchase_order_ref: "OC-000184",
+              status: "received",
               warehouse_ref: "PS003MT",
               item_ref: "ITM-1",
-              quantity: "18",
-              uom: "UN",
-              posted_at: "2026-04-24T08:42:00Z",
+              lines_count: 1,
             },
           ],
         }),
@@ -28,12 +26,13 @@ describe("OperationalPage", () => {
     );
   });
 
-  it("renders dense operational table and primary action", async () => {
-    const view = render(<OperationalPage module={operationModules[0]} />);
+  it("renders dense read-only operational table", async () => {
+    const view = render(<OperationalPage module={operationModuleByKey("receipts")} />);
 
-    expect(view.getByRole("heading", { name: "Recepciones" })).toBeInTheDocument();
-    expect(view.getByRole("button", { name: "Registrar recepcion" })).toBeInTheDocument();
+    expect(view.getByRole("heading", { name: "Ingresos por OC" })).toBeInTheDocument();
+    expect(view.queryByRole("button", { name: /registrar/i })).not.toBeInTheDocument();
+    expect(view.getByText("solo lectura")).toBeInTheDocument();
     expect(view.getByRole("table")).toBeInTheDocument();
-    await waitFor(() => expect(view.getByText("REC-000184")).toBeInTheDocument());
+    await waitFor(() => expect(view.getByText("OC-000184")).toBeInTheDocument());
   });
 });

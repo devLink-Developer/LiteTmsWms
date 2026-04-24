@@ -6,5 +6,6 @@ from apps.inventory import api
 urlpatterns = [
     path("balances/", api.balances, name="inventory-balances"),
     path("ledger/", api.ledger, name="inventory-ledger"),
+    path("receipts/", api.receipts, name="inventory-receipts"),
     path("reservations/", api.reservations, name="inventory-reservations"),
 ]
