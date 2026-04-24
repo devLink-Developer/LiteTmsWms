@@ -6,6 +6,7 @@ from apps.fulfillment import api
 urlpatterns = [
     path("from-legacy-order", api.from_legacy_order, name="fulfillment-from-legacy-order"),
     path("expedition-queue/", api.expedition_queue_view, name="fulfillment-expedition-queue"),
+    path("preparation-tasks/", api.preparation_tasks, name="preparation-tasks"),
     path("<uuid:fulfillment_id>/split", api.split_fulfillment, name="fulfillment-split"),
     path("", api.fulfillment_orders, name="fulfillment-orders"),
     path("deliveries/", api.delivery_orders, name="delivery-orders"),

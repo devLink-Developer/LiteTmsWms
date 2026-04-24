@@ -145,12 +145,19 @@ function sumDeliveryQty(delivery: DeliveryDraft) {
 }
 
 function getMaxDispatchableQty(line: ExpeditionLine, delivery?: DeliveryDraft) {
-  const currentDeliveryQty = delivery?.source === "api" ? getDeliveryLineQty(delivery, line.id) : 0;
+  const currentDeliveryQty = delivery?.source === "api" && delivery.status !== "remito" ? getDeliveryLineQty(delivery, line.id) : 0;
   return Math.max(0, line.maxDispatchableQty + currentDeliveryQty);
+}
+
+function isOperationalDelivery(delivery: DeliveryDraft) {
+  return delivery.status !== "remito";
 }
 
 function deliveryStatusFromApi(delivery: ApiDeliveryOrder): DeliveryStatus {
   if (delivery.documents.some((document) => document.document_type === "remito" && document.status === "issued")) {
+    return "remito";
+  }
+  if (delivery.status === "delivered_complete" || delivery.status === "delivered_partial") {
     return "remito";
   }
   if (delivery.status === "loaded" || delivery.status === "prepared") {
@@ -321,7 +328,8 @@ export function DeliveryExpeditionPage() {
     }
     return activeOrder.deliveries;
   }, [activeOrder, draftState]);
-  const activeDelivery = visibleDeliveries.find((delivery) => delivery.id === activeDeliveryId) ?? visibleDeliveries[0];
+  const activeDelivery =
+    visibleDeliveries.find((delivery) => delivery.id === activeDeliveryId) ?? visibleDeliveries.find(isOperationalDelivery);
   const canEditActiveDelivery = activeDelivery?.source === "draft";
 
   useEffect(() => {
@@ -329,11 +337,17 @@ export function DeliveryExpeditionPage() {
       setActiveDeliveryId("");
       return;
     }
+    if (draftState?.orderId === activeOrder.id) {
+      if (activeDeliveryId !== draftState.delivery.id) {
+        setActiveDeliveryId(draftState.delivery.id);
+      }
+      return;
+    }
     if (activeDeliveryId && visibleDeliveries.some((delivery) => delivery.id === activeDeliveryId)) {
       return;
     }
-    setActiveDeliveryId(visibleDeliveries[0]?.id ?? "");
-  }, [activeDeliveryId, activeOrder, visibleDeliveries]);
+    setActiveDeliveryId(visibleDeliveries.find(isOperationalDelivery)?.id ?? "");
+  }, [activeDeliveryId, activeOrder, draftState, visibleDeliveries]);
 
   function updateSearch(key: keyof SearchState, value: string) {
     setSearch((current) => ({ ...current, [key]: value }));
@@ -362,7 +376,7 @@ export function DeliveryExpeditionPage() {
 
   function selectOrder(order: ExpeditionOrder) {
     setActiveOrderId(order.id);
-    setActiveDeliveryId(order.deliveries[0]?.id ?? "");
+    setActiveDeliveryId(order.deliveries.find(isOperationalDelivery)?.id ?? "");
     if (draftState?.orderId !== order.id) {
       setDraftState(null);
     }
@@ -536,7 +550,7 @@ export function DeliveryExpeditionPage() {
       if (submittedSearch) {
         await loadQueue(submittedSearch, { silent: true });
       }
-      setActiveDeliveryId(deliveryId);
+      setActiveDeliveryId("");
       setMessage({ tone: "info", text: `Remito ${document.document_number} generado desde TMS/WMS.` });
     } catch (apiError) {
       setMessage({
@@ -549,23 +563,67 @@ export function DeliveryExpeditionPage() {
   }
 
   const activeDeliveryQty = activeDelivery ? sumDeliveryQty(activeDelivery) : 0;
+  const workflowActions = (
+    <div className="flex flex-wrap items-center gap-2">
+      <button
+        type="button"
+        disabled={!activeOrder || processing}
+        onClick={addDelivery}
+        className="min-h-10 rounded border border-borderSoft bg-white px-3 text-[12px] font-semibold text-night transition hover:border-primary hover:text-primaryHover focus:outline-none focus:ring-2 focus:ring-primary/20 disabled:bg-softStart"
+      >
+        Agregar entrega
+      </button>
+      <button
+        type="button"
+        disabled={!activeDelivery || activeDelivery.status !== "draft" || processing}
+        onClick={() => void confirmActiveDelivery()}
+        className="min-h-10 rounded border border-primary/30 bg-primary/10 px-3 text-[12px] font-semibold text-primaryHover transition hover:bg-primary/15 focus:outline-none focus:ring-2 focus:ring-primary/20 disabled:bg-softStart"
+      >
+        Confirmar entrega
+      </button>
+      <button
+        type="button"
+        disabled={!activeDelivery || activeDelivery.status !== "reserved" || processing}
+        onClick={() => void sendActiveDeliveryToPrepare()}
+        className="min-h-10 rounded border border-primary/30 bg-primary/10 px-3 text-[12px] font-semibold text-primaryHover transition hover:bg-primary/15 focus:outline-none focus:ring-2 focus:ring-primary/20 disabled:bg-softStart"
+      >
+        Enviar a preparar
+      </button>
+      <button
+        type="button"
+        disabled={!activeDelivery || activeDelivery.status !== "preparing" || processing}
+        onClick={() => void markActiveDeliveryPrepared()}
+        className="min-h-10 rounded border border-primary/30 bg-primary/10 px-3 text-[12px] font-semibold text-primaryHover transition hover:bg-primary/15 focus:outline-none focus:ring-2 focus:ring-primary/20 disabled:bg-softStart"
+      >
+        Marcar preparada
+      </button>
+      <button
+        type="button"
+        disabled={!activeDelivery || activeDelivery.status !== "prepared" || activeDeliveryQty <= 0 || processing}
+        onClick={() => void generateRemitoPdf()}
+        className="min-h-10 rounded bg-primary px-3 text-[12px] font-semibold text-white transition hover:bg-primaryHover focus:outline-none focus:ring-2 focus:ring-primary/30 disabled:bg-softStart disabled:text-secondaryText"
+      >
+        Generar remito
+      </button>
+    </div>
+  );
 
   return (
-    <div className="flex h-full min-h-0 flex-col gap-3 overflow-auto p-3 xl:overflow-hidden">
-      <header className="flex flex-wrap items-start justify-between gap-3">
+    <div className="flex h-full min-h-0 flex-col gap-3 overflow-hidden p-3">
+      <header className="shrink-0">
         <div className="min-w-0">
           <h1 className="text-[20px] font-semibold text-night">Expedicion de entregas</h1>
         </div>
       </header>
 
-      {error && <div className="rounded border border-red-200 bg-red-50 px-3 py-2 text-[12px] text-red-700">{error}</div>}
+      {error && <div className="shrink-0 rounded border border-red-200 bg-red-50 px-3 py-2 text-[12px] text-red-700">{error}</div>}
 
-      <section className="grid min-h-0 flex-1 grid-cols-1 gap-3 xl:grid-cols-[320px_minmax(0,1fr)_360px]">
-        <aside className="flex min-h-0 flex-col rounded border border-borderSoft bg-surface shadow-panel">
-          <div className="border-b border-borderSoft px-3 py-2">
+      <section className="grid min-h-0 flex-1 grid-cols-1 grid-rows-[minmax(0,0.8fr)_minmax(0,1.7fr)_minmax(0,1fr)] gap-3 overflow-hidden xl:grid-cols-[320px_minmax(0,1fr)_360px] xl:grid-rows-1">
+        <aside className="flex min-h-0 flex-col overflow-hidden rounded border border-borderSoft bg-surface shadow-panel">
+          <div className="shrink-0 border-b border-borderSoft px-3 py-2">
             <h2 className="text-[13px] font-semibold text-night">Pedidos para expedicion</h2>
           </div>
-          <form className="grid gap-2 border-b border-borderSoft bg-softMid px-3 py-2" onSubmit={executeSearch}>
+          <form className="grid shrink-0 gap-2 border-b border-borderSoft bg-softMid px-3 py-2" onSubmit={executeSearch}>
             <div className="grid grid-cols-3 gap-1 rounded border border-borderSoft bg-white p-1" role="group" aria-label="Tipo de busqueda">
               {(Object.keys(searchModeLabels) as SearchMode[]).map((mode) => (
                 <button
@@ -597,7 +655,7 @@ export function DeliveryExpeditionPage() {
               {loading ? "Buscando..." : "Buscar pendientes"}
             </button>
           </form>
-          <div className="min-h-0 overflow-auto">
+          <div className="min-h-0 flex-1 overflow-auto">
             {orders.map((order) => (
               <button
                 key={order.id}
@@ -633,10 +691,11 @@ export function DeliveryExpeditionPage() {
           </div>
         </aside>
 
-        <main className="flex min-h-0 flex-col rounded border border-borderSoft bg-surface shadow-panel">
+        <main className="flex min-h-0 flex-col overflow-hidden rounded border border-borderSoft bg-surface shadow-panel">
           {activeOrder ? (
             <>
-              <div className="flex flex-wrap items-start justify-between gap-3 border-b border-borderSoft px-3 py-3">
+              <div className="shrink-0 border-b border-borderSoft px-3 py-3">
+                <div className="flex flex-wrap items-start justify-between gap-3">
                 <div className="min-w-0">
                   <p className="text-[11px] font-semibold uppercase text-secondaryText">Pedido seleccionado</p>
                   <h2 className="mt-1 font-mono text-[18px] font-semibold text-night">{activeOrder.orderNumber}</h2>
@@ -668,9 +727,24 @@ export function DeliveryExpeditionPage() {
                     </div>
                   )}
                 </div>
+                </div>
               </div>
 
-              <section className="grid gap-2 border-b border-borderSoft bg-softMid px-3 py-2 md:grid-cols-4">
+              <section className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-borderSoft bg-white px-3 py-2">
+                <div className="min-w-0 text-[12px] text-secondaryText">
+                  {activeDelivery ? (
+                    <>
+                      Entrega activa <span className="font-mono font-semibold text-night">{activeDelivery.number}</span> /
+                      cantidad total <span className="font-mono font-semibold text-night">{formatQty(activeDeliveryQty)}</span>
+                    </>
+                  ) : (
+                    "Crea una entrega para asignar cantidades."
+                  )}
+                </div>
+                {workflowActions}
+              </section>
+
+              <section className="grid shrink-0 gap-2 border-b border-borderSoft bg-softMid px-3 py-2 md:grid-cols-4">
                 <label className="grid gap-1 text-[11px] font-semibold text-secondaryText">
                   Modalidad
                   <input
@@ -771,7 +845,7 @@ export function DeliveryExpeditionPage() {
                 </table>
               </div>
 
-              <div className="flex flex-wrap items-center justify-between gap-3 border-t border-borderSoft px-3 py-2">
+              <div className="shrink-0 border-t border-borderSoft px-3 py-2 text-[12px] text-secondaryText">
                 <div className="text-[12px] text-secondaryText">
                   {activeDelivery ? (
                     <>
@@ -782,69 +856,33 @@ export function DeliveryExpeditionPage() {
                     "Crea una entrega para asignar cantidades."
                   )}
                 </div>
-                <div className="flex flex-wrap items-center gap-2">
-                  <button
-                    type="button"
-                    disabled={processing}
-                    onClick={addDelivery}
-                    className="min-h-10 rounded border border-borderSoft bg-white px-3 text-[12px] font-semibold text-night transition hover:border-primary hover:text-primaryHover focus:outline-none focus:ring-2 focus:ring-primary/20 disabled:bg-softStart"
-                  >
-                    Agregar entrega
-                  </button>
-                  <button
-                    type="button"
-                    disabled={!activeDelivery || activeDelivery.status !== "draft" || processing}
-                    onClick={() => void confirmActiveDelivery()}
-                    className="min-h-10 rounded border border-primary/30 bg-primary/10 px-3 text-[12px] font-semibold text-primaryHover transition hover:bg-primary/15 focus:outline-none focus:ring-2 focus:ring-primary/20 disabled:bg-softStart"
-                  >
-                    Confirmar entrega
-                  </button>
-                  <button
-                    type="button"
-                    disabled={!activeDelivery || activeDelivery.status !== "reserved" || processing}
-                    onClick={() => void sendActiveDeliveryToPrepare()}
-                    className="min-h-10 rounded border border-primary/30 bg-primary/10 px-3 text-[12px] font-semibold text-primaryHover transition hover:bg-primary/15 focus:outline-none focus:ring-2 focus:ring-primary/20 disabled:bg-softStart"
-                  >
-                    Enviar a preparar
-                  </button>
-                  <button
-                    type="button"
-                    disabled={!activeDelivery || activeDelivery.status !== "preparing" || processing}
-                    onClick={() => void markActiveDeliveryPrepared()}
-                    className="min-h-10 rounded border border-primary/30 bg-primary/10 px-3 text-[12px] font-semibold text-primaryHover transition hover:bg-primary/15 focus:outline-none focus:ring-2 focus:ring-primary/20 disabled:bg-softStart"
-                  >
-                    Marcar preparada
-                  </button>
-                  <button
-                    type="button"
-                    disabled={!activeDelivery || activeDelivery.status !== "prepared" || activeDeliveryQty <= 0 || processing}
-                    onClick={() => void generateRemitoPdf()}
-                    className="min-h-10 rounded bg-primary px-3 text-[12px] font-semibold text-white transition hover:bg-primaryHover focus:outline-none focus:ring-2 focus:ring-primary/30 disabled:bg-softStart disabled:text-secondaryText"
-                  >
-                    Generar remito
-                  </button>
-                </div>
               </div>
               {message && (
-                <div className="border-t border-borderSoft bg-white px-3 py-2 text-[12px]" role="status" aria-live="polite">
+                <div className="shrink-0 border-t border-borderSoft bg-white px-3 py-2 text-[12px]" role="status" aria-live="polite">
                   <StatusBadge label={message.tone === "danger" ? "revision" : "estado"} tone={message.tone} />
                   <span className="ml-2 text-secondaryText">{message.text}</span>
                 </div>
               )}
             </>
           ) : (
-            <div className="p-6 text-[12px] text-secondaryText">
-              {loading
-                ? "Buscando pedidos pendientes en TMS/WMS..."
-                : submittedSearch
-                  ? "No hay pedidos pendientes para revisar."
-                  : "Busca un pedido VENT8, ID cliente o DNI cliente para iniciar la expedicion."}
+            <div className="min-h-0 overflow-auto p-6 text-[12px] text-secondaryText">
+              <div className="mt-4">
+                {loading
+                  ? "Buscando pedidos pendientes en TMS/WMS..."
+                  : submittedSearch
+                    ? "No hay pedidos pendientes para revisar."
+                    : "Busca un pedido VENT8, ID cliente o DNI cliente para iniciar la expedicion."}
+              </div>
+              <div>
+                <div className="mb-2 text-[11px] font-semibold uppercase text-secondaryText">Acciones de entrega</div>
+                {workflowActions}
+              </div>
             </div>
           )}
         </main>
 
-        <aside className="flex min-h-0 flex-col rounded border border-borderSoft bg-surface shadow-panel">
-          <div className="flex items-start justify-between gap-3 border-b border-borderSoft px-3 py-2">
+        <aside className="flex min-h-0 flex-col overflow-hidden rounded border border-borderSoft bg-surface shadow-panel">
+          <div className="flex shrink-0 items-start justify-between gap-3 border-b border-borderSoft px-3 py-2">
             <div>
               <h2 className="text-[13px] font-semibold text-night">Entregas del pedido</h2>
               <p className="mt-1 text-[11px] text-secondaryText">Un pedido puede tener multiples entregas y remitos.</p>
@@ -895,7 +933,7 @@ export function DeliveryExpeditionPage() {
             )}
           </div>
 
-          <div className="border-t border-borderSoft bg-white px-3 py-3">
+          <div className="shrink-0 border-t border-borderSoft bg-white px-3 py-3">
             <h3 className="text-[12px] font-semibold uppercase text-secondaryText">Resumen de remito</h3>
             {activeDelivery ? (
               <dl className="mt-3 grid grid-cols-2 gap-2 text-[12px]">

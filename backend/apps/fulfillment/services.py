@@ -6,10 +6,11 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from django.db import transaction
-from django.db.models import Q, Sum
+from django.db.models import F, Q, Sum
 from django.utils import timezone
 
 from apps.core.models import AuditTrail, DomainEventOutbox, IdempotencyKey, StatusHistory
+from apps.core.sequences import allocate_sequence_number
 from apps.fulfillment.models import (
     DeliveryDocument,
     DeliveryDocumentLine,
@@ -21,9 +22,13 @@ from apps.fulfillment.models import (
     FulfillmentOrderLine,
 )
 from apps.integrations.legacy.models import LegacyOrder, LegacyOrderInvoice, LegacyOrderLine
-from apps.inventory.models import InventoryBalance, InventoryReservation, StockState
-from apps.inventory.services import InventoryRuleError, pack_reserved_inventory, reserve_inventory
+from apps.inventory.models import InventoryBalance, InventoryLedgerEntry, InventoryReservation, StockState
+from apps.inventory.services import InventoryRuleError, LedgerCommand, pack_reserved_inventory, post_ledger_entry, reserve_inventory
 from apps.logistics.parquet_master_data import customer_refs_for_dni
+
+
+DELIVERY_SEQUENCE_NAME = "Entregas"
+REMITO_SEQUENCE_NAME = "Remitos"
 
 
 class FulfillmentRuleError(ValueError):
@@ -150,6 +155,20 @@ def _max_dispatchable_from_values(
     return min(remaining_qty, packed_remaining)
 
 
+def _active_delivery_lines_queryset():
+    return DeliveryOrderLine.objects.exclude(
+        delivery__documents__document_type=DeliveryDocument.DocumentType.REMITO,
+        delivery__documents__status=DeliveryDocument.DocumentStatus.ISSUED,
+    ).exclude(
+        delivery__status__in=[
+            DeliveryOrder.DeliveryStatus.DELIVERED_PARTIAL,
+            DeliveryOrder.DeliveryStatus.DELIVERED_COMPLETE,
+            DeliveryOrder.DeliveryStatus.RETURNED,
+            DeliveryOrder.DeliveryStatus.CANCELLED,
+        ]
+    )
+
+
 def _line_metrics(lines: list[FulfillmentOrderLine]) -> dict:
     if not lines:
         return {}
@@ -157,7 +176,8 @@ def _line_metrics(lines: list[FulfillmentOrderLine]) -> dict:
     line_ids = [line.id for line in lines]
     planned_by_line = {
         row["fulfillment_line_id"]: row["total"] or Decimal("0")
-        for row in DeliveryOrderLine.objects.filter(fulfillment_line_id__in=line_ids)
+        for row in _active_delivery_lines_queryset()
+        .filter(fulfillment_line_id__in=line_ids)
         .values("fulfillment_line_id")
         .annotate(total=Sum("planned_qty"))
     }
@@ -393,6 +413,7 @@ def ingest_legacy_order(*, sales_order_number: str, idempotency_key: str, actor:
 
     for legacy_line in legacy_lines:
         remaining_qty = _line_remaining_qty(legacy_line)
+        legacy_delivered_qty = legacy_line.sales_quantity_delivered or Decimal("0")
         fulfillment_line, created_line = FulfillmentOrderLine.objects.get_or_create(
             fulfillment=fulfillment,
             source_table="transactions_orders_retailLineItem",
@@ -409,7 +430,7 @@ def ingest_legacy_order(*, sales_order_number: str, idempotency_key: str, actor:
                 "ordered_qty": legacy_line.ordered_sales_quantity,
                 "reserved_qty": Decimal("0"),
                 "prepared_qty": Decimal("0"),
-                "delivered_qty": legacy_line.sales_quantity_delivered or Decimal("0"),
+                "delivered_qty": legacy_delivered_qty,
                 "cancelled_qty": Decimal("0"),
                 "uom": legacy_line.sales_unit_symbol,
                 "source_hash": source_hash,
@@ -426,7 +447,7 @@ def ingest_legacy_order(*, sales_order_number: str, idempotency_key: str, actor:
             fulfillment_line.warehouse_ref = legacy_line.shipping_warehouse_id or legacy_line.fulfillment_store_id or legacy_line.warehouse
             fulfillment_line.store_ref = legacy_line.fulfillment_store_id
             fulfillment_line.ordered_qty = legacy_line.ordered_sales_quantity
-            fulfillment_line.delivered_qty = legacy_line.sales_quantity_delivered or Decimal("0")
+            fulfillment_line.delivered_qty = max(legacy_delivered_qty, _remitted_qty_for_fulfillment_line(fulfillment_line))
             fulfillment_line.cancelled_qty = Decimal("0")
             fulfillment_line.uom = legacy_line.sales_unit_symbol
             fulfillment_line.source_hash = source_hash
@@ -472,7 +493,7 @@ def ingest_legacy_order(*, sales_order_number: str, idempotency_key: str, actor:
 
 
 def _planned_elsewhere(fulfillment_line: FulfillmentOrderLine, exclude_delivery_id: str | None = None) -> Decimal:
-    queryset = DeliveryOrderLine.objects.filter(fulfillment_line=fulfillment_line)
+    queryset = _active_delivery_lines_queryset().filter(fulfillment_line=fulfillment_line)
     if exclude_delivery_id:
         queryset = queryset.exclude(delivery_id=exclude_delivery_id)
     return queryset.aggregate(total=Sum("planned_qty"))["total"] or Decimal("0")
@@ -487,6 +508,17 @@ def _packed_balance_quantity(fulfillment_line: FulfillmentOrderLine) -> Decimal:
         uom=fulfillment_line.uom,
     ).first()
     return balance.quantity if balance else Decimal("0")
+
+
+def _remitted_qty_for_fulfillment_line(fulfillment_line: FulfillmentOrderLine) -> Decimal:
+    return (
+        DeliveryDocumentLine.objects.filter(
+            delivery_line__fulfillment_line=fulfillment_line,
+            document__status=DeliveryDocument.DocumentStatus.ISSUED,
+            document__document_type=DeliveryDocument.DocumentType.REMITO,
+        ).aggregate(total=Sum("quantity"))["total"]
+        or Decimal("0")
+    )
 
 
 def _max_dispatchable(fulfillment_line: FulfillmentOrderLine, exclude_delivery_id: str | None = None) -> Decimal:
@@ -529,10 +561,9 @@ def split_fulfillment_delivery(
 
     fulfillment = FulfillmentOrder.objects.select_for_update().get(id=fulfillment_id)
     _ensure_warehouse_authorized(fulfillment.warehouse_ref, authorized_warehouses)
-    next_number = fulfillment.deliveries.count() + 1
     delivery = DeliveryOrder.objects.create(
         fulfillment=fulfillment,
-        delivery_number=f"ENT-{fulfillment.legacy_sales_order_number}-{next_number}",
+        delivery_number=allocate_sequence_number(DELIVERY_SEQUENCE_NAME, actor=actor),
         delivery_mode=delivery_mode or fulfillment.delivery_mode,
         planned_date=planned_date or fulfillment.requested_date,
         status=DeliveryOrder.DeliveryStatus.CREATED,
@@ -881,9 +912,10 @@ def mark_preparation_task_prepared(
 
     for line in delivery.lines.all():
         fulfillment_line = line.fulfillment_line
+        fulfillment_line.reserved_qty = max(Decimal("0"), fulfillment_line.reserved_qty - line.planned_qty)
         fulfillment_line.prepared_qty += line.planned_qty
         fulfillment_line.updated_by = actor
-        fulfillment_line.save(update_fields=["prepared_qty", "updated_by", "updated_at"])
+        fulfillment_line.save(update_fields=["reserved_qty", "prepared_qty", "updated_by", "updated_at"])
 
     task.status = DeliveryPreparationTask.TaskStatus.PREPARED
     task.prepared_by = actor
@@ -931,17 +963,17 @@ def issue_remito(*, delivery_id: str, idempotency_key: str, actor: str, authoriz
     _ensure_warehouse_authorized(delivery.warehouse_ref, authorized_warehouses)
     for line in delivery.lines.all():
         _ensure_warehouse_authorized(line.warehouse_ref or delivery.warehouse_ref, authorized_warehouses)
-    if delivery.status != DeliveryOrder.DeliveryStatus.PREPARED:
-        raise FulfillmentRuleError("El remito solo se puede emitir para una entrega preparada.")
 
     existing = delivery.documents.filter(document_type=DeliveryDocument.DocumentType.REMITO).first()
     if existing:
         result = IdempotentResult({"result": _serialize_document(existing)})
         return _finish_idempotent_command(idempotency, result)
+    if delivery.status != DeliveryOrder.DeliveryStatus.PREPARED:
+        raise FulfillmentRuleError("El remito solo se puede emitir para una entrega preparada.")
 
     document = DeliveryDocument.objects.create(
         delivery=delivery,
-        document_number=f"R-{delivery.delivery_number}",
+        document_number=allocate_sequence_number(REMITO_SEQUENCE_NAME, actor=actor),
         document_type=DeliveryDocument.DocumentType.REMITO,
         status=DeliveryDocument.DocumentStatus.ISSUED,
         issued_at=timezone.now(),
@@ -967,6 +999,82 @@ def issue_remito(*, delivery_id: str, idempotency_key: str, actor: str, authoriz
             warehouse_ref=line.warehouse_ref,
             created_by=actor,
         )
+    for index, line in enumerate(delivery.lines.select_related("fulfillment_line").filter(planned_qty__gt=0), start=1):
+        qty_to_dispatch = max(Decimal("0"), line.planned_qty - line.delivered_qty)
+        if qty_to_dispatch <= 0:
+            continue
+        try:
+            post_ledger_entry(
+                LedgerCommand(
+                    idempotency_key=f"{idempotency_key}:dispatch:packed:{index}",
+                    movement_type=InventoryLedgerEntry.MovementType.DISPATCH,
+                    direction=InventoryLedgerEntry.Direction.DECREASE,
+                    warehouse_ref=line.warehouse_ref or delivery.warehouse_ref,
+                    item_ref=line.item_ref,
+                    stock_state=StockState.PACKED,
+                    quantity=qty_to_dispatch,
+                    uom=line.uom,
+                    document_type="delivery_document",
+                    document_ref=str(document.id),
+                    actor=actor,
+                    reason="Remito de entrega",
+                    legacy_sales_order_number=line.legacy_sales_order_number,
+                    legacy_line_id=line.legacy_line_id,
+                )
+            )
+            post_ledger_entry(
+                LedgerCommand(
+                    idempotency_key=f"{idempotency_key}:dispatch:delivered:{index}",
+                    movement_type=InventoryLedgerEntry.MovementType.DISPATCH,
+                    direction=InventoryLedgerEntry.Direction.INCREASE,
+                    warehouse_ref=line.warehouse_ref or delivery.warehouse_ref,
+                    item_ref=line.item_ref,
+                    stock_state=StockState.DELIVERED,
+                    quantity=qty_to_dispatch,
+                    uom=line.uom,
+                    document_type="delivery_document",
+                    document_ref=str(document.id),
+                    actor=actor,
+                    reason="Remito de entrega",
+                    legacy_sales_order_number=line.legacy_sales_order_number,
+                    legacy_line_id=line.legacy_line_id,
+                )
+            )
+        except InventoryRuleError as exc:
+            raise FulfillmentRuleError(str(exc)) from exc
+
+        line.delivered_qty += qty_to_dispatch
+        line.updated_by = actor
+        line.save(update_fields=["delivered_qty", "updated_by", "updated_at"])
+
+        fulfillment_line = line.fulfillment_line
+        fulfillment_line.prepared_qty = max(Decimal("0"), fulfillment_line.prepared_qty - qty_to_dispatch)
+        fulfillment_line.delivered_qty = min(fulfillment_line.ordered_qty, fulfillment_line.delivered_qty + qty_to_dispatch)
+        fulfillment_line.updated_by = actor
+        fulfillment_line.save(update_fields=["prepared_qty", "delivered_qty", "updated_by", "updated_at"])
+
+    from_status = delivery.status
+    delivery.status = DeliveryOrder.DeliveryStatus.DELIVERED_COMPLETE
+    delivery.updated_by = actor
+    delivery.save(update_fields=["status", "updated_by", "updated_at"])
+    fulfillment = delivery.fulfillment
+    has_pending = fulfillment.lines.filter(delivered_qty__lt=F("ordered_qty")).exists()
+    fulfillment.status = (
+        FulfillmentOrder.FulfillmentStatus.PARTIALLY_DELIVERED
+        if has_pending
+        else FulfillmentOrder.FulfillmentStatus.DELIVERED
+    )
+    fulfillment.updated_by = actor
+    fulfillment.save(update_fields=["status", "updated_by", "updated_at"])
+    StatusHistory.objects.create(
+        entity_type="delivery_order",
+        entity_id=str(delivery.id),
+        from_status=from_status,
+        to_status=delivery.status,
+        actor=actor,
+        reason="Remito emitido",
+        payload={"document_id": str(document.id)},
+    )
     AuditTrail.objects.create(
         entity_type="delivery_document",
         entity_id=str(document.id),

@@ -49,6 +49,34 @@ export type ApiDeliveryPreparationTask = {
   notes: string;
 };
 
+export type ApiPreparationTaskListItem = ApiDeliveryPreparationTask & {
+  warehouse_ref: string;
+  store_ref: string;
+  total_qty: string;
+  delivery: {
+    id: string;
+    delivery_number: string;
+    status: string;
+    delivery_mode: string;
+    planned_date: string | null;
+  };
+  order: {
+    id: string;
+    fulfillment_number: string;
+    sales_order_number: string;
+    transaction_number: string;
+    customer_ref: string;
+  };
+  lines: Array<{
+    id: string;
+    item_ref: string;
+    warehouse_ref: string;
+    planned_qty: string;
+    uom: string;
+    legacy_line_id: string;
+  }>;
+};
+
 export type ApiDeliveryOrder = {
   id: string;
   created_at?: string;
@@ -145,6 +173,22 @@ export async function sendDeliveryToPrepare(deliveryId: string) {
 export async function markDeliveryPrepared(deliveryId: string) {
   const result = await apiPost<CommandResult<ApiDeliveryOrder>>(
     `/api/v1/fulfillment/deliveries/${deliveryId}/mark-prepared`,
+  );
+  return result.result;
+}
+
+export async function fetchPreparationTasks(status = "open") {
+  const params = new URLSearchParams({ status });
+  const result = await apiGet<ApiPreparationTaskListItem>(`/api/v1/fulfillment/preparation-tasks/?${params.toString()}`);
+  if (result.error) {
+    throw new Error(result.error.message);
+  }
+  return result.results ?? [];
+}
+
+export async function markPreparationTaskPrepared(taskId: string) {
+  const result = await apiPost<CommandResult<ApiDeliveryOrder>>(
+    `/api/v1/fulfillment/preparation-tasks/${taskId}/mark-prepared`,
   );
   return result.result;
 }

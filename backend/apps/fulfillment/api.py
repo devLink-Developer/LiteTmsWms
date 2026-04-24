@@ -130,6 +130,93 @@ def delivery_orders(request):
 
 
 @require_GET
+def preparation_tasks(request):
+    try:
+        permissions = _delivery_permissions(request)
+        authorized_warehouses = permissions.get("authorized_warehouses", [])
+        forbidden = _forbidden_without_warehouse(authorized_warehouses)
+        if forbidden:
+            return forbidden
+
+        status_filter = request.GET.get("status", "open").strip().lower()
+        assigned_to = request.GET.get("assigned_to", "").strip()
+        mine = request.GET.get("mine", "").strip().lower() in {"1", "true", "yes"}
+        if mine and not assigned_to:
+            assigned_to = _request_actor(request)
+
+        rows = (
+            DeliveryPreparationTask.objects.select_related("delivery", "delivery__fulfillment")
+            .prefetch_related("delivery__lines")
+            .filter(warehouse_ref__in=authorized_warehouses)
+            .order_by("-assigned_at", "-created_at")
+        )
+        if status_filter == "open":
+            rows = rows.filter(
+                status__in=[
+                    DeliveryPreparationTask.TaskStatus.ASSIGNED,
+                    DeliveryPreparationTask.TaskStatus.PREPARING,
+                ]
+            )
+        elif status_filter and status_filter != "all":
+            rows = rows.filter(status=status_filter)
+        if assigned_to:
+            rows = rows.filter(assigned_to__iexact=assigned_to)
+
+        results = []
+        for task in rows[:200]:
+            delivery = task.delivery
+            fulfillment = delivery.fulfillment
+            lines = list(delivery.lines.all())
+            results.append(
+                {
+                    "id": str(task.id),
+                    "status": task.status,
+                    "assigned_employee_ref": task.assigned_to,
+                    "assigned_at": task.assigned_at.isoformat() if task.assigned_at else None,
+                    "prepared_by": task.prepared_by,
+                    "prepared_at": task.prepared_at.isoformat() if task.prepared_at else None,
+                    "notes": task.notes,
+                    "warehouse_ref": task.warehouse_ref,
+                    "store_ref": task.store_ref,
+                    "delivery": {
+                        "id": str(delivery.id),
+                        "delivery_number": delivery.delivery_number,
+                        "status": delivery.status,
+                        "delivery_mode": delivery.delivery_mode,
+                        "planned_date": delivery.planned_date.isoformat() if delivery.planned_date else None,
+                    },
+                    "order": {
+                        "id": str(fulfillment.id),
+                        "fulfillment_number": fulfillment.fulfillment_number,
+                        "sales_order_number": fulfillment.legacy_sales_order_number,
+                        "transaction_number": fulfillment.legacy_transaction_number,
+                        "customer_ref": fulfillment.customer_ref,
+                    },
+                    "lines": [
+                        {
+                            "id": str(line.id),
+                            "item_ref": line.item_ref,
+                            "warehouse_ref": line.warehouse_ref or delivery.warehouse_ref,
+                            "planned_qty": str(line.planned_qty),
+                            "uom": line.uom,
+                            "legacy_line_id": line.legacy_line_id,
+                        }
+                        for line in lines
+                    ],
+                    "total_qty": str(sum((line.planned_qty for line in lines), start=0)),
+                }
+            )
+        return json_response(
+            {
+                "results": results,
+                "permissions": {"authorized_warehouses": authorized_warehouses},
+            }
+        )
+    except MasterDataSourceError as exc:
+        return error_response("master_data_unavailable", str(exc), status=503)
+
+
+@require_GET
 def expedition_queue_view(request):
     filters = _queue_filters(request)
     if not any(filters.values()):

@@ -32,6 +32,16 @@ export const operationModules: OperationModule[] = [
     permissions: ["orders:view", "orders:edit", "orders:split"],
   },
   {
+    key: "tasks",
+    label: "Tareas",
+    path: "/tareas",
+    description: "Preparacion de entregas reservadas con asignacion por deposito y responsable.",
+    apiPath: "/api/v1/fulfillment/preparation-tasks/",
+    primaryAction: "Actualizar tareas",
+    columns: ["Tarea", "Estado", "Deposito", "Preparador", "Pedido", "Cantidad", "Asignada"],
+    permissions: ["tasks:view", "tasks:prepare"],
+  },
+  {
     key: "deliveries",
     label: "Entregas",
     path: "/entregas/expedicion",

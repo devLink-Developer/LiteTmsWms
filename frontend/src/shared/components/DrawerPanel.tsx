@@ -10,8 +10,8 @@ type DrawerPanelProps = {
 
 export function DrawerPanel({ module, row, onClose }: DrawerPanelProps) {
   return (
-    <aside className="w-full border-l border-borderSoft bg-surface shadow-panel lg:w-[360px]" aria-label="Detalle operativo">
-      <div className="flex items-start justify-between gap-3 border-b border-borderSoft px-4 py-3">
+    <aside className="flex min-h-0 w-full flex-col overflow-hidden border-l border-borderSoft bg-surface shadow-panel lg:w-[360px]" aria-label="Detalle operativo">
+      <div className="flex shrink-0 items-start justify-between gap-3 border-b border-borderSoft px-4 py-3">
         <div>
           <p className="text-[11px] font-semibold uppercase text-secondaryText">{module.label}</p>
           <h2 className="mt-1 text-[16px] font-semibold text-night">{row?.ref ?? "Sin seleccion"}</h2>
@@ -25,7 +25,7 @@ export function DrawerPanel({ module, row, onClose }: DrawerPanelProps) {
         </button>
       </div>
       {row ? (
-        <div className="space-y-4 px-4 py-3">
+        <div className="min-h-0 flex-1 space-y-4 overflow-auto px-4 py-3">
           <section className="grid grid-cols-2 gap-2 text-[12px]">
             <div>
               <div className="text-[11px] font-semibold text-secondaryText">Estado</div>
@@ -67,7 +67,7 @@ export function DrawerPanel({ module, row, onClose }: DrawerPanelProps) {
           </section>
         </div>
       ) : (
-        <div className="px-4 py-6 text-[12px] text-secondaryText">Selecciona una fila para revisar lineas, eventos e incidencias.</div>
+        <div className="min-h-0 flex-1 overflow-auto px-4 py-6 text-[12px] text-secondaryText">Selecciona una fila para revisar lineas, eventos e incidencias.</div>
       )}
     </aside>
   );

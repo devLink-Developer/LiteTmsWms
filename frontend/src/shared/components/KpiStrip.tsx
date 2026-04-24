@@ -7,7 +7,7 @@ type KpiStripProps = {
 
 export function KpiStrip({ items }: KpiStripProps) {
   return (
-    <section className="grid grid-cols-1 gap-2 md:grid-cols-3" aria-label="Indicadores operativos">
+    <section className="grid shrink-0 grid-cols-1 gap-2 md:grid-cols-3" aria-label="Indicadores operativos">
       {items.map((item) => (
         <div key={item.label} className="rounded border border-borderSoft bg-surface px-3 py-2 shadow-panel">
           <div className="flex items-center justify-between gap-3">

@@ -11,7 +11,7 @@ type DataTableProps = {
 
 export function DataTable({ rows, selectedIds, onSelect, onOpen, columns }: DataTableProps) {
   return (
-    <div className="min-h-0 overflow-auto">
+    <div className="min-h-0 flex-1 overflow-auto">
       <table className="w-full border-collapse text-left text-[12px]">
         <thead className="sticky top-0 z-10 bg-deep text-white">
           <tr>

@@ -233,7 +233,7 @@ describe("DeliveryExpeditionPage", () => {
 
     await waitFor(() => expect(screen.getByRole("button", { name: "Agregar entrega" })).toBeInTheDocument());
     fireEvent.click(screen.getByRole("button", { name: "Agregar entrega" }));
-    expect(screen.getByRole("button", { name: "Confirmar entrega" })).not.toBeDisabled();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Confirmar entrega" })).not.toBeDisabled());
     expect(screen.getByRole("button", { name: "Enviar a preparar" })).toBeDisabled();
 
     fireEvent.click(screen.getByRole("button", { name: "Confirmar entrega" }));

@@ -49,8 +49,8 @@ export function DashboardPage() {
   }, [rowsByModule]);
 
   return (
-    <div className="flex h-full flex-col gap-3 p-3">
-      <section className="flex flex-wrap items-start justify-between gap-3">
+    <div className="flex h-full min-h-0 flex-col gap-3 overflow-hidden p-3">
+      <section className="flex shrink-0 flex-wrap items-start justify-between gap-3">
         <div>
           <h1 className="text-[20px] font-semibold text-night">Dashboard operativo</h1>
           <p className="mt-1 max-w-3xl text-[12px] leading-5 text-secondaryText">
@@ -62,9 +62,9 @@ export function DashboardPage() {
           <StatusBadge label="ledger activo" tone="success" />
         </div>
       </section>
-      {error && <div className="rounded border border-red-200 bg-red-50 px-3 py-2 text-[12px] text-red-700">{error}</div>}
+      {error && <div className="shrink-0 rounded border border-red-200 bg-red-50 px-3 py-2 text-[12px] text-red-700">{error}</div>}
       <KpiStrip items={executiveKpis} />
-      <section className="grid min-h-0 flex-1 grid-cols-1 gap-3 xl:grid-cols-[1.3fr_0.7fr]">
+      <section className="grid min-h-0 flex-1 grid-cols-1 grid-rows-[minmax(0,1.3fr)_minmax(0,0.7fr)] gap-3 overflow-hidden xl:grid-cols-[1.3fr_0.7fr] xl:grid-rows-1">
         <div className="min-h-0 overflow-auto rounded border border-borderSoft bg-surface shadow-panel">
           <div className="border-b border-borderSoft px-3 py-2">
             <h2 className="text-[13px] font-semibold text-night">Cola priorizada</h2>
@@ -98,7 +98,7 @@ export function DashboardPage() {
             </tbody>
           </table>
         </div>
-        <aside className="rounded border border-borderSoft bg-surface p-3 shadow-panel">
+        <aside className="min-h-0 overflow-auto rounded border border-borderSoft bg-surface p-3 shadow-panel">
           <h2 className="text-[13px] font-semibold text-night">Principios activos</h2>
           <ul className="mt-3 space-y-2 text-[12px] leading-5 text-secondaryText">
             {principles.length ? (
