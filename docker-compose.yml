@@ -1,0 +1,68 @@
+services:
+  backend:
+    build:
+      context: ./backend
+    command: gunicorn config.wsgi:application --bind 0.0.0.0:8021 --workers 3
+    environment:
+      POSTGRES_ENGINE: django.db.backends.postgresql
+      POSTGRES_DB_NAME: litecore
+      POSTGRES_DB_USER: litecore
+      POSTGRES_DB_PASS: litecorepass
+      POSTGRES_DB_HOST: 10.11.0.30
+      POSTGRES_DB_PORT: "5433"
+      LITECORE_DB_NAME: litecore
+      LITECORE_DB_USER: litecore
+      LITECORE_DB_PASS: litecorepass
+      LITECORE_DB_HOST: 10.11.0.30
+      LITECORE_DB_PORT: "5433"
+      TMSWMS_DB_SCHEMA: tmswms
+      TMSWMS_DEFAULT_ACTOR: ${TMSWMS_DEFAULT_ACTOR:-eespinoza}
+      MASTER_DATA_PARQUET_DIR: /srv/data/parquet
+    expose:
+      - "8021"
+    volumes:
+      - ./backend:/app
+      - C:/cache:/srv/data/parquet:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  legacy-order-sync:
+    build:
+      context: ./backend
+    command: python manage.py sync_legacy_orders --watch --poll-interval ${LEGACY_ORDER_SYNC_INTERVAL_SECONDS:-60} --limit ${LEGACY_ORDER_SYNC_LIMIT:-100} --actor backend.sync
+    restart: unless-stopped
+    environment:
+      POSTGRES_ENGINE: django.db.backends.postgresql
+      POSTGRES_DB_NAME: litecore
+      POSTGRES_DB_USER: litecore
+      POSTGRES_DB_PASS: litecorepass
+      POSTGRES_DB_HOST: 10.11.0.30
+      POSTGRES_DB_PORT: "5433"
+      LITECORE_DB_NAME: litecore
+      LITECORE_DB_USER: litecore
+      LITECORE_DB_PASS: litecorepass
+      LITECORE_DB_HOST: 10.11.0.30
+      LITECORE_DB_PORT: "5433"
+      TMSWMS_DB_SCHEMA: tmswms
+    volumes:
+      - ./backend:/app
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  frontend:
+    build:
+      context: ./frontend
+    environment:
+      VITE_API_PROXY_TARGET: http://backend:8021
+      VITE_TMSWMS_ACTOR: ${VITE_TMSWMS_ACTOR:-eespinoza}
+    command: npm run dev
+    ports:
+      - "8021:8021"
+    volumes:
+      - ./frontend:/app
+      - frontend_node_modules:/app/node_modules
+    depends_on:
+      - backend
+
+volumes:
+  frontend_node_modules:
