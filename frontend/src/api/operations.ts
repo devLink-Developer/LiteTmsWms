@@ -1,4 +1,6 @@
 import { apiGet } from "./client";
+import { formatAppDateTime } from "../shared/utils/dateFormat";
+import { formatIdentifier } from "../shared/utils/identifierFormat";
 import type { Kpi, OperationModule, OperationRow, StatusTone, TimelineEvent } from "../types/operations";
 
 type ApiRecord = Record<string, unknown>;
@@ -19,7 +21,7 @@ const statusTones: Record<string, StatusTone> = {
 };
 
 function text(value: unknown, fallback = "-") {
-  return value === null || value === undefined || value === "" ? fallback : String(value);
+  return formatIdentifier(value, fallback);
 }
 
 function toneFor(status: string): StatusTone {
@@ -126,7 +128,7 @@ function timelineFor(record: ApiRecord): TimelineEvent[] {
       id: key,
       label,
       actor: "api",
-      at: text(record[key]),
+      at: formatAppDateTime(text(record[key]), text(record[key])),
       details: `Valor informado por backend para ${key}.`,
     }));
 }
@@ -143,7 +145,7 @@ export function mapOperationRows(moduleKey: string, records: ApiRecord[]): Opera
       owner: ownerFor(record, moduleKey),
       priority: moduleKey === "vehicles" ? first(record, ["status"]) : "-",
       quantity: quantityFor(record, moduleKey),
-      sla: first(record, ["planned_date", "posted_at"], "-"),
+      sla: formatAppDateTime(first(record, ["planned_date", "posted_at"], ""), "-"),
       raw: record,
       timeline: timelineFor(record),
     };

@@ -18,6 +18,10 @@ services:
       TMSWMS_DB_SCHEMA: tmswms
       TMSWMS_DEFAULT_ACTOR: ${TMSWMS_DEFAULT_ACTOR:-eespinoza}
       MASTER_DATA_PARQUET_DIR: /srv/data/parquet
+      ROUTING_PROVIDER: ${ROUTING_PROVIDER:-ors}
+      ORS_API_KEY: ${ORS_API_KEY:-}
+      ORS_BASE_URL: ${ORS_BASE_URL:-https://api.openrouteservice.org}
+      ROUTING_SERVICE_MINUTES_PER_STOP: ${ROUTING_SERVICE_MINUTES_PER_STOP:-10}
     expose:
       - "8021"
     volumes:
@@ -44,6 +48,10 @@ services:
       LITECORE_DB_HOST: 10.11.0.30
       LITECORE_DB_PORT: "5433"
       TMSWMS_DB_SCHEMA: tmswms
+      ROUTING_PROVIDER: ${ROUTING_PROVIDER:-ors}
+      ORS_API_KEY: ${ORS_API_KEY:-}
+      ORS_BASE_URL: ${ORS_BASE_URL:-https://api.openrouteservice.org}
+      ROUTING_SERVICE_MINUTES_PER_STOP: ${ROUTING_SERVICE_MINUTES_PER_STOP:-10}
     volumes:
       - ./backend:/app
     extra_hosts:

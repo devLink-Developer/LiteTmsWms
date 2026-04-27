@@ -1,4 +1,5 @@
 import type { OperationModule, OperationRow } from "../../types/operations";
+import { formatMaybeDateValue } from "../utils/dateFormat";
 import { StatusBadge } from "./StatusBadge";
 import { Timeline } from "./Timeline";
 
@@ -60,7 +61,7 @@ export function DrawerPanel({ module, row, onClose }: DrawerPanelProps) {
                 .map(([key, value]) => (
                   <div key={key} className="contents">
                     <dt>{key}</dt>
-                    <dd className="break-all font-mono text-night">{String(value ?? "-")}</dd>
+                    <dd className="break-all font-mono text-night">{formatMaybeDateValue(key, value)}</dd>
                   </div>
                 ))}
             </dl>

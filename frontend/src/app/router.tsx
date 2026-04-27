@@ -2,9 +2,15 @@ import { Navigate, createBrowserRouter, type RouteObject } from "react-router-do
 
 import { DashboardPage } from "../features/dashboard/DashboardPage";
 import { DeliveryExpeditionPage } from "../features/deliveries/DeliveryExpeditionPage";
+import { FleetAdminPage } from "../features/fleet/FleetAdminPage";
+import { DriverRouteExecutionPage } from "../features/reparto/DriverRouteExecutionPage";
 import { OperationalPage } from "../features/operations/OperationalPage";
 import { PlaceholderPage } from "../features/operations/PlaceholderPage";
+import { RepartoConfirmationPage } from "../features/reparto/RepartoConfirmationPage";
+import { RepartoPreparationPage } from "../features/reparto/RepartoPreparationPage";
+import { RoutePlanningPage } from "../features/routing/RoutePlanningPage";
 import { PreparationTasksPage } from "../features/tasks/PreparationTasksPage";
+import { TransfersPage } from "../features/transfers/TransfersPage";
 import { AppShell } from "../layouts/AppShell";
 import { placeholderPages, routedOperationModules } from "../shared/data/modules";
 
@@ -12,6 +18,11 @@ const legacyRedirects: RouteObject[] = [
   { path: "entregas", element: <Navigate to="/pedidos/entrega" replace /> },
   { path: "entregas/expedicion", element: <Navigate to="/pedidos/entrega" replace /> },
   { path: "tareas", element: <Navigate to="/pedidos/tareas" replace /> },
+  { path: "pedidos/reparto", element: <Navigate to="/reparto/confirmacion" replace /> },
+  { path: "ruteo", element: <Navigate to="/reparto/ruteo" replace /> },
+  { path: "hojas-ruta", element: <Navigate to="/reparto/hojas-ruta" replace /> },
+  { path: "vehiculos", element: <Navigate to="/maestros/vehiculos" replace /> },
+  { path: "choferes", element: <Navigate to="/maestros/choferes" replace /> },
   { path: "recepciones", element: <Navigate to="/ingresos/oc" replace /> },
   { path: "transferencias", element: <Navigate to="/ingresos/tr-depositos" replace /> },
   { path: "stock", element: <Navigate to="/stock/almacenes" replace /> },
@@ -26,7 +37,14 @@ export const appRoutes: RouteObject[] = [
       { index: true, element: <Navigate to="/pedidos/entrega" replace /> },
       { path: "dashboard", element: <DashboardPage /> },
       { path: "pedidos/entrega", element: <DeliveryExpeditionPage /> },
+      { path: "reparto/confirmacion", element: <RepartoConfirmationPage /> },
+      { path: "reparto/preparacion", element: <RepartoPreparationPage /> },
+      { path: "reparto/ruteo", element: <RoutePlanningPage /> },
+      { path: "reparto/chofer", element: <DriverRouteExecutionPage /> },
+      { path: "maestros/vehiculos", element: <FleetAdminPage initialTab="vehicles" /> },
+      { path: "maestros/choferes", element: <FleetAdminPage initialTab="drivers" /> },
       { path: "pedidos/tareas", element: <PreparationTasksPage /> },
+      { path: "ingresos/tr-depositos", element: <TransfersPage /> },
       ...legacyRedirects,
       ...routedOperationModules.map((module) => ({
         path: module.path.replace(/^\//, ""),

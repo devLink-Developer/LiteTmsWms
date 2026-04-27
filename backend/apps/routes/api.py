@@ -1,12 +1,83 @@
-from django.views.decorators.http import require_GET
+from __future__ import annotations
 
-from apps.common.api import json_response
+from django.conf import settings
+from django.db.models import Count
+from django.utils.dateparse import parse_date
+from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_GET, require_POST, require_http_methods
+
+from apps.common.api import error_response, json_response, parse_json_body, require_idempotency_key
+from apps.fulfillment.models import DeliveryOrder
+from apps.logistics.parquet_master_data import MasterDataSourceError, employee_delivery_permissions
 from apps.routes.models import RouteSheet
+from apps.routes.services import (
+    RouteCapacityError,
+    RouteRuleError,
+    close_route,
+    confirm_route,
+    create_route_sheet,
+    depart_route,
+    execute_delivery_stop,
+    optimize_route,
+    pending_reparto_deliveries,
+    serialize_route_sheet,
+    start_loading_route,
+    update_route_stops,
+)
 
 
-@require_GET
+def _request_actor(request) -> str:
+    user = getattr(request, "user", None)
+    if user is not None and getattr(user, "is_authenticated", False):
+        return user.get_username()
+    return (
+        request.headers.get("X-Actor", "")
+        or request.headers.get("X-User", "")
+        or request.headers.get("X-User-Email", "")
+        or settings.TMSWMS_DEFAULT_ACTOR
+        or "system"
+    ).strip()
+
+
+def _authorized_warehouses(request) -> list[str]:
+    return employee_delivery_permissions(_request_actor(request)).get("authorized_warehouses", [])
+
+
+def _route_error_response(exc: Exception):
+    if isinstance(exc, RouteCapacityError):
+        return error_response("capacity_violation", str(exc), status=422)
+    if isinstance(exc, RouteRuleError):
+        return error_response("business_rule_violation", str(exc), status=422)
+    if isinstance(exc, (RouteSheet.DoesNotExist, DeliveryOrder.DoesNotExist)):
+        return error_response("not_found", "Recurso logistico no encontrado.", status=404)
+    if isinstance(exc, ValueError):
+        return error_response("validation_error", str(exc), status=400)
+    return error_response("server_error", str(exc), status=500)
+
+
+@csrf_exempt
+@require_http_methods(["GET", "POST"])
 def route_sheets(request):
-    rows = RouteSheet.objects.select_related("vehicle", "vehicle__capacity_profile").order_by("-planned_date")[:100]
+    if request.method == "POST":
+        return create_sheet(request)
+    rows = RouteSheet.objects.select_related("vehicle", "vehicle__capacity_profile").order_by("-planned_date", "-created_at")
+    planned_date = parse_date(request.GET.get("planned_date", ""))
+    warehouse_ref = request.GET.get("warehouse_ref", "").strip() or request.GET.get("warehouse", "").strip()
+    status_filter = [
+        status.strip()
+        for status in request.GET.get("status", "").split(",")
+        if status.strip()
+    ]
+    if planned_date:
+        rows = rows.filter(planned_date=planned_date)
+    if warehouse_ref:
+        rows = rows.filter(warehouse_ref=warehouse_ref)
+    driver_ref = request.GET.get("driver_ref", "").strip() or request.GET.get("driver", "").strip()
+    if driver_ref:
+        rows = rows.filter(driver_ref=driver_ref)
+    if status_filter:
+        rows = rows.filter(status__in=status_filter)
+    rows = rows.annotate(stops_total=Count("stops"))[:100]
     return json_response(
         {
             "results": [
@@ -17,10 +88,176 @@ def route_sheets(request):
                     "planned_date": row.planned_date.isoformat(),
                     "warehouse_ref": row.warehouse_ref,
                     "vehicle": row.vehicle.code if row.vehicle else None,
+                    "driver_ref": row.driver_ref,
                     "planned_weight_kg": str(row.planned_weight_kg),
                     "planned_volume_m3": str(row.planned_volume_m3),
+                    "total_distance_km": str(row.total_distance_km),
+                    "total_time_minutes": row.total_time_minutes,
+                    "stops_count": row.stops_total,
                 }
                 for row in rows
             ]
         }
     )
+
+
+@require_GET
+def route_sheet_detail(request, route_id):
+    try:
+        route = RouteSheet.objects.get(id=route_id)
+    except RouteSheet.DoesNotExist:
+        return error_response("not_found", "Hoja de ruta no encontrada.", status=404)
+    return json_response({"result": serialize_route_sheet(route)})
+
+
+@require_GET
+def pending_deliveries(request):
+    planned_date = parse_date(request.GET.get("planned_date", ""))
+    try:
+        authorized_warehouses = _authorized_warehouses(request)
+    except MasterDataSourceError as exc:
+        return error_response("master_data_unavailable", str(exc), status=503)
+    warehouse_ref = request.GET.get("warehouse_ref", "").strip() or request.GET.get("warehouse", "").strip()
+    if warehouse_ref and authorized_warehouses and warehouse_ref not in authorized_warehouses:
+        return json_response({"results": []})
+    return json_response(
+        {
+            "results": pending_reparto_deliveries(
+                warehouse_ref=warehouse_ref,
+                planned_date=planned_date,
+                authorized_warehouses=authorized_warehouses,
+            )
+        }
+    )
+
+
+@csrf_exempt
+@require_POST
+def optimize(request):
+    try:
+        result = optimize_route(
+            payload=parse_json_body(request),
+            idempotency_key=require_idempotency_key(request),
+            actor=_request_actor(request),
+        )
+        return json_response(result.payload, status=result.status)
+    except Exception as exc:
+        return _route_error_response(exc)
+
+
+@csrf_exempt
+@require_POST
+def create_sheet(request):
+    try:
+        result = create_route_sheet(
+            payload=parse_json_body(request),
+            idempotency_key=require_idempotency_key(request),
+            actor=_request_actor(request),
+        )
+        return json_response(result.payload, status=result.status)
+    except Exception as exc:
+        return _route_error_response(exc)
+
+
+@csrf_exempt
+@require_http_methods(["PATCH"])
+def patch_stops(request, route_id):
+    try:
+        result = update_route_stops(
+            route_id=str(route_id),
+            payload=parse_json_body(request),
+            idempotency_key=require_idempotency_key(request),
+            actor=_request_actor(request),
+        )
+        return json_response(result.payload, status=result.status)
+    except Exception as exc:
+        return _route_error_response(exc)
+
+
+@csrf_exempt
+@require_http_methods(["PUT"])
+def confirm(request, route_id):
+    try:
+        result = confirm_route(
+            route_id=str(route_id),
+            payload=parse_json_body(request),
+            idempotency_key=require_idempotency_key(request),
+            actor=_request_actor(request),
+        )
+        return json_response(result.payload, status=result.status)
+    except Exception as exc:
+        return _route_error_response(exc)
+
+
+@csrf_exempt
+@require_POST
+def send_to_preparation(request, route_id):
+    try:
+        result = confirm_route(
+            route_id=str(route_id),
+            payload={**parse_json_body(request), "reviewed": True},
+            idempotency_key=require_idempotency_key(request),
+            actor=_request_actor(request),
+        )
+        return json_response(result.payload, status=result.status)
+    except Exception as exc:
+        return _route_error_response(exc)
+
+
+@csrf_exempt
+@require_POST
+def start_loading(request, route_id):
+    try:
+        result = start_loading_route(
+            route_id=str(route_id),
+            payload=parse_json_body(request),
+            idempotency_key=require_idempotency_key(request),
+            actor=_request_actor(request),
+        )
+        return json_response(result.payload, status=result.status)
+    except Exception as exc:
+        return _route_error_response(exc)
+
+
+@csrf_exempt
+@require_POST
+def depart(request, route_id):
+    try:
+        result = depart_route(
+            route_id=str(route_id),
+            payload=parse_json_body(request),
+            idempotency_key=require_idempotency_key(request),
+            actor=_request_actor(request),
+        )
+        return json_response(result.payload, status=result.status)
+    except Exception as exc:
+        return _route_error_response(exc)
+
+
+@csrf_exempt
+@require_POST
+def close(request, route_id):
+    try:
+        result = close_route(
+            route_id=str(route_id),
+            payload=parse_json_body(request),
+            idempotency_key=require_idempotency_key(request),
+            actor=_request_actor(request),
+        )
+        return json_response(result.payload, status=result.status)
+    except Exception as exc:
+        return _route_error_response(exc)
+
+
+@csrf_exempt
+@require_POST
+def execute_delivery(request):
+    try:
+        result = execute_delivery_stop(
+            payload=parse_json_body(request),
+            idempotency_key=require_idempotency_key(request),
+            actor=_request_actor(request),
+        )
+        return json_response(result.payload, status=result.status)
+    except Exception as exc:
+        return _route_error_response(exc)

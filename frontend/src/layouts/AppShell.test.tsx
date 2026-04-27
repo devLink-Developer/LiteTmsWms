@@ -32,7 +32,7 @@ describe("AppShell", () => {
 
   it("renders the grouped operations menu without Despacho tienda", async () => {
     render(
-      <MemoryRouter initialEntries={["/pedidos/reparto"]}>
+      <MemoryRouter initialEntries={["/reparto/confirmacion"]}>
         <AppShell />
       </MemoryRouter>,
     );
@@ -43,11 +43,25 @@ describe("AppShell", () => {
     expect(within(desktopNav).getByText("Pedidos")).toBeInTheDocument();
     expect(within(desktopNav).getByRole("link", { name: "Listar pedidos" })).toHaveAttribute("href", "/pedidos");
     expect(within(desktopNav).getByRole("link", { name: "Entrega" })).toHaveAttribute("href", "/pedidos/entrega");
-    expect(within(desktopNav).getByRole("link", { name: "Tareas de preparacion" })).toHaveAttribute(
+    expect(within(desktopNav).getByRole("link", { name: "Tareas de preparacion" })).toHaveAttribute("href", "/pedidos/tareas");
+    expect(within(desktopNav).getByText("Reparto")).toBeInTheDocument();
+    expect(within(desktopNav).getByRole("link", { name: "Confirmacion de reparto" })).toHaveAttribute(
       "href",
-      "/pedidos/tareas",
+      "/reparto/confirmacion",
     );
-    expect(within(desktopNav).getByRole("link", { name: "Reparto" })).toHaveAttribute("href", "/pedidos/reparto");
+    expect(within(desktopNav).getByRole("link", { name: "Preparacion de reparto" })).toHaveAttribute(
+      "href",
+      "/reparto/preparacion",
+    );
+    expect(within(desktopNav).getByRole("link", { name: "Ruteo" })).toHaveAttribute("href", "/reparto/ruteo");
+    expect(within(desktopNav).getByRole("link", { name: "Ejecucion chofer" })).toHaveAttribute(
+      "href",
+      "/reparto/chofer",
+    );
+    expect(within(desktopNav).getByRole("link", { name: "Hojas de ruta" })).toHaveAttribute(
+      "href",
+      "/reparto/hojas-ruta",
+    );
     expect(within(desktopNav).getByText("Ingresos")).toBeInTheDocument();
     expect(within(desktopNav).getByRole("link", { name: "Ingresos por OC" })).toHaveAttribute("href", "/ingresos/oc");
     expect(within(desktopNav).getByRole("link", { name: "Ingresos por TR entre depositos" })).toHaveAttribute(
@@ -59,6 +73,13 @@ describe("AppShell", () => {
       "/ingresos/devoluciones",
     );
     expect(within(desktopNav).getByText("Operaciones")).toBeInTheDocument();
+    expect(within(desktopNav).getByRole("link", { name: "Corte de chapas" })).toBeInTheDocument();
+    expect(within(desktopNav).getByText("Maestros")).toBeInTheDocument();
+    expect(within(desktopNav).getByRole("link", { name: "Vehiculo" })).toHaveAttribute(
+      "href",
+      "/maestros/vehiculos",
+    );
+    expect(within(desktopNav).getByRole("link", { name: "Choferes" })).toHaveAttribute("href", "/maestros/choferes");
     expect(screen.queryByText("Despacho tienda")).not.toBeInTheDocument();
   });
 });

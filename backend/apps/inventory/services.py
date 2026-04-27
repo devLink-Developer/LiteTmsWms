@@ -152,6 +152,7 @@ def reserve_inventory(
         requested_by=actor,
         created_by=actor,
     )
+    reservation_lines = []
     for index, line in enumerate(lines, start=1):
         qty = Decimal(line["quantity"])
         item_ref = line["item_ref"]
@@ -193,17 +194,21 @@ def reserve_inventory(
                 legacy_line_id=line.get("legacy_line_id", ""),
             )
         )
-        InventoryReservationLine.objects.create(
-            reservation=reservation,
-            warehouse_ref=line_warehouse_ref,
-            item_ref=item_ref,
-            requested_qty=qty,
-            reserved_qty=qty,
-            uom=uom,
-            legacy_sales_order_number=line.get("legacy_sales_order_number", ""),
-            legacy_line_id=line.get("legacy_line_id", ""),
-            created_by=actor,
+        reservation_lines.append(
+            InventoryReservationLine(
+                reservation=reservation,
+                warehouse_ref=line_warehouse_ref,
+                item_ref=item_ref,
+                requested_qty=qty,
+                reserved_qty=qty,
+                uom=uom,
+                legacy_sales_order_number=line.get("legacy_sales_order_number", ""),
+                legacy_line_id=line.get("legacy_line_id", ""),
+                created_by=actor,
+            )
         )
+    if reservation_lines:
+        InventoryReservationLine.objects.bulk_create(reservation_lines)
     reservation.status = InventoryReservation.ReservationStatus.ALLOCATED
     reservation.save(update_fields=["status", "updated_at"])
     return reservation
@@ -226,6 +231,8 @@ def pack_reserved_inventory(
     if reservation.status != InventoryReservation.ReservationStatus.ALLOCATED:
         raise InventoryRuleError("La reserva debe estar asignada para preparar stock.")
 
+    lines_to_update = []
+    now = timezone.now()
     for index, line in enumerate(reservation.lines.all(), start=1):
         qty = line.reserved_qty - line.fulfilled_qty
         if qty <= 0:
@@ -268,7 +275,14 @@ def pack_reserved_inventory(
         )
         line.fulfilled_qty += qty
         line.updated_by = actor
-        line.save(update_fields=["fulfilled_qty", "updated_by", "updated_at"])
+        line.updated_at = now
+        lines_to_update.append(line)
+
+    if lines_to_update:
+        InventoryReservationLine.objects.bulk_update(
+            lines_to_update,
+            ["fulfilled_qty", "updated_by", "updated_at"],
+        )
 
     reservation.status = InventoryReservation.ReservationStatus.CONSUMED
     reservation.updated_by = actor

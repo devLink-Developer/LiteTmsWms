@@ -65,6 +65,9 @@ class LegacyOrderLine(models.Model):
     shipping_warehouse_id = models.CharField(db_column="ShippingWarehouseId", max_length=60)
     fulfillment_store_id = models.CharField(db_column="FulfillmentStoreId", max_length=60)
     requested_shipping_date = models.DateTimeField(db_column="RequestedShippingDate")
+    line_delivery_date = models.DateTimeField(db_column="LineDeliveryDate", blank=True, null=True)
+    delivery_address_location_id = models.CharField(db_column="DeliveryAddressLocationId", max_length=60)
+    delivery_address_country_region_iso_code = models.CharField(db_column="DeliveryAddressCountryRegionIsoCode", max_length=60)
     delivery_address_state_id = models.CharField(db_column="DeliveryAddressStateId", max_length=60)
     delivery_address_city = models.CharField(db_column="DeliveryAddressCity", max_length=60)
     delivery_address_street = models.CharField(db_column="DeliveryAddressStreet", max_length=250)
@@ -131,6 +134,13 @@ class LegacyOrderInvoice(models.Model):
 class LegacyCustomer(models.Model):
     rec_id = models.UUIDField(db_column="RecId", primary_key=True)
     customer_account = models.CharField(db_column="CustomerAccount", max_length=20, unique=True)
+    party_type = models.CharField(db_column="PartyType", max_length=12)
+    tax_exempt_number = models.CharField(db_column="TaxExemptNumber", max_length=30)
+    receipt_email = models.CharField(db_column="ReceiptEmail", max_length=200)
+    tax_fiscal_identification_type = models.CharField(
+        db_column="AxxTaxFiscalIdentificationType_TaxFiscalIdentificationId",
+        max_length=10,
+    )
     organization_name = models.CharField(db_column="OrganizationName", max_length=200)
     person_first_name = models.CharField(db_column="PersonFirstName", max_length=120)
     person_last_name = models.CharField(db_column="PersonLastName", max_length=120)
@@ -141,6 +151,50 @@ class LegacyCustomer(models.Model):
     class Meta:
         managed = False
         db_table = '"Maestros_Clientes"'
+
+
+class LegacyCustomerAddress(models.Model):
+    rec_id = models.UUIDField(db_column="RecId", primary_key=True)
+    estado = models.BooleanField(db_column="Estado")
+    customer_account_number = models.CharField(db_column="CustomerAccountNumber", max_length=300)
+    address_location_id = models.CharField(db_column="AddressLocationId", max_length=300)
+    is_primary = models.CharField(db_column="IsPrimary", max_length=300)
+    is_role_delivery = models.CharField(db_column="IsRoleDelivery", max_length=300)
+    address_country_region_iso_code = models.CharField(db_column="AddressCountryRegionISOCode", max_length=300)
+    address_description = models.CharField(db_column="AddressDescription", max_length=300)
+    address_street_number = models.CharField(db_column="AddressStreetNumber", max_length=300)
+    address_city = models.CharField(db_column="AddressCity", max_length=300)
+    formatted_address = models.TextField(db_column="FormattedAddress")
+    address_longitude = models.DecimalField(db_column="AddressLongitude", max_digits=18, decimal_places=8)
+    address_zip_code = models.CharField(db_column="AddressZipCode", max_length=300)
+    address_street = models.CharField(db_column="AddressStreet", max_length=300)
+    address_latitude = models.DecimalField(db_column="AddressLatitude", max_digits=18, decimal_places=8)
+    address_state = models.CharField(db_column="AddressState", max_length=300)
+    attention_to_address_line = models.CharField(db_column="AttentionToAddressLine", max_length=300)
+    address_reference = models.CharField(db_column="AddressReference", max_length=300)
+    modified_datetime = models.DateTimeField(db_column="ModifiedDateTime", blank=True, null=True)
+
+    class Meta:
+        managed = False
+        db_table = '"Maestros_Clientes_Direcciones"'
+
+
+class LegacyCustomerContact(models.Model):
+    rec_id = models.UUIDField(db_column="RecId", primary_key=True)
+    estado = models.BooleanField(db_column="Estado")
+    customer_account = models.CharField(db_column="CustomerAccount", max_length=20)
+    electronic_address_id = models.CharField(db_column="ElectronicAddressId", max_length=100)
+    purpose = models.CharField(db_column="Purpose", max_length=100)
+    locator = models.CharField(db_column="Locator", max_length=200)
+    is_primary = models.BooleanField(db_column="IsPrimary")
+    description = models.CharField(db_column="Description", max_length=255)
+    type = models.CharField(db_column="Type", max_length=10)
+    modified_datetime = models.DateTimeField(db_column="ModifiedDateTime", blank=True, null=True)
+    created_datetime = models.DateTimeField(db_column="CreatedDateTime", blank=True, null=True)
+
+    class Meta:
+        managed = False
+        db_table = '"Maestros_Clientes_Contactos"'
 
 
 class LegacyItem(models.Model):

@@ -22,10 +22,13 @@ class FulfillmentOrder(TimestampedModel, LegacyReferenceModel):
     customer_ref = models.CharField(max_length=80)
     delivery_mode = models.CharField(max_length=60)
     requested_date = models.DateField(null=True, blank=True)
+    address_snapshot = models.JSONField(default=dict, blank=True)
 
     class Meta:
         indexes = [
             models.Index(fields=["status", "requested_date"]),
+            models.Index(fields=["warehouse_ref", "status", "requested_date"], name="ful_order_wh_st_req_idx"),
+            models.Index(fields=["delivery_mode", "status", "requested_date"], name="ful_order_mode_st_req_idx"),
             models.Index(fields=["legacy_sales_order_number"]),
             models.Index(fields=["customer_ref"]),
         ]
@@ -77,6 +80,8 @@ class DeliveryOrder(TimestampedModel, LegacyReferenceModel):
     class Meta:
         indexes = [
             models.Index(fields=["status", "planned_date"]),
+            models.Index(fields=["warehouse_ref", "status", "planned_date"], name="ful_deliv_wh_st_dt_idx"),
+            models.Index(fields=["delivery_mode", "status", "planned_date"], name="ful_deliv_mode_st_dt_idx"),
             models.Index(fields=["delivery_mode"]),
         ]
 
@@ -85,9 +90,15 @@ class DeliveryOrderLine(TimestampedModel, LegacyReferenceModel):
     delivery = models.ForeignKey(DeliveryOrder, related_name="lines", on_delete=models.CASCADE)
     fulfillment_line = models.ForeignKey(FulfillmentOrderLine, related_name="delivery_lines", on_delete=models.PROTECT)
     planned_qty = models.DecimalField(max_digits=18, decimal_places=6)
+    delivery_unit_qty = models.DecimalField(max_digits=18, decimal_places=6, default=0)
+    delivery_uom = models.CharField(max_length=20, blank=True)
+    conversion_factor = models.DecimalField(max_digits=18, decimal_places=6, default=1)
     dispatched_qty = models.DecimalField(max_digits=18, decimal_places=6, default=0)
     delivered_qty = models.DecimalField(max_digits=18, decimal_places=6, default=0)
     uom = models.CharField(max_length=20)
+    item_snapshot = models.JSONField(default=dict, blank=True)
+    planned_weight_kg = models.DecimalField(max_digits=18, decimal_places=6, default=0)
+    planned_volume_m3 = models.DecimalField(max_digits=18, decimal_places=6, default=0)
 
 
 class DeliverySplit(TimestampedModel, LegacyReferenceModel):
@@ -125,13 +136,14 @@ class DeliveryDocument(TimestampedModel, LegacyReferenceModel):
         REMITO = "remito", "Remito"
 
     class DocumentStatus(models.TextChoices):
-        ISSUED = "issued", "Emitido"
+        OPEN = "open", "Abierto"
+        CLOSED = "closed", "Cerrado"
         VOIDED = "voided", "Anulado"
 
     delivery = models.ForeignKey(DeliveryOrder, related_name="documents", on_delete=models.PROTECT)
     document_number = models.CharField(max_length=60, unique=True)
     document_type = models.CharField(max_length=30, choices=DocumentType.choices, default=DocumentType.REMITO)
-    status = models.CharField(max_length=30, choices=DocumentStatus.choices, default=DocumentStatus.ISSUED)
+    status = models.CharField(max_length=30, choices=DocumentStatus.choices, default=DocumentStatus.OPEN)
     issued_at = models.DateTimeField()
     customer_ref = models.CharField(max_length=80)
     address_snapshot = models.JSONField(default=dict, blank=True)
@@ -147,9 +159,47 @@ class DeliveryDocument(TimestampedModel, LegacyReferenceModel):
         ]
 
 
+class DeliveryExecution(TimestampedModel, LegacyReferenceModel):
+    class ExecutionStatus(models.TextChoices):
+        DELIVERED_COMPLETE = "delivered_complete", "Entregada completa"
+        DELIVERED_PARTIAL = "delivered_partial", "Entregada parcial"
+        NOT_DELIVERED = "not_delivered", "No entregada"
+
+    class FailureReason(models.TextChoices):
+        NONE = "", "Sin motivo"
+        CUSTOMER_ABSENT = "customer_absent", "Cliente ausente"
+        REJECTED = "rejected", "Rechazo"
+        LOGISTICS_ISSUE = "logistics_issue", "Problema logistico"
+        OTHER = "other", "Otro"
+
+    delivery = models.ForeignKey(DeliveryOrder, related_name="executions", on_delete=models.PROTECT)
+    route_stop_ref = models.CharField(max_length=80, blank=True)
+    status = models.CharField(max_length=40, choices=ExecutionStatus.choices)
+    reason = models.CharField(max_length=40, choices=FailureReason.choices, blank=True)
+    delivered_qty = models.DecimalField(max_digits=18, decimal_places=6, default=0)
+    returned_qty = models.DecimalField(max_digits=18, decimal_places=6, default=0)
+    executed_at = models.DateTimeField()
+    observations = models.TextField(blank=True)
+    evidence_payload = models.JSONField(default=dict, blank=True)
+    payload = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["delivery", "executed_at"]),
+            models.Index(fields=["route_stop_ref"]),
+            models.Index(fields=["status", "executed_at"]),
+        ]
+
+
 class DeliveryDocumentLine(TimestampedModel, LegacyReferenceModel):
     document = models.ForeignKey(DeliveryDocument, related_name="lines", on_delete=models.CASCADE)
     delivery_line = models.ForeignKey(DeliveryOrderLine, related_name="document_lines", on_delete=models.PROTECT)
     item_ref = models.CharField(max_length=60, blank=True)
     quantity = models.DecimalField(max_digits=18, decimal_places=6)
+    delivery_unit_qty = models.DecimalField(max_digits=18, decimal_places=6, default=0)
+    delivery_uom = models.CharField(max_length=20, blank=True)
+    conversion_factor = models.DecimalField(max_digits=18, decimal_places=6, default=1)
     uom = models.CharField(max_length=20)
+    item_snapshot = models.JSONField(default=dict, blank=True)
+    planned_weight_kg = models.DecimalField(max_digits=18, decimal_places=6, default=0)
+    planned_volume_m3 = models.DecimalField(max_digits=18, decimal_places=6, default=0)

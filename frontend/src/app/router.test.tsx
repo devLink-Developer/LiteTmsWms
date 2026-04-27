@@ -1,4 +1,5 @@
 import { render, screen, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { RouterProvider, createMemoryRouter } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -13,7 +14,12 @@ function jsonResponse(payload: unknown) {
 
 function renderRoute(path: string) {
   const router = createMemoryRouter(appRoutes, { initialEntries: [path] });
-  render(<RouterProvider router={router} />);
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+  render(
+    <QueryClientProvider client={client}>
+      <RouterProvider router={router} />
+    </QueryClientProvider>,
+  );
   return router;
 }
 
@@ -44,6 +50,11 @@ describe("app router", () => {
     ["/entregas", "/pedidos/entrega", "Expedicion de entregas"],
     ["/entregas/expedicion", "/pedidos/entrega", "Expedicion de entregas"],
     ["/tareas", "/pedidos/tareas", "Tareas de preparacion"],
+    ["/pedidos/reparto", "/reparto/confirmacion", "Confirmacion de reparto"],
+    ["/ruteo", "/reparto/ruteo", "Planificacion de reparto"],
+    ["/hojas-ruta", "/reparto/hojas-ruta", "Hojas de ruta"],
+    ["/vehiculos", "/maestros/vehiculos", "ABM de flota"],
+    ["/choferes", "/maestros/choferes", "ABM de flota"],
     ["/recepciones", "/ingresos/oc", "Ingresos por OC"],
     ["/stock", "/stock/almacenes", "Stock por almacen"],
     ["/despacho-tienda", "/pedidos/entrega", "Expedicion de entregas"],
@@ -57,10 +68,14 @@ describe("app router", () => {
   it.each([
     ["/pedidos", "Listar pedidos"],
     ["/pedidos/tareas", "Tareas de preparacion"],
-    ["/pedidos/reparto", "Reparto"],
-    ["/ingresos/tr-depositos", "Ingresos por TR entre depositos"],
+    ["/reparto/confirmacion", "Confirmacion de reparto"],
+    ["/reparto/preparacion", "Preparacion de reparto"],
+    ["/reparto/chofer", "Ejecucion chofer"],
+    ["/reparto/hojas-ruta", "Hojas de ruta"],
+    ["/maestros/vehiculos", "ABM de flota"],
+    ["/maestros/choferes", "ABM de flota"],
+    ["/ingresos/tr-depositos", "Transferencias entre sucursales"],
     ["/ingresos/devoluciones", "Ingresos por devoluciones"],
-    ["/hojas-ruta", "Hojas de ruta"],
     ["/stock/movimientos", "Movimientos de Stock"],
   ])("renders the operational route %s", async (path, heading) => {
     const router = renderRoute(path);

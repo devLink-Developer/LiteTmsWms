@@ -44,3 +44,36 @@ class Vehicle(TimestampedModel):
 
     def __str__(self) -> str:
         return f"{self.code} {self.plate}"
+
+
+class Driver(TimestampedModel):
+    class DriverStatus(models.TextChoices):
+        AVAILABLE = "available", "Disponible"
+        ASSIGNED = "assigned", "Asignado"
+        IN_ROUTE = "in_route", "En ruta"
+        SUSPENDED = "suspended", "Suspendido"
+        INACTIVE = "inactive", "Inactivo"
+
+    code = models.CharField(max_length=40, unique=True)
+    full_name = models.CharField(max_length=160)
+    document_number = models.CharField(max_length=40, blank=True)
+    phone = models.CharField(max_length=60, blank=True)
+    email = models.EmailField(blank=True)
+    license_number = models.CharField(max_length=80, blank=True)
+    license_category = models.CharField(max_length=40, blank=True)
+    license_expires_at = models.DateField(null=True, blank=True)
+    status = models.CharField(max_length=30, choices=DriverStatus.choices, default=DriverStatus.AVAILABLE)
+    branch_ref = models.CharField(max_length=80, blank=True)
+    warehouse_ref = models.CharField(max_length=80, blank=True)
+    active = models.BooleanField(default=True)
+    notes = models.TextField(blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["status", "branch_ref"]),
+            models.Index(fields=["warehouse_ref", "active"]),
+            models.Index(fields=["document_number"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.code} {self.full_name}"

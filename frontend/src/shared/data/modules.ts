@@ -23,8 +23,8 @@ export const operationModules: OperationModule[] = [
   },
   {
     key: "distribution",
-    label: "Reparto",
-    path: "/pedidos/reparto",
+    label: "Confirmacion de reparto",
+    path: "/reparto/confirmacion",
     description: "Entregas con metodo de envio Reparto, listas para evaluacion de ruteo.",
     apiPath: "/api/v1/fulfillment/deliveries/?delivery_mode=Reparto",
     columns: ["Entrega", "Estado", "Warehouse", "Modo", "Prioridad", "Cantidad", "SLA"],
@@ -64,7 +64,7 @@ export const operationModules: OperationModule[] = [
   {
     key: "routes",
     label: "Hojas de ruta",
-    path: "/hojas-ruta",
+    path: "/reparto/hojas-ruta",
     description: "Planificacion manual y automatica con peso, volumen y secuencia.",
     apiPath: "/api/v1/routes/",
     columns: ["Ruta", "Estado", "Warehouse", "Vehiculo", "Prioridad", "Paradas", "SLA"],
@@ -103,16 +103,27 @@ export const operationModules: OperationModule[] = [
     showInDashboard: false,
   },
   {
+    key: "reparto-preparation",
+    label: "Preparacion de reparto",
+    path: "/reparto/preparacion",
+    description: "Envio a preparacion, tareas abiertas y marcado de preparado para entregas por reparto.",
+    apiPath: "/api/v1/fulfillment/preparation-tasks/",
+    primaryAction: "Enviar a preparar",
+    columns: ["Entrega", "Estado", "Deposito", "Preparador", "Pedido", "Cantidad", "Asignada"],
+    permissions: ["deliveries:view", "tasks:prepare"],
+    hiddenFromNavigation: true,
+    showInDashboard: false,
+  },
+  {
     key: "vehicles",
-    label: "Vehiculos",
-    path: "/vehiculos",
-    description: "Capacidad por peso y volumen, disponibilidad y restricciones de uso.",
+    label: "Vehiculo",
+    path: "/maestros/vehiculos",
+    description: "Alta, baja y modificacion de vehiculos con capacidad, disponibilidad y restricciones de uso.",
     apiPath: "/api/v1/vehicles/",
     primaryAction: "Alta vehiculo",
     columns: ["Vehiculo", "Estado", "Base", "Perfil", "Prioridad", "Capacidad", "SLA"],
     permissions: ["vehicles:view", "vehicles:create", "vehicles:edit"],
     hiddenFromNavigation: true,
-    readOnly: true,
     showInDashboard: false,
   },
   {
@@ -182,24 +193,14 @@ export const routedOperationModules = [
   "receipts",
   "transfers",
   "returns",
-  "distribution",
   "routes",
   "stock",
   "stock-movements",
-  "vehicles",
   "audits",
   "shipping",
 ].map(operationModuleByKey);
 
 export const placeholderPages: PlaceholderPageConfig[] = [
-  {
-    key: "routing",
-    label: "Ruteo",
-    path: "/ruteo",
-    groupLabel: "Ruteo",
-    description: "Consola de armado de rutas pendiente de integracion con motor de ruteo.",
-    checkpoints: ["Vista read-only", "Sin optimizacion activa", "Pendiente de API de ruteo"],
-  },
   {
     key: "sheet-cutting",
     label: "Corte de chapas",
@@ -243,7 +244,17 @@ export const navigationEntries: NavigationEntry[] = [
       { key: "orders-list", label: "Listar pedidos", path: operationModuleByKey("orders").path, end: true },
       { key: "orders-delivery", label: "Entrega", path: operationModuleByKey("deliveries").path },
       { key: "orders-tasks", label: "Tareas de preparacion", path: operationModuleByKey("tasks").path },
-      { key: "orders-distribution", label: "Reparto", path: operationModuleByKey("distribution").path },
+    ],
+  },
+  {
+    key: "reparto",
+    label: "Reparto",
+    items: [
+      { key: "reparto-confirmation", label: "Confirmacion de reparto", path: operationModuleByKey("distribution").path },
+      { key: "reparto-preparation", label: "Preparacion de reparto", path: operationModuleByKey("reparto-preparation").path },
+      { key: "reparto-routing", label: "Ruteo", path: "/reparto/ruteo" },
+      { key: "reparto-driver-execution", label: "Ejecucion chofer", path: "/reparto/chofer" },
+      { key: "reparto-route-sheets", label: "Hojas de ruta", path: operationModuleByKey("routes").path },
     ],
   },
   {
@@ -255,8 +266,6 @@ export const navigationEntries: NavigationEntry[] = [
       { key: "income-returns", label: "Ingresos por devoluciones", path: operationModuleByKey("returns").path },
     ],
   },
-  { key: "routing", label: "Ruteo", path: placeholderPageByKey("routing").path },
-  { key: "route-sheets", label: "Hojas de ruta", path: operationModuleByKey("routes").path },
   { key: "stock", label: "Stock", path: operationModuleByKey("stock").path },
   { key: "stock-movements", label: "Movimientos de Stock", path: operationModuleByKey("stock-movements").path },
   {
@@ -266,6 +275,14 @@ export const navigationEntries: NavigationEntry[] = [
       { key: "sheet-cutting", label: "Corte de chapas", path: placeholderPageByKey("sheet-cutting").path },
       { key: "lot-to-balance", label: "Canje lote a saldo", path: placeholderPageByKey("lot-to-balance").path },
       { key: "breakages-losses", label: "Roturas y perdidas", path: placeholderPageByKey("breakages-losses").path },
+    ],
+  },
+  {
+    key: "masters",
+    label: "Maestros",
+    items: [
+      { key: "master-vehicles", label: "Vehiculo", path: "/maestros/vehiculos" },
+      { key: "master-drivers", label: "Choferes", path: "/maestros/choferes" },
     ],
   },
 ];

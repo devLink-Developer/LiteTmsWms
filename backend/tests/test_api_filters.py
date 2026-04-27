@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import json
+from datetime import date
 from datetime import timedelta
 from decimal import Decimal
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from django.test import TestCase
 from django.utils import timezone
@@ -88,6 +92,39 @@ class ApiFilterTests(TestCase):
         self.assertEqual(results[0]["warehouse_ref"], "WH-A")
         self.assertEqual(results[0]["item_ref"], "ITEM-1")
         self.assertEqual(results[0]["stock_state"], StockState.ON_HAND)
+
+    def test_pos_freight_product_refs_reads_automatic_freight_params(self):
+        from apps.logistics import parquet_master_data
+
+        parquet_master_data.pos_freight_product_refs.cache_clear()
+        with TemporaryDirectory() as tmp_dir:
+            master_dir = Path(tmp_dir)
+            params_path = master_dir / "parametros_pos.parquet"
+            params_path.write_text("", encoding="utf-8")
+            rows = [
+                {
+                    "Estado": True,
+                    "ParamName": "automatic_freight",
+                    "Params": json.dumps(
+                        {
+                            "enabled": True,
+                            "article_id": "13505c79-595e-4b89-8217-f8b97f4d2350",
+                            "article_name": "FLETE",
+                            "article_number": "350320",
+                        }
+                    ),
+                }
+            ]
+            with (
+                patch.object(parquet_master_data, "master_data_dir", return_value=master_dir),
+                patch.object(parquet_master_data, "_read_rows", return_value=(params_path, rows)),
+            ):
+                refs = parquet_master_data.pos_freight_product_refs("PRO3DP")
+
+        parquet_master_data.pos_freight_product_refs.cache_clear()
+        self.assertIn("350320", refs)
+        self.assertNotIn("FLETE", refs)
+        self.assertNotIn("13505c79-595e-4b89-8217-f8b97f4d2350", refs)
 
     def test_inventory_ledger_filters_by_supported_fields(self):
         now = timezone.now()
@@ -297,15 +334,16 @@ class ApiFilterTests(TestCase):
         fulfillment = FulfillmentOrder.objects.create(
             fulfillment_number="FUL-100",
             customer_ref="CUST-1",
-            delivery_mode="Reparto programado",
+            delivery_mode="Repart Prg",
             warehouse_ref="WH-A",
         )
         DeliveryOrder.objects.create(
             delivery_number="DEL-100",
             fulfillment=fulfillment,
             status=DeliveryOrder.DeliveryStatus.PREPARED,
-            delivery_mode="Reparto programado",
+            delivery_mode="Repart Prg",
             warehouse_ref="WH-A",
+            planned_date=date(2026, 4, 24),
         )
         DeliveryOrder.objects.create(
             delivery_number="DEL-200",
@@ -313,8 +351,59 @@ class ApiFilterTests(TestCase):
             status=DeliveryOrder.DeliveryStatus.PREPARED,
             delivery_mode="Retiro en tienda",
             warehouse_ref="WH-A",
+            planned_date=date(2026, 4, 24),
+        )
+        DeliveryOrder.objects.create(
+            delivery_number="DEL-300",
+            fulfillment=fulfillment,
+            status=DeliveryOrder.DeliveryStatus.PREPARED,
+            delivery_mode="Repart Prg",
+            warehouse_ref="WH-A",
+            planned_date=date(2026, 4, 25),
         )
 
-        results = self._results("/api/v1/fulfillment/deliveries/", {"delivery_mode": "Reparto"})
+        results = self._results(
+            "/api/v1/fulfillment/deliveries/",
+            {"delivery_mode": "Reparto", "planned_date": "2026-04-24"},
+        )
 
         self.assertEqual([row["delivery_number"] for row in results], ["DEL-100"])
+        self.assertEqual(results[0]["sales_order_number"], "")
+        self.assertEqual(results[0]["customer_ref"], "CUST-1")
+
+    def test_reparto_confirmation_queue_includes_uncreated_fulfillment_orders(self):
+        fulfillment = FulfillmentOrder.objects.create(
+            fulfillment_number="FUL-101",
+            customer_ref="CUST-1",
+            delivery_mode="Repart Prg",
+            warehouse_ref="WH-A",
+            requested_date=date(2026, 4, 24),
+            legacy_sales_order_number="VENT8-101",
+            address_snapshot={
+                "address_id": "ADDR-1",
+                "street": "Uruguay",
+                "street_number": "3947",
+                "city": "Posadas",
+            },
+        )
+        fulfillment.lines.create(
+            ordered_qty=Decimal("2"),
+            uom="UN",
+            item_ref="ITEM-1",
+            warehouse_ref="WH-A",
+            legacy_sales_order_number="VENT8-101",
+            legacy_line_id="10",
+        )
+
+        results = self._results(
+            "/api/v1/fulfillment/reparto-confirmation/",
+            {"planned_date": "2026-04-24"},
+        )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["source_type"], "fulfillment")
+        self.assertEqual(results[0]["sales_order_number"], "VENT8-101")
+        self.assertEqual(results[0]["delivery_number"], "sin entrega")
+        self.assertEqual(results[0]["address_snapshot"]["address_id"], "ADDR-1")
+        self.assertEqual(results[0]["address_snapshot"]["street"], "Uruguay")
+        self.assertEqual(results[0]["lines"][0]["split_qty"], "2.000000")

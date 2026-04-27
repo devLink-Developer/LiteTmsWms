@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { DeliveryExpeditionPage } from "./DeliveryExpeditionPage";
@@ -17,6 +17,31 @@ describe("DeliveryExpeditionPage", () => {
       "fetch",
       vi.fn(async (input: RequestInfo | URL) => {
         const url = String(input);
+        if (url.includes("/stock-check")) {
+          return {
+            ok: true,
+            json: async () => ({
+              result: {
+                reference_type: "fulfillment_order",
+                reference_id: "order-184",
+                reference_number: "PED-000184",
+                status: "ok",
+                can_confirm: true,
+                issues: [],
+                lines: [
+                  {
+                    line_id: "184-1",
+                    item_ref: "CER-104",
+                    warehouse_ref: "PS003MT",
+                    planned_qty: "2.88",
+                    available_qty: "4",
+                    uom: "m2",
+                  },
+                ],
+              },
+            }),
+          };
+        }
         if (url.includes("/validate-stock")) {
           deliveryStatus = "confirmed";
           return {
@@ -147,6 +172,10 @@ describe("DeliveryExpeditionPage", () => {
                     id: "184-1",
                     legacy_line_id: "1",
                     item_ref: "CER-104",
+                    item_name: "Ceramica Calacatta",
+                    item_long_name: "Ceramica Calacatta 60x60 caja 1,44",
+                    category: "Ceramicos",
+                    coverage_group: "STK",
                     warehouse_ref: "PS003MT",
                     ordered_qty: "18",
                     reserved_qty: "18",
@@ -157,7 +186,45 @@ describe("DeliveryExpeditionPage", () => {
                     planned_qty: "10",
                     stock_available: "14",
                     max_dispatchable_qty: "4",
-                    uom: "CJ",
+                    uom: "m2",
+                    sales_uom: "m2",
+                    delivery_uom: "caja",
+                    conversion_factor: "1.44",
+                    planned_delivery_unit_qty: "6.94",
+                    max_dispatchable_delivery_unit_qty: "2",
+                    unit_weight_kg: "15",
+                    unit_volume_m3: "0.02",
+                    planned_weight_kg: "150",
+                    planned_volume_m3: "0.2",
+                  },
+                  {
+                    id: "184-2",
+                    legacy_line_id: "2",
+                    item_ref: "SIN-001",
+                    item_name: "Articulo sin disponible",
+                    item_long_name: "Articulo sin disponible",
+                    category: "Sin stock",
+                    coverage_group: "STK",
+                    warehouse_ref: "PS003MT",
+                    ordered_qty: "1",
+                    reserved_qty: "0",
+                    prepared_qty: "0",
+                    delivered_qty: "0",
+                    cancelled_qty: "0",
+                    pending_qty: "1",
+                    planned_qty: "0",
+                    stock_available: "0",
+                    max_dispatchable_qty: "0",
+                    uom: "Un",
+                    sales_uom: "Un",
+                    delivery_uom: "Un",
+                    conversion_factor: "1",
+                    planned_delivery_unit_qty: "0",
+                    max_dispatchable_delivery_unit_qty: "0",
+                    unit_weight_kg: "1",
+                    unit_volume_m3: "0.001",
+                    planned_weight_kg: "0",
+                    planned_volume_m3: "0",
                   },
                 ],
                 deliveries: [
@@ -167,8 +234,21 @@ describe("DeliveryExpeditionPage", () => {
                     status: deliveryStatus,
                     delivery_mode: "Reparto programado",
                     planned_date: "2026-04-24",
+                    warehouse_ref: "PS003MT",
                     documents: [],
-                    lines: [{ id: "dl-1", fulfillment_line_id: "184-1", item_ref: "CER-104", planned_qty: "6", uom: "CJ" }],
+                    lines: [
+                      {
+                        id: "dl-1",
+                        fulfillment_line_id: "184-1",
+                        item_ref: "CER-104",
+                        planned_qty: "8.64",
+                        delivery_unit_qty: "6",
+                        delivery_uom: "caja",
+                        conversion_factor: "1.44",
+                        uom: "m2",
+                        warehouse_ref: "PS003MT",
+                      },
+                    ],
                   },
                   {
                     id: "del-184-2",
@@ -176,10 +256,70 @@ describe("DeliveryExpeditionPage", () => {
                     status: "planned",
                     delivery_mode: "Reparto programado",
                     planned_date: "2026-04-25",
+                    warehouse_ref: "PS003MT",
                     documents: [],
-                    lines: [{ id: "dl-2", fulfillment_line_id: "184-1", item_ref: "CER-104", planned_qty: "4", uom: "CJ" }],
+                    lines: [
+                      {
+                        id: "dl-2",
+                        fulfillment_line_id: "184-1",
+                        item_ref: "CER-104",
+                        planned_qty: "5.76",
+                        delivery_unit_qty: "4",
+                        delivery_uom: "caja",
+                        conversion_factor: "1.44",
+                        uom: "m2",
+                        warehouse_ref: "PS003MT",
+                      },
+                    ],
+                  },
+                  {
+                    id: "del-184-3",
+                    delivery_number: "ENT-000184-3",
+                    status: "delivered_complete",
+                    delivery_mode: "Reparto programado",
+                    planned_date: "2026-04-24",
+                    warehouse_ref: "PS003MT",
+                    address_snapshot: {
+                      receiver: "Autorizado Remito",
+                      reference: "Retiro remito",
+                    },
+                    documents: [
+                      {
+                        id: "doc-184-3",
+                        document_number: "R-ENT-000184-3",
+                        document_type: "remito",
+                        status: "issued",
+                        issued_at: "2026-04-24T12:46:00Z",
+                      },
+                    ],
+                    lines: [
+                      {
+                        id: "dl-3",
+                        fulfillment_line_id: "184-1",
+                        item_ref: "CER-104",
+                        planned_qty: "1.44",
+                        delivery_unit_qty: "1",
+                        delivery_uom: "caja",
+                        conversion_factor: "1.44",
+                        uom: "m2",
+                        warehouse_ref: "PS003MT",
+                      },
+                    ],
                   },
                 ],
+                customer: {
+                  customer_ref: "CLI-10924",
+                  name: "Ricardo Ortigoza",
+                  document_type: "DNI",
+                  document_number: "30111222",
+                  phone: "3764000000",
+                  email: "cliente@example.com",
+                  address_text: "Uruguay 3947, Posadas",
+                },
+                pickup_authorization: {
+                  name: "Ricardo Ortigoza",
+                  reference: "Retiro con DNI",
+                },
               },
             ],
           }),
@@ -198,10 +338,37 @@ describe("DeliveryExpeditionPage", () => {
     fireEvent.click(screen.getByRole("button", { name: "Buscar pendientes" }));
 
     await waitFor(() => expect(screen.getAllByText("PED-000184").length).toBeGreaterThan(0));
+    expect(screen.getAllByText("Ricardo Ortigoza").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Ceramica Calacatta").length).toBeGreaterThan(0);
     expect(screen.getAllByText("ENT-000184-1").length).toBeGreaterThan(0);
     expect(screen.getAllByText("ENT-000184-2").length).toBeGreaterThan(0);
+    expect(screen.getByText("Articulos remitidos")).toBeInTheDocument();
+    expect(screen.getByText("Almacen retiro")).toBeInTheDocument();
+    expect(screen.getAllByText("PS003MT").length).toBeGreaterThan(0);
+    expect(screen.getByText("6 caja")).toBeInTheDocument();
+    expect(screen.getAllByText("04/24/2026").length).toBeGreaterThan(0);
+    expect(screen.getByLabelText("Cantidad a entregar SIN-001")).toBeDisabled();
     expect(screen.getByRole("button", { name: "Agregar entrega" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Generar remito" })).toBeDisabled();
+  });
+
+  it("shows remito summary without changing the central delivery", async () => {
+    render(<DeliveryExpeditionPage />);
+
+    fireEvent.change(screen.getByLabelText("Busqueda"), { target: { value: "PED-000184" } });
+    fireEvent.click(screen.getByRole("button", { name: "Buscar pendientes" }));
+
+    await waitFor(() => expect(screen.getAllByText("ENT-000184-3").length).toBeGreaterThan(0));
+    const centralPanel = screen.getByRole("main");
+    expect(within(centralPanel).getByText("ENT-000184-1")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /ENT-000184-3/ }));
+
+    expect(within(centralPanel).getByText("ENT-000184-1")).toBeInTheDocument();
+    expect(within(centralPanel).queryByText("ENT-000184-3")).not.toBeInTheDocument();
+    expect(screen.getAllByText("R-ENT-000184-3").length).toBeGreaterThan(0);
+    await waitFor(() => expect(screen.getByText("Autorizado Remito")).toBeInTheDocument());
+    expect(screen.getByText("1 caja")).toBeInTheDocument();
   });
 
   it("moves a delivery through preparation before enabling remito", async () => {
@@ -234,14 +401,25 @@ describe("DeliveryExpeditionPage", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: "Agregar entrega" })).toBeInTheDocument());
     fireEvent.click(screen.getByRole("button", { name: "Agregar entrega" }));
     const qtyInput = screen.getByLabelText("Cantidad a entregar CER-104") as HTMLInputElement;
+    const blockedInput = screen.getByLabelText("Cantidad a entregar SIN-001") as HTMLInputElement;
     expect(qtyInput.value).toBe("0");
+    expect(blockedInput).toBeDisabled();
     expect(screen.getByRole("button", { name: "Confirmar entrega" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Entregar todo" })).not.toBeDisabled();
 
+    fireEvent.change(qtyInput, { target: { value: "99" } });
+    expect(qtyInput.value).toBe("2");
+
     fireEvent.click(screen.getByRole("button", { name: "Entregar todo" }));
-    expect(qtyInput.value).toBe("4");
-    await waitFor(() => expect(screen.getByRole("button", { name: "Confirmar entrega" })).not.toBeDisabled());
+    expect(qtyInput.value).toBe("2");
+    expect(screen.getAllByText(/43,2 kg/).length).toBeGreaterThan(0);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Validar Stock" })).not.toBeDisabled());
+    expect(screen.getByRole("button", { name: "Confirmar entrega" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Enviar a preparar" })).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Validar Stock" }));
+    await waitFor(() => expect(screen.getByText(/Stock validado. Puede confirmar/)).toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "Confirmar entrega" })).not.toBeDisabled();
 
     fireEvent.click(screen.getByRole("button", { name: "Confirmar entrega" }));
     await waitFor(() => expect(screen.getByText(/ENT-000184-1 confirmada; stock reservado./)).toBeInTheDocument());

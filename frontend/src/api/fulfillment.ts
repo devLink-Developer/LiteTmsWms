@@ -4,6 +4,10 @@ export type ApiFulfillmentLine = {
   id: string;
   legacy_line_id: string;
   item_ref: string;
+  item_name?: string;
+  item_long_name?: string;
+  category?: string;
+  coverage_group?: string;
   warehouse_ref: string;
   ordered_qty: string;
   reserved_qty: string;
@@ -15,6 +19,16 @@ export type ApiFulfillmentLine = {
   stock_available?: string;
   max_dispatchable_qty?: string;
   uom: string;
+  sales_uom?: string;
+  delivery_uom?: string;
+  conversion_factor?: string;
+  planned_delivery_unit_qty?: string;
+  max_dispatchable_delivery_unit_qty?: string;
+  unit_weight_kg?: string;
+  unit_volume_m3?: string;
+  planned_weight_kg?: string;
+  planned_volume_m3?: string;
+  item_snapshot?: Record<string, string>;
 };
 
 export type ApiDeliveryLine = {
@@ -22,10 +36,19 @@ export type ApiDeliveryLine = {
   fulfillment_line_id: string;
   legacy_line_id: string;
   item_ref: string;
+  item_name?: string;
   planned_qty: string;
+  delivery_unit_qty?: string;
+  delivery_uom?: string;
+  conversion_factor?: string;
   dispatched_qty: string;
   delivered_qty: string;
   uom: string;
+  warehouse_ref?: string;
+  store_ref?: string;
+  planned_weight_kg?: string;
+  planned_volume_m3?: string;
+  item_snapshot?: Record<string, string>;
 };
 
 export type ApiDeliveryDocument = {
@@ -87,10 +110,94 @@ export type ApiDeliveryOrder = {
   planned_date: string | null;
   fulfillment_id: string;
   sales_order_number: string;
+  warehouse_ref?: string;
+  store_ref?: string;
   address_snapshot?: Record<string, string>;
   lines: ApiDeliveryLine[];
   documents: ApiDeliveryDocument[];
   preparation_task?: ApiDeliveryPreparationTask | null;
+  totals?: {
+    delivery_unit_qty: string;
+    commercial_qty: string;
+    planned_weight_kg: string;
+    planned_volume_m3: string;
+  };
+};
+
+export type ApiRepartoDelivery = {
+  id: string;
+  source_type: "delivery" | "fulfillment";
+  delivery_id: string | null;
+  delivery_number: string;
+  status: string;
+  delivery_mode: string;
+  warehouse_ref: string;
+  planned_date: string | null;
+  fulfillment_id: string;
+  fulfillment_number: string;
+  sales_order_number: string;
+  transaction_number: string;
+  customer_ref: string;
+  documents_count: number;
+  lines_count: number;
+  total_qty: string;
+  total_weight_kg: string;
+  total_volume_m3: string;
+  address_snapshot?: Record<string, string>;
+  lines: Array<{
+    delivery_line_id?: string | null;
+    fulfillment_line_id: string;
+    item_ref: string;
+    item_name?: string;
+    item_long_name?: string;
+    warehouse_ref: string;
+    split_qty: string;
+    delivery_unit_qty?: string;
+    uom: string;
+    delivery_uom?: string;
+    planned_weight_kg?: string;
+    planned_volume_m3?: string;
+    stock_available?: string;
+    max_dispatchable_qty?: string;
+  }>;
+};
+
+export type ApiStockValidationIssue = {
+  line_id: string;
+  item_ref: string;
+  warehouse_ref: string;
+  planned_qty: string;
+  available_qty: string;
+  uom: string;
+  reason?: string;
+};
+
+export type ApiStockValidationResult = {
+  reference_type: string;
+  reference_id: string;
+  reference_number: string;
+  status: "ok" | "insufficient";
+  can_confirm: boolean;
+  issues: ApiStockValidationIssue[];
+  lines: Array<ApiStockValidationIssue & { fulfillment_line_id?: string; packed_qty?: string }>;
+};
+
+export type ApiCustomerSnapshot = {
+  customer_ref: string;
+  name: string;
+  document_type?: string;
+  document_number?: string;
+  phone?: string;
+  email?: string;
+  address?: Record<string, string>;
+  address_text?: string;
+  source?: string;
+};
+
+export type ApiPickupAuthorization = {
+  name: string;
+  reference?: string;
+  source?: string;
 };
 
 export type ApiFulfillmentOrder = {
@@ -104,6 +211,8 @@ export type ApiFulfillmentOrder = {
   customer_ref: string;
   customer_dni?: string;
   customer_document?: string;
+  customer?: ApiCustomerSnapshot;
+  pickup_authorization?: ApiPickupAuthorization;
   delivery_mode: string;
   requested_date: string | null;
   warehouse_ref: string;
@@ -143,16 +252,54 @@ export async function fetchExpeditionQueue(search: ExpeditionQueueSearch) {
   return result.results ?? [];
 }
 
+export async function fetchRepartoDeliveries(filters: {
+  plannedDate?: string;
+  warehouse?: string;
+  status?: string;
+  query?: string;
+}) {
+  const params = new URLSearchParams();
+  if (filters.plannedDate) params.set("planned_date", filters.plannedDate);
+  if (filters.warehouse) params.set("warehouse", filters.warehouse);
+  if (filters.status) params.set("status", filters.status);
+  if (filters.query) params.set("q", filters.query);
+  const result = await apiGet<ApiRepartoDelivery>(`/api/v1/fulfillment/reparto-confirmation/?${params.toString()}`);
+  if (result.error) {
+    throw new Error(result.error.message);
+  }
+  return result.results ?? [];
+}
+
 export async function splitFulfillmentDelivery(
   fulfillmentId: string,
   payload: {
     delivery_mode: string;
     planned_date: string;
     reason: string;
-    lines: Array<{ fulfillment_line_id: string; split_qty: number }>;
+    receiver?: string;
+    reference?: string;
+    lines: Array<{ fulfillment_line_id: string; delivery_unit_qty?: number; split_qty?: number }>;
   },
 ) {
   const result = await apiPost<CommandResult<ApiDeliveryOrder>>(`/api/v1/fulfillment/${fulfillmentId}/split`, payload);
+  return result.result;
+}
+
+export async function checkFulfillmentStock(
+  fulfillmentId: string,
+  lines: Array<{ fulfillment_line_id: string; delivery_unit_qty?: number; split_qty?: number }>,
+) {
+  const result = await apiPost<CommandResult<ApiStockValidationResult>>(
+    `/api/v1/fulfillment/${fulfillmentId}/stock-check`,
+    { lines },
+  );
+  return result.result;
+}
+
+export async function checkDeliveryStock(deliveryId: string) {
+  const result = await apiPost<CommandResult<ApiStockValidationResult>>(
+    `/api/v1/fulfillment/deliveries/${deliveryId}/stock-check`,
+  );
   return result.result;
 }
 

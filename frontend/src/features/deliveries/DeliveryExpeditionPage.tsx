@@ -1,6 +1,8 @@
 import { type FormEvent, useEffect, useMemo, useState } from "react";
 
 import {
+  checkDeliveryStock,
+  checkFulfillmentStock,
   confirmDeliveryStock,
   downloadDeliveryRemitoPdf,
   fetchExpeditionQueue,
@@ -9,10 +11,14 @@ import {
   sendDeliveryToPrepare,
   splitFulfillmentDelivery,
   type ApiDeliveryOrder,
+  type ApiFulfillmentLine,
+  type ApiStockValidationResult,
   type ExpeditionQueueSearch,
   type ApiFulfillmentOrder,
 } from "../../api/fulfillment";
 import { StatusBadge } from "../../shared/components/StatusBadge";
+import { formatAppDate, formatAppDateTime } from "../../shared/utils/dateFormat";
+import { formatIdentifier } from "../../shared/utils/identifierFormat";
 import type { StatusTone } from "../../types/operations";
 
 type DeliveryStatus = "draft" | "reserved" | "preparing" | "prepared" | "remito";
@@ -21,6 +27,7 @@ type DeliverySource = "api" | "draft";
 type DeliveryLineAllocation = {
   lineId: string;
   qty: number;
+  warehouse?: string;
 };
 
 type DeliveryDraft = {
@@ -32,7 +39,10 @@ type DeliveryDraft = {
   plannedDate: string;
   receiver: string;
   reference: string;
+  warehouse: string;
+  store: string;
   remitoNumber?: string;
+  issuedAt?: string;
   preparationAssignee?: string;
   preparationTaskStatus?: string;
   lines: DeliveryLineAllocation[];
@@ -42,6 +52,10 @@ type ExpeditionLine = {
   id: string;
   itemRef: string;
   description: string;
+  itemName: string;
+  itemLongName: string;
+  category: string;
+  coverageGroup: string;
   orderedQty: number;
   reservedQty: number;
   preparedQty: number;
@@ -51,6 +65,15 @@ type ExpeditionLine = {
   stockAvailable: number;
   maxDispatchableQty: number;
   uom: string;
+  salesUom: string;
+  deliveryUom: string;
+  conversionFactor: number;
+  plannedDeliveryUnitQty: number;
+  maxDispatchableDeliveryUnitQty: number;
+  unitWeightKg: number;
+  unitVolumeM3: number;
+  plannedWeightKg: number;
+  plannedVolumeM3: number;
   warehouse: string;
   location: string;
 };
@@ -62,6 +85,9 @@ type ExpeditionOrder = {
   customerName: string;
   customerRef: string;
   customerDni: string;
+  customerDocumentType: string;
+  customerPhone: string;
+  customerEmail: string;
   warehouse: string;
   base: string;
   status: string;
@@ -70,6 +96,8 @@ type ExpeditionOrder = {
   requestedDate: string;
   address: string;
   contact: string;
+  pickupAuthorizedName: string;
+  pickupAuthorizedReference: string;
   lines: ExpeditionLine[];
   deliveries: DeliveryDraft[];
 };
@@ -81,6 +109,12 @@ type DraftState = {
 
 type ValidationMessage = {
   tone: StatusTone;
+  text: string;
+} | null;
+
+type StockValidationState = {
+  key: string;
+  ok: boolean;
   text: string;
 } | null;
 
@@ -132,8 +166,33 @@ function asNumber(value: string | number | null | undefined) {
   return Number.isFinite(numberValue) ? numberValue : 0;
 }
 
+function lineConversionFactor(line: ApiFulfillmentLine) {
+  return Math.max(asNumber(line.conversion_factor) || 1, 0.000001);
+}
+
+function lineMaxDeliveryUnits(line: ApiFulfillmentLine) {
+  const explicitValue = asNumber(line.max_dispatchable_delivery_unit_qty);
+  if (explicitValue > 0) {
+    return explicitValue;
+  }
+  return Math.floor(asNumber(line.max_dispatchable_qty) / lineConversionFactor(line));
+}
+
 function formatQty(value: number, uom?: string) {
   return `${new Intl.NumberFormat("es-AR", { maximumFractionDigits: 2 }).format(value)}${uom ? ` ${uom}` : ""}`;
+}
+
+function formatMeasure(value: number, uom: string, maximumFractionDigits = 3) {
+  return `${new Intl.NumberFormat("es-AR", { maximumFractionDigits }).format(value)} ${uom}`;
+}
+
+function formatStockValidationIssues(result: ApiStockValidationResult) {
+  if (!result.issues.length) {
+    return "Stock validado. Puede confirmar para reservar las cantidades.";
+  }
+  return result.issues
+    .map((issue) => `${issue.item_ref}: solicitado ${formatQty(asNumber(issue.planned_qty), issue.uom)}, disponible ${formatQty(asNumber(issue.available_qty), issue.uom)}`)
+    .join(" / ");
 }
 
 function getDeliveryLineQty(delivery: DeliveryDraft | undefined, lineId: string) {
@@ -144,9 +203,95 @@ function sumDeliveryQty(delivery: DeliveryDraft) {
   return delivery.lines.reduce((total, line) => total + line.qty, 0);
 }
 
-function getMaxDispatchableQty(line: ExpeditionLine, delivery?: DeliveryDraft) {
+function getCommercialQty(line: ExpeditionLine, delivery?: DeliveryDraft) {
+  return getDeliveryLineQty(delivery, line.id) * line.conversionFactor;
+}
+
+function getMaxDispatchableDeliveryUnitQty(line: ExpeditionLine, delivery?: DeliveryDraft) {
   const currentDeliveryQty = delivery?.source === "api" && delivery.status !== "remito" ? getDeliveryLineQty(delivery, line.id) : 0;
-  return Math.max(0, line.maxDispatchableQty + currentDeliveryQty);
+  return Math.max(0, Math.floor(line.maxDispatchableDeliveryUnitQty + currentDeliveryQty));
+}
+
+function getDeliveryTotals(order: ExpeditionOrder | undefined, delivery: DeliveryDraft | undefined) {
+  if (!order || !delivery) {
+    return {
+      deliveryUnits: 0,
+      commercialQty: 0,
+      weightKg: 0,
+      volumeM3: 0,
+    };
+  }
+  return delivery.lines.reduce(
+    (totals, allocation) => {
+      const line = order.lines.find((orderLine) => orderLine.id === allocation.lineId);
+      if (!line) {
+        return totals;
+      }
+      const commercialQty = allocation.qty * line.conversionFactor;
+      return {
+        deliveryUnits: totals.deliveryUnits + allocation.qty,
+        commercialQty: totals.commercialQty + commercialQty,
+        weightKg: totals.weightKg + commercialQty * line.unitWeightKg,
+        volumeM3: totals.volumeM3 + commercialQty * line.unitVolumeM3,
+      };
+    },
+    {
+      deliveryUnits: 0,
+      commercialQty: 0,
+      weightKg: 0,
+      volumeM3: 0,
+    },
+  );
+}
+
+function getDeliveryLineSummaries(order: ExpeditionOrder | undefined, delivery: DeliveryDraft | undefined) {
+  if (!order || !delivery) {
+    return [];
+  }
+  return delivery.lines
+    .filter((allocation) => allocation.qty > 0)
+    .map((allocation) => {
+      const orderLine = order.lines.find((line) => line.id === allocation.lineId);
+      const commercialQty = orderLine ? allocation.qty * orderLine.conversionFactor : allocation.qty;
+      return {
+        id: allocation.lineId,
+        itemRef: orderLine?.itemRef ?? allocation.lineId,
+        itemName: orderLine?.itemName ?? allocation.lineId,
+        deliveryQty: allocation.qty,
+        deliveryUom: orderLine?.deliveryUom ?? orderLine?.uom ?? "",
+        commercialQty,
+        commercialUom: orderLine?.uom ?? "",
+        conversionFactor: orderLine?.conversionFactor ?? 1,
+        warehouse: allocation.warehouse || orderLine?.warehouse || delivery.warehouse || order.warehouse,
+      };
+    });
+}
+
+function getDeliveryWarehouse(order: ExpeditionOrder | undefined, delivery: DeliveryDraft | undefined) {
+  const warehouses = Array.from(new Set(getDeliveryLineSummaries(order, delivery).map((line) => line.warehouse).filter(Boolean)));
+  if (warehouses.length === 1) {
+    return warehouses[0];
+  }
+  if (warehouses.length > 1) {
+    return `Varios: ${warehouses.join(", ")}`;
+  }
+  return delivery?.warehouse || order?.warehouse || "s/d";
+}
+
+function getInvalidDeliveryQtyCount(order: ExpeditionOrder | undefined, delivery: DeliveryDraft | undefined) {
+  if (!order || !delivery || delivery.status !== "draft") {
+    return 0;
+  }
+  return delivery.lines.filter((allocation) => {
+    if (allocation.qty <= 0) {
+      return false;
+    }
+    const orderLine = order.lines.find((line) => line.id === allocation.lineId);
+    if (!orderLine) {
+      return true;
+    }
+    return allocation.qty > getMaxDispatchableDeliveryUnitQty(orderLine, delivery);
+  }).length;
 }
 
 function isOperationalDelivery(delivery: DeliveryDraft) {
@@ -154,7 +299,7 @@ function isOperationalDelivery(delivery: DeliveryDraft) {
 }
 
 function deliveryStatusFromApi(delivery: ApiDeliveryOrder): DeliveryStatus {
-  if (delivery.documents.some((document) => document.document_type === "remito" && document.status === "issued")) {
+  if (delivery.documents.some((document) => document.document_type === "remito" && ["issued", "open", "closed"].includes(document.status))) {
     return "remito";
   }
   if (delivery.status === "delivered_complete" || delivery.status === "delivered_partial") {
@@ -189,7 +334,7 @@ function orderStatusFromApi(order: ApiFulfillmentOrder) {
 }
 
 function deliveryFromApi(delivery: ApiDeliveryOrder): DeliveryDraft {
-  const remito = delivery.documents.find((document) => document.document_type === "remito" && document.status === "issued");
+  const remito = delivery.documents.find((document) => document.document_type === "remito" && ["issued", "open", "closed"].includes(document.status));
   return {
     id: delivery.id,
     number: delivery.delivery_number,
@@ -199,52 +344,84 @@ function deliveryFromApi(delivery: ApiDeliveryOrder): DeliveryDraft {
     plannedDate: delivery.planned_date ?? "",
     receiver: delivery.address_snapshot?.receiver ?? delivery.sales_order_number,
     reference: delivery.address_snapshot?.reference ?? delivery.delivery_number,
+    warehouse: delivery.warehouse_ref || delivery.lines.find((line) => line.warehouse_ref)?.warehouse_ref || "",
+    store: delivery.store_ref || "",
     remitoNumber: remito?.document_number,
+    issuedAt: remito?.issued_at,
     preparationAssignee: delivery.preparation_task?.assigned_employee_ref,
     preparationTaskStatus: delivery.preparation_task?.status,
     lines: delivery.lines.map((line) => ({
       lineId: line.fulfillment_line_id,
-      qty: asNumber(line.planned_qty),
+      qty: asNumber(line.delivery_unit_qty ?? line.planned_qty),
+      warehouse: line.warehouse_ref,
     })),
   };
 }
 
 function orderFromApi(order: ApiFulfillmentOrder): ExpeditionOrder {
   const firstDeliveryAddress = order.deliveries.find((delivery) => delivery.address_snapshot)?.address_snapshot ?? {};
+  const customerAddress = order.customer?.address ?? {};
   const requestedDate = order.requested_date ?? order.created_at.slice(0, 10);
   return {
     id: order.id,
-    orderNumber: order.sales_order_number || order.fulfillment_number,
+    orderNumber: formatIdentifier(order.sales_order_number || order.fulfillment_number),
     transactionNumber: order.transaction_number,
-    customerName: order.customer_ref,
+    customerName: order.customer?.name || order.customer_ref,
     customerRef: order.customer_ref,
-    customerDni: order.customer_dni ?? order.customer_document ?? "",
+    customerDni: order.customer?.document_number ?? order.customer_dni ?? order.customer_document ?? "",
+    customerDocumentType: order.customer?.document_type ?? "",
+    customerPhone: order.customer?.phone ?? "",
+    customerEmail: order.customer?.email ?? "",
     warehouse: order.warehouse_ref,
     base: order.warehouse_ref || "S/E",
     status: orderStatusFromApi(order),
     priority: order.deliveries.length ? "En gestion" : "Nueva",
     deliveryType: order.delivery_mode || "Sin modalidad",
     requestedDate,
-    address: [firstDeliveryAddress.description, firstDeliveryAddress.street, firstDeliveryAddress.city]
-      .filter(Boolean)
-      .join(" / ") || "Direccion no informada por snapshot TMS/WMS",
-    contact: order.customer_ref,
-    lines: order.lines.map((line) => ({
-      id: line.id,
-      itemRef: line.item_ref,
-      description: `Linea legacy ${line.legacy_line_id}`,
-      orderedQty: asNumber(line.ordered_qty),
-      reservedQty: asNumber(line.reserved_qty),
-      preparedQty: asNumber(line.prepared_qty),
-      deliveredQty: asNumber(line.delivered_qty),
-      pendingQty: asNumber(line.pending_qty),
-      plannedQty: asNumber(line.planned_qty),
-      stockAvailable: asNumber(line.stock_available),
-      maxDispatchableQty: asNumber(line.max_dispatchable_qty),
-      uom: line.uom,
-      warehouse: line.warehouse_ref,
-      location: line.warehouse_ref,
-    })),
+    address:
+      order.customer?.address_text ||
+      [firstDeliveryAddress.description, firstDeliveryAddress.street, firstDeliveryAddress.city]
+        .filter(Boolean)
+        .join(" / ") ||
+      [customerAddress.description, customerAddress.street, customerAddress.street_number, customerAddress.city]
+        .filter(Boolean)
+        .join(" ") ||
+      "Direccion no informada por snapshot TMS/WMS",
+    contact: [order.customer?.phone, order.customer?.email].filter(Boolean).join(" / ") || order.customer_ref,
+    pickupAuthorizedName: order.pickup_authorization?.name || order.customer?.name || order.customer_ref,
+    pickupAuthorizedReference: order.pickup_authorization?.reference || "",
+    lines: order.lines.map((line) => {
+      const displayUom = line.sales_uom || line.uom;
+      return {
+        id: line.id,
+        itemRef: line.item_ref,
+        description: line.item_long_name || line.item_name || `Linea legacy ${line.legacy_line_id}`,
+        itemName: line.item_name || line.item_long_name || line.item_ref,
+        itemLongName: line.item_long_name || line.item_name || line.item_ref,
+        category: line.category || "",
+        coverageGroup: line.coverage_group || "",
+        orderedQty: asNumber(line.ordered_qty),
+        reservedQty: asNumber(line.reserved_qty),
+        preparedQty: asNumber(line.prepared_qty),
+        deliveredQty: asNumber(line.delivered_qty),
+        pendingQty: asNumber(line.pending_qty),
+        plannedQty: asNumber(line.planned_qty),
+        stockAvailable: asNumber(line.stock_available),
+        maxDispatchableQty: asNumber(line.max_dispatchable_qty),
+        uom: displayUom,
+        salesUom: displayUom,
+        deliveryUom: line.delivery_uom || displayUom,
+        conversionFactor: lineConversionFactor(line),
+        plannedDeliveryUnitQty: asNumber(line.planned_delivery_unit_qty),
+        maxDispatchableDeliveryUnitQty: lineMaxDeliveryUnits(line),
+        unitWeightKg: asNumber(line.unit_weight_kg),
+        unitVolumeM3: asNumber(line.unit_volume_m3),
+        plannedWeightKg: asNumber(line.planned_weight_kg),
+        plannedVolumeM3: asNumber(line.planned_volume_m3),
+        warehouse: line.warehouse_ref,
+        location: line.warehouse_ref,
+      };
+    }),
     deliveries: order.deliveries.map(deliveryFromApi),
   };
 }
@@ -271,6 +448,7 @@ export function DeliveryExpeditionPage() {
   const [orders, setOrders] = useState<ExpeditionOrder[]>([]);
   const [activeOrderId, setActiveOrderId] = useState("");
   const [activeDeliveryId, setActiveDeliveryId] = useState("");
+  const [summaryDeliveryId, setSummaryDeliveryId] = useState("");
   const [draftState, setDraftState] = useState<DraftState>(null);
   const [search, setSearch] = useState<SearchState>({
     mode: "sales_order",
@@ -278,6 +456,7 @@ export function DeliveryExpeditionPage() {
   });
   const [submittedSearch, setSubmittedSearch] = useState<ExpeditionQueueSearch | null>(null);
   const [message, setMessage] = useState<ValidationMessage>(null);
+  const [stockValidation, setStockValidation] = useState<StockValidationState>(null);
   const [loading, setLoading] = useState(false);
   const [processing, setProcessing] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -330,7 +509,28 @@ export function DeliveryExpeditionPage() {
   }, [activeOrder, draftState]);
   const activeDelivery =
     visibleDeliveries.find((delivery) => delivery.id === activeDeliveryId) ?? visibleDeliveries.find(isOperationalDelivery);
+  const summaryDelivery = visibleDeliveries.find((delivery) => delivery.id === summaryDeliveryId) ?? activeDelivery ?? visibleDeliveries[0];
   const canEditActiveDelivery = activeDelivery?.source === "draft";
+
+  useEffect(() => {
+    if (!activeOrder || draftState?.orderId !== activeOrder.id) {
+      return;
+    }
+    let changed = false;
+    const nextLines = draftState.delivery.lines.map((allocation) => {
+      const orderLine = activeOrder.lines.find((line) => line.id === allocation.lineId);
+      const maxUnits = orderLine ? getMaxDispatchableDeliveryUnitQty(orderLine, draftState.delivery) : 0;
+      const nextQty = Math.min(Math.max(0, allocation.qty), maxUnits);
+      if (nextQty !== allocation.qty) {
+        changed = true;
+        return { ...allocation, qty: nextQty };
+      }
+      return allocation;
+    });
+    if (changed) {
+      setDraftState({ orderId: activeOrder.id, delivery: { ...draftState.delivery, lines: nextLines } });
+    }
+  }, [activeOrder, draftState]);
 
   useEffect(() => {
     if (!activeOrder) {
@@ -349,6 +549,17 @@ export function DeliveryExpeditionPage() {
     setActiveDeliveryId(visibleDeliveries.find(isOperationalDelivery)?.id ?? "");
   }, [activeDeliveryId, activeOrder, draftState, visibleDeliveries]);
 
+  useEffect(() => {
+    if (!activeOrder) {
+      setSummaryDeliveryId("");
+      return;
+    }
+    if (summaryDeliveryId && visibleDeliveries.some((delivery) => delivery.id === summaryDeliveryId)) {
+      return;
+    }
+    setSummaryDeliveryId(activeDelivery?.id ?? visibleDeliveries[0]?.id ?? "");
+  }, [activeDelivery, activeOrder, summaryDeliveryId, visibleDeliveries]);
+
   function updateSearch(key: keyof SearchState, value: string) {
     setSearch((current) => ({ ...current, [key]: value }));
   }
@@ -361,7 +572,9 @@ export function DeliveryExpeditionPage() {
       setOrders([]);
       setActiveOrderId("");
       setActiveDeliveryId("");
+      setSummaryDeliveryId("");
       setDraftState(null);
+      setStockValidation(null);
       return;
     }
     const nextSearch = { mode: search.mode, value };
@@ -369,17 +582,22 @@ export function DeliveryExpeditionPage() {
     setOrders([]);
     setActiveOrderId("");
     setActiveDeliveryId("");
+    setSummaryDeliveryId("");
     setDraftState(null);
+    setStockValidation(null);
     setMessage(null);
     void loadQueue(nextSearch);
   }
 
   function selectOrder(order: ExpeditionOrder) {
+    const firstOperationalDeliveryId = order.deliveries.find(isOperationalDelivery)?.id ?? "";
     setActiveOrderId(order.id);
-    setActiveDeliveryId(order.deliveries.find(isOperationalDelivery)?.id ?? "");
+    setActiveDeliveryId(firstOperationalDeliveryId);
+    setSummaryDeliveryId(firstOperationalDeliveryId || order.deliveries[0]?.id || "");
     if (draftState?.orderId !== order.id) {
       setDraftState(null);
     }
+    setStockValidation(null);
     setMessage(null);
   }
 
@@ -395,15 +613,20 @@ export function DeliveryExpeditionPage() {
       status: "draft",
       mode: activeOrder.deliveryType,
       plannedDate: activeOrder.requestedDate,
-      receiver: activeOrder.customerRef,
-      reference: "Pendiente de confirmacion",
+      receiver: activeOrder.pickupAuthorizedName,
+      reference: activeOrder.pickupAuthorizedReference || "Pendiente de confirmacion",
+      warehouse: activeOrder.warehouse,
+      store: "",
       lines: activeOrder.lines.map((line) => ({
         lineId: line.id,
         qty: 0,
+        warehouse: line.warehouse,
       })),
     };
     setDraftState({ orderId: activeOrder.id, delivery: draft });
     setActiveDeliveryId(draft.id);
+    setSummaryDeliveryId(draft.id);
+    setStockValidation(null);
     setMessage({ tone: "info", text: "Completa cantidades manualmente o usa Entregar todo para cargar el maximo entregable." });
   }
 
@@ -412,18 +635,26 @@ export function DeliveryExpeditionPage() {
       return;
     }
     setDraftState({ orderId: activeOrder.id, delivery: updater(draftState.delivery) });
+    setStockValidation(null);
     setMessage(null);
   }
 
   function updateLineQty(lineId: string, value: string) {
-    if (!canEditActiveDelivery) {
+    if (!canEditActiveDelivery || !activeOrder) {
       return;
     }
     const qty = Number(value);
-    const nextQty = Number.isFinite(qty) ? Math.max(0, qty) : 0;
     updateDraftDelivery((delivery) => ({
       ...delivery,
-      lines: delivery.lines.map((line) => (line.lineId === lineId ? { ...line, qty: nextQty } : line)),
+      lines: delivery.lines.map((line) => {
+        if (line.lineId !== lineId) {
+          return line;
+        }
+        const orderLine = activeOrder.lines.find((candidate) => candidate.id === lineId);
+        const maxUnits = orderLine ? getMaxDispatchableDeliveryUnitQty(orderLine, delivery) : 0;
+        const requestedQty = Number.isFinite(qty) ? Math.max(0, qty) : 0;
+        return { ...line, qty: Math.min(requestedQty, maxUnits) };
+      }),
     }));
   }
 
@@ -444,7 +675,7 @@ export function DeliveryExpeditionPage() {
         const orderLine = activeOrder.lines.find((line) => line.id === deliveryLine.lineId);
         return {
           ...deliveryLine,
-          qty: orderLine ? getMaxDispatchableQty(orderLine, delivery) : 0,
+          qty: orderLine ? getMaxDispatchableDeliveryUnitQty(orderLine, delivery) : 0,
         };
       }),
     }));
@@ -456,30 +687,78 @@ export function DeliveryExpeditionPage() {
     }
     const lines = delivery.lines
       .filter((line) => line.qty > 0)
-      .map((line) => ({ fulfillment_line_id: line.lineId, split_qty: line.qty }));
+      .map((line) => ({ fulfillment_line_id: line.lineId, delivery_unit_qty: line.qty }));
     if (!lines.length) {
       throw new Error("La entrega no tiene cantidades a despachar.");
     }
     activeOrder.lines.forEach((line) => {
-      const plannedQty = getDeliveryLineQty(delivery, line.id);
-      const maxQty = getMaxDispatchableQty(line, delivery);
-      if (plannedQty > maxQty) {
-        throw new Error(`${line.itemRef}: solicitado ${formatQty(plannedQty)}, disponible ${formatQty(maxQty, line.uom)}`);
+      const plannedUnits = getDeliveryLineQty(delivery, line.id);
+      const maxUnits = getMaxDispatchableDeliveryUnitQty(line, delivery);
+      if (plannedUnits > maxUnits) {
+        throw new Error(`${line.itemRef}: solicitado ${formatQty(plannedUnits, line.deliveryUom)}, disponible ${formatQty(maxUnits, line.deliveryUom)}`);
       }
     });
     const created = await splitFulfillmentDelivery(activeOrder.id, {
       delivery_mode: delivery.mode,
       planned_date: delivery.plannedDate,
       reason: delivery.reference || "Split desde pantalla de expedicion",
+      receiver: delivery.receiver,
+      reference: delivery.reference,
       lines,
     });
     setDraftState(null);
     return created;
   }
 
+  async function validateActiveDeliveryStock(stockKey: string) {
+    if (!activeOrder || !activeDelivery) {
+      setMessage({ tone: "danger", text: "Primero selecciona o crea una entrega para validar stock." });
+      return;
+    }
+    if (activeDelivery.status !== "draft") {
+      setMessage({ tone: "info", text: "Esta entrega ya no requiere validacion previa de stock." });
+      return;
+    }
+    if (activeDeliveryQty <= 0) {
+      setMessage({ tone: "danger", text: "La entrega no tiene cantidades a despachar." });
+      return;
+    }
+    if (activeDeliveryHasInvalidQty) {
+      setMessage({ tone: "danger", text: "Revisa cantidades superiores al disponible antes de validar stock." });
+      return;
+    }
+    setProcessing(true);
+    try {
+      const result =
+        activeDelivery.source === "draft"
+          ? await checkFulfillmentStock(
+              activeOrder.id,
+              activeDelivery.lines
+                .filter((line) => line.qty > 0)
+                .map((line) => ({ fulfillment_line_id: line.lineId, delivery_unit_qty: line.qty })),
+            )
+          : await checkDeliveryStock(activeDelivery.id);
+      const text = formatStockValidationIssues(result);
+      setStockValidation({ key: stockKey, ok: result.can_confirm, text });
+      setMessage({ tone: result.can_confirm ? "success" : "danger", text });
+    } catch (apiError) {
+      setStockValidation(null);
+      setMessage({
+        tone: "danger",
+        text: apiError instanceof Error ? apiError.message : "No se pudo validar el stock.",
+      });
+    } finally {
+      setProcessing(false);
+    }
+  }
+
   async function confirmActiveDelivery() {
     if (!activeDelivery) {
       setMessage({ tone: "danger", text: "Primero selecciona o crea una entrega para confirmar." });
+      return null;
+    }
+    if (activeDelivery.status === "draft" && !(stockValidation?.key === activeDeliveryStockKey && stockValidation.ok)) {
+      setMessage({ tone: "danger", text: "Valida stock antes de confirmar. La confirmacion es la que reserva y bloquea la cantidad." });
       return null;
     }
     setProcessing(true);
@@ -491,6 +770,8 @@ export function DeliveryExpeditionPage() {
         await loadQueue(submittedSearch, { silent: true });
       }
       setActiveDeliveryId(confirmed.id);
+      setSummaryDeliveryId(confirmed.id);
+      setStockValidation(null);
       setMessage({ tone: "success", text: `${confirmed.delivery_number} confirmada; stock reservado.` });
       return confirmed;
     } catch (apiError) {
@@ -516,6 +797,7 @@ export function DeliveryExpeditionPage() {
         await loadQueue(submittedSearch, { silent: true });
       }
       setActiveDeliveryId(preparing.id);
+      setSummaryDeliveryId(preparing.id);
       setMessage({ tone: "success", text: `${preparing.delivery_number} enviada a preparar.` });
     } catch (apiError) {
       setMessage({
@@ -539,6 +821,7 @@ export function DeliveryExpeditionPage() {
         await loadQueue(submittedSearch, { silent: true });
       }
       setActiveDeliveryId(prepared.id);
+      setSummaryDeliveryId(prepared.id);
       setMessage({ tone: "success", text: `${prepared.delivery_number} marcada como preparada.` });
     } catch (apiError) {
       setMessage({
@@ -567,6 +850,7 @@ export function DeliveryExpeditionPage() {
         await loadQueue(submittedSearch, { silent: true });
       }
       setActiveDeliveryId("");
+      setSummaryDeliveryId(deliveryId);
       setMessage({ tone: "info", text: `Remito ${document.document_number} generado desde TMS/WMS.` });
     } catch (apiError) {
       setMessage({
@@ -578,7 +862,31 @@ export function DeliveryExpeditionPage() {
     }
   }
 
-  const activeDeliveryQty = activeDelivery ? sumDeliveryQty(activeDelivery) : 0;
+  const activeDeliveryTotals = getDeliveryTotals(activeOrder, activeDelivery);
+  const activeDeliveryQty = activeDeliveryTotals.deliveryUnits;
+  const summaryDeliveryTotals = getDeliveryTotals(activeOrder, summaryDelivery);
+  const summaryDeliveryLines = getDeliveryLineSummaries(activeOrder, summaryDelivery);
+  const summaryDeliveryWarehouse = getDeliveryWarehouse(activeOrder, summaryDelivery);
+  const activeDeliveryHasInvalidQty = getInvalidDeliveryQtyCount(activeOrder, activeDelivery) > 0;
+  const activeDeliveryStockKey =
+    activeOrder && activeDelivery
+      ? [
+          activeOrder.id,
+          activeDelivery.id,
+          activeDelivery.source,
+          activeDelivery.status,
+          activeDelivery.mode,
+          activeDelivery.plannedDate,
+          activeDelivery.lines.map((line) => `${line.lineId}:${line.qty}:${line.warehouse ?? ""}`).join("|"),
+        ].join("::")
+      : "";
+  const activeStockValidation = stockValidation?.key === activeDeliveryStockKey ? stockValidation : null;
+  const canConfirmActiveDelivery =
+    !!activeDelivery &&
+    activeDelivery.status === "draft" &&
+    activeDeliveryQty > 0 &&
+    !activeDeliveryHasInvalidQty &&
+    activeStockValidation?.ok === true;
   const workflowActions = (
     <div className="flex flex-wrap items-center gap-2">
       <button
@@ -599,7 +907,15 @@ export function DeliveryExpeditionPage() {
       </button>
       <button
         type="button"
-        disabled={!activeDelivery || activeDelivery.status !== "draft" || activeDeliveryQty <= 0 || processing}
+        disabled={!activeDelivery || activeDelivery.status !== "draft" || activeDeliveryQty <= 0 || activeDeliveryHasInvalidQty || processing}
+        onClick={() => void validateActiveDeliveryStock(activeDeliveryStockKey)}
+        className="min-h-10 rounded border border-emerald-200 bg-emerald-50 px-3 text-[12px] font-semibold text-emerald-800 transition hover:bg-emerald-100 focus:outline-none focus:ring-2 focus:ring-emerald-500/20 disabled:bg-softStart disabled:text-secondaryText"
+      >
+        Validar Stock
+      </button>
+      <button
+        type="button"
+        disabled={!canConfirmActiveDelivery || processing}
         onClick={() => void confirmActiveDelivery()}
         className="min-h-10 rounded border border-primary/30 bg-primary/10 px-3 text-[12px] font-semibold text-primaryHover transition hover:bg-primary/15 focus:outline-none focus:ring-2 focus:ring-primary/20 disabled:bg-softStart"
       >
@@ -719,48 +1035,80 @@ export function DeliveryExpeditionPage() {
           {activeOrder ? (
             <>
               <div className="shrink-0 border-b border-borderSoft px-3 py-3">
-                <div className="flex flex-wrap items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <p className="text-[11px] font-semibold uppercase text-secondaryText">Pedido seleccionado</p>
-                  <h2 className="mt-1 font-mono text-[18px] font-semibold text-night">{activeOrder.orderNumber}</h2>
-                  <p className="mt-1 max-w-3xl text-[12px] leading-5 text-secondaryText">
-                    {activeOrder.customerName} / {activeOrder.address}
-                  </p>
-                </div>
-                <div className="grid grid-cols-2 gap-2 text-[11px] md:grid-cols-4">
-                  <div>
-                    <div className="font-semibold text-secondaryText">Cliente</div>
-                    <div className="mt-1 font-mono text-night">{activeOrder.customerRef}</div>
+                <div className="grid items-start gap-3 2xl:grid-cols-[minmax(0,0.9fr)_minmax(440px,1.1fr)]">
+                  <div className="min-w-0 self-start">
+                    <p className="text-[11px] font-semibold uppercase text-secondaryText">Pedido seleccionado</p>
+                    <h2 className="mt-1 font-mono text-[18px] font-semibold text-night">{activeOrder.orderNumber}</h2>
+                    <p className="mt-1 max-w-3xl text-[12px] leading-5 text-secondaryText">
+                      {activeOrder.customerName} / {activeOrder.address}
+                    </p>
+                    <p className="mt-1 max-w-3xl text-[12px] leading-5 text-secondaryText">
+                      Autorizado a retirar: <span className="font-semibold text-night">{activeOrder.pickupAuthorizedName}</span>
+                      {activeOrder.pickupAuthorizedReference ? ` / ${activeOrder.pickupAuthorizedReference}` : ""}
+                    </p>
                   </div>
-                  <div>
-                    <div className="font-semibold text-secondaryText">Deposito</div>
-                    <div className="mt-1 font-mono text-night">{activeOrder.warehouse}</div>
-                  </div>
-                  <div>
-                    <div className="font-semibold text-secondaryText">Base</div>
-                    <div className="mt-1 font-mono text-night">{activeOrder.base}</div>
-                  </div>
-                  <div>
-                    <div className="font-semibold text-secondaryText">Solicitado</div>
-                    <div className="mt-1 font-mono text-night">{activeOrder.requestedDate}</div>
-                  </div>
-                  {activeOrder.customerDni && (
-                    <div>
-                      <div className="font-semibold text-secondaryText">DNI</div>
-                      <div className="mt-1 font-mono text-night">{activeOrder.customerDni}</div>
+
+                  <div className="min-w-0">
+                    <div className="grid grid-cols-2 gap-x-3 gap-y-2 text-[11px] lg:grid-cols-4">
+                      <div>
+                        <div className="font-semibold text-secondaryText">Cliente</div>
+                        <div className="mt-1 font-mono text-night">{activeOrder.customerRef}</div>
+                      </div>
+                      <div>
+                        <div className="font-semibold text-secondaryText">Documento</div>
+                        <div className="mt-1 font-mono text-night">
+                          {[activeOrder.customerDocumentType, activeOrder.customerDni].filter(Boolean).join(" ") || "s/d"}
+                        </div>
+                      </div>
+                      <div className="min-w-0">
+                        <div className="font-semibold text-secondaryText">Contacto</div>
+                        <div className="mt-1 truncate text-night">{activeOrder.contact || "s/d"}</div>
+                      </div>
+                      <div>
+                        <div className="font-semibold text-secondaryText">Deposito</div>
+                        <div className="mt-1 font-mono text-night">{activeOrder.warehouse}</div>
+                      </div>
+                      <div>
+                        <div className="font-semibold text-secondaryText">Base</div>
+                        <div className="mt-1 font-mono text-night">{activeOrder.base}</div>
+                      </div>
+                      <div>
+                        <div className="font-semibold text-secondaryText">Solicitado</div>
+                        <div className="mt-1 font-mono text-night">{formatAppDate(activeOrder.requestedDate)}</div>
+                      </div>
+                      <div>
+                        <div className="font-semibold text-secondaryText">Peso total</div>
+                        <div className="mt-1 font-mono text-night">{formatMeasure(activeDeliveryTotals.weightKg, "kg")}</div>
+                      </div>
+                      <div>
+                        <div className="font-semibold text-secondaryText">Volumen total</div>
+                        <div className="mt-1 font-mono text-night">{formatMeasure(activeDeliveryTotals.volumeM3, "m3", 4)}</div>
+                      </div>
                     </div>
-                  )}
-                </div>
+
+                  </div>
                 </div>
               </div>
 
               <section className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-borderSoft bg-white px-3 py-2">
                 <div className="min-w-0 text-[12px] text-secondaryText">
                   {activeDelivery ? (
-                    <>
-                      Entrega activa <span className="font-mono font-semibold text-night">{activeDelivery.number}</span> /
-                      cantidad total <span className="font-mono font-semibold text-night">{formatQty(activeDeliveryQty)}</span>
-                    </>
+                    <div className="flex flex-wrap gap-x-4 gap-y-1">
+                      <span>
+                        Entrega activa <span className="font-mono font-semibold text-night">{activeDelivery.number}</span>
+                      </span>
+                      <span>
+                        Unidades <span className="font-mono font-semibold text-night">{formatQty(activeDeliveryTotals.deliveryUnits)}</span>
+                      </span>
+                      {activeDelivery.status === "draft" && (
+                        <span>
+                          Stock{" "}
+                          <span className={`font-semibold ${activeStockValidation?.ok ? "text-emerald-700" : "text-amber-700"}`}>
+                            {activeStockValidation?.ok ? "validado" : "pendiente de validar"}
+                          </span>
+                        </span>
+                      )}
+                    </div>
                   ) : (
                     "Crea una entrega para asignar cantidades."
                   )}
@@ -789,7 +1137,7 @@ export function DeliveryExpeditionPage() {
                   />
                 </label>
                 <label className="grid gap-1 text-[11px] font-semibold text-secondaryText">
-                  Receptor
+                  Autorizado
                   <input
                     disabled={!canEditActiveDelivery}
                     value={activeDelivery?.receiver ?? ""}
@@ -812,55 +1160,71 @@ export function DeliveryExpeditionPage() {
                 <table className="w-full border-collapse text-left text-[12px]">
                   <thead className="sticky top-0 z-10 bg-deep text-white">
                     <tr>
-                      <th className="px-3 py-2 font-semibold">Item</th>
-                      <th className="px-3 py-2 font-semibold">Descripcion</th>
+                      <th className="px-3 py-2 font-semibold">Producto</th>
+                      <th className="px-3 py-2 font-semibold">Rubro</th>
+                      <th className="px-3 py-2 font-semibold">Unidad</th>
                       <th className="px-3 py-2 font-semibold">Pedido</th>
                       <th className="px-3 py-2 font-semibold">Reservado</th>
                       <th className="px-3 py-2 font-semibold">Preparado</th>
                       <th className="px-3 py-2 font-semibold">Disponible</th>
                       <th className="px-3 py-2 font-semibold">A entregar</th>
+                      <th className="px-3 py-2 font-semibold">Peso/vol.</th>
                       <th className="px-3 py-2 font-semibold">Estado</th>
                     </tr>
                   </thead>
                   <tbody>
                     {activeOrder.lines.map((line) => {
-                      const maxQty = getMaxDispatchableQty(line, activeDelivery);
-                      const plannedQty = getDeliveryLineQty(activeDelivery, line.id);
-                      const issue = plannedQty > maxQty;
-                      const stockToneValue: StatusTone = maxQty <= 0 ? "danger" : issue ? "warning" : "success";
+                      const maxUnits = getMaxDispatchableDeliveryUnitQty(line, activeDelivery);
+                      const plannedUnits = getDeliveryLineQty(activeDelivery, line.id);
+                      const commercialQty = getCommercialQty(line, activeDelivery);
+                      const lineWeight = commercialQty * line.unitWeightKg;
+                      const lineVolume = commercialQty * line.unitVolumeM3;
+                      const issue = plannedUnits > maxUnits;
+                      const stockToneValue: StatusTone = maxUnits <= 0 ? "danger" : issue ? "warning" : "success";
+                      const lineInputDisabled = !canEditActiveDelivery || activeDelivery?.status !== "draft" || maxUnits <= 0;
 
                       return (
                         <tr key={line.id} className="border-b border-borderSoft bg-white hover:bg-softStart">
-                          <td className="whitespace-nowrap px-3 py-2 font-mono font-semibold text-night">{line.itemRef}</td>
                           <td className="min-w-64 px-3 py-2 text-night">
-                            <div>{line.description}</div>
-                            <div className="mt-1 text-[11px] text-secondaryText">
-                              Ubicacion {line.location} / planificado {formatQty(line.plannedQty, line.uom)}
-                            </div>
+                            <div className="font-mono font-semibold">{line.itemRef}</div>
+                            <div className="mt-1 max-w-[28rem] whitespace-normal font-semibold">{line.itemName}</div>
+                          </td>
+                          <td className="min-w-44 px-3 py-2 text-night">
+                            <div>{line.category || "Sin categoria"}</div>
+                          </td>
+                          <td className="whitespace-nowrap px-3 py-2 font-mono text-night">
+                            <div>{line.salesUom}</div>
                           </td>
                           <td className="whitespace-nowrap px-3 py-2 font-mono text-night">{formatQty(line.orderedQty, line.uom)}</td>
                           <td className="whitespace-nowrap px-3 py-2 font-mono text-night">{formatQty(line.reservedQty, line.uom)}</td>
                           <td className="whitespace-nowrap px-3 py-2 font-mono text-night">{formatQty(line.preparedQty, line.uom)}</td>
-                          <td className="whitespace-nowrap px-3 py-2 font-mono text-primaryHover">{formatQty(maxQty, line.uom)}</td>
+                          <td className="whitespace-nowrap px-3 py-2 font-mono text-primaryHover">
+                            <div>{formatQty(maxUnits, line.deliveryUom)}</div>
+                          </td>
                           <td className="whitespace-nowrap px-3 py-2">
                             <label className="sr-only" htmlFor={`qty-${line.id}`}>
                               Cantidad a entregar {line.itemRef}
                             </label>
                             <input
                               id={`qty-${line.id}`}
-                              disabled={!canEditActiveDelivery || activeDelivery?.status !== "draft"}
+                              disabled={lineInputDisabled}
                               type="number"
                               min={0}
+                              max={maxUnits}
                               step={1}
-                              value={plannedQty}
+                              value={plannedUnits}
                               onChange={(event) => updateLineQty(line.id, event.target.value)}
                               className={`h-9 w-24 rounded border bg-white px-2 font-mono text-[12px] text-night outline-none focus:border-primary focus:ring-2 focus:ring-primary/20 disabled:bg-softStart ${
                                 issue ? "border-red-300" : "border-borderSoft"
                               }`}
                             />
                           </td>
+                          <td className="whitespace-nowrap px-3 py-2 font-mono text-night">
+                            <div>{formatMeasure(lineWeight, "kg")}</div>
+                            <div className="mt-1 text-[11px] text-secondaryText">{formatMeasure(lineVolume, "m3", 4)}</div>
+                          </td>
                           <td className="whitespace-nowrap px-3 py-2">
-                            <StatusBadge label={maxQty <= 0 ? "bloqueado" : issue ? "revisar" : "ok"} tone={stockToneValue} />
+                            <StatusBadge label={maxUnits <= 0 ? "bloqueado" : issue ? "revisar" : "ok"} tone={stockToneValue} />
                           </td>
                         </tr>
                       );
@@ -869,18 +1233,6 @@ export function DeliveryExpeditionPage() {
                 </table>
               </div>
 
-              <div className="shrink-0 border-t border-borderSoft px-3 py-2 text-[12px] text-secondaryText">
-                <div className="text-[12px] text-secondaryText">
-                  {activeDelivery ? (
-                    <>
-                      Entrega activa <span className="font-mono font-semibold text-night">{activeDelivery.number}</span> /
-                      cantidad total <span className="font-mono font-semibold text-night">{formatQty(activeDeliveryQty)}</span>
-                    </>
-                  ) : (
-                    "Crea una entrega para asignar cantidades."
-                  )}
-                </div>
-              </div>
               {message && (
                 <div className="shrink-0 border-t border-borderSoft bg-white px-3 py-2 text-[12px]" role="status" aria-live="polite">
                   <StatusBadge label={message.tone === "danger" ? "revision" : "estado"} tone={message.tone} />
@@ -911,7 +1263,7 @@ export function DeliveryExpeditionPage() {
               <h2 className="text-[13px] font-semibold text-night">Entregas del pedido</h2>
               <p className="mt-1 text-[11px] text-secondaryText">Un pedido puede tener multiples entregas y remitos.</p>
             </div>
-            {activeDelivery && <StatusBadge label={statusLabel[activeDelivery.status]} tone={statusTone[activeDelivery.status]} />}
+            {summaryDelivery && <StatusBadge label={statusLabel[summaryDelivery.status]} tone={statusTone[summaryDelivery.status]} />}
           </div>
           <div className="min-h-0 flex-1 overflow-auto">
             {visibleDeliveries.length ? (
@@ -920,17 +1272,22 @@ export function DeliveryExpeditionPage() {
                   key={delivery.id}
                   type="button"
                   onClick={() => {
-                    setActiveDeliveryId(delivery.id);
+                    if (delivery.status !== "remito") {
+                      setActiveDeliveryId(delivery.id);
+                    }
+                    setSummaryDeliveryId(delivery.id);
                     setMessage(null);
                   }}
                   className={`block w-full border-b border-borderSoft px-3 py-3 text-left transition hover:bg-softStart focus:outline-none focus:ring-2 focus:ring-inset focus:ring-primary/30 ${
-                    delivery.id === activeDelivery?.id ? "bg-white" : "bg-surface"
+                    delivery.id === summaryDelivery?.id ? "bg-white" : "bg-surface"
                   }`}
                 >
                   <div className="flex items-start justify-between gap-2">
                     <div>
                       <div className="font-mono text-[13px] font-semibold text-night">{delivery.number}</div>
-                      <div className="mt-1 text-[11px] text-secondaryText">{delivery.plannedDate || "sin fecha"} / {delivery.mode}</div>
+                      <div className="mt-1 text-[11px] text-secondaryText">
+                        {delivery.issuedAt ? formatAppDateTime(delivery.issuedAt) : formatAppDate(delivery.plannedDate)} / {delivery.mode}
+                      </div>
                     </div>
                     <StatusBadge label={delivery.source === "draft" ? "borrador local" : statusLabel[delivery.status]} tone={statusTone[delivery.status]} />
                   </div>
@@ -958,22 +1315,72 @@ export function DeliveryExpeditionPage() {
           </div>
 
           <div className="shrink-0 border-t border-borderSoft bg-white px-3 py-3">
-            <h3 className="text-[12px] font-semibold uppercase text-secondaryText">Resumen de remito</h3>
-            {activeDelivery ? (
-              <dl className="mt-3 grid grid-cols-2 gap-2 text-[12px]">
-                <dt className="font-semibold text-secondaryText">Entrega</dt>
-                <dd className="font-mono text-night">{activeDelivery.number}</dd>
-                <dt className="font-semibold text-secondaryText">Estado</dt>
-                <dd>
-                  <StatusBadge label={statusLabel[activeDelivery.status]} tone={statusTone[activeDelivery.status]} />
-                </dd>
-                <dt className="font-semibold text-secondaryText">Receptor</dt>
-                <dd className="text-night">{activeDelivery.receiver}</dd>
-                <dt className="font-semibold text-secondaryText">Preparador</dt>
-                <dd className="font-mono text-night">{activeDelivery.preparationAssignee ?? "sin asignar"}</dd>
-                <dt className="font-semibold text-secondaryText">PDF</dt>
-                <dd className="font-mono text-night">{activeDelivery.remitoNumber ?? "no emitido"}</dd>
-              </dl>
+            <div className="flex items-start justify-between gap-3">
+              <h3 className="text-[12px] font-semibold uppercase text-secondaryText">Resumen de remito</h3>
+              {summaryDelivery && (
+                <div className="text-right">
+                  <div className="text-[10px] font-semibold uppercase text-secondaryText">Remito</div>
+                  <div className="mt-0.5 font-mono text-[12px] font-semibold text-night">{summaryDelivery.remitoNumber ?? "no emitido"}</div>
+                </div>
+              )}
+            </div>
+            {summaryDelivery ? (
+              <>
+                <dl className="mt-3 grid grid-cols-[7rem_minmax(0,1fr)] gap-x-3 gap-y-2 text-[12px]">
+                  <dt className="font-semibold text-secondaryText">Entrega</dt>
+                  <dd className="font-mono text-night">{summaryDelivery.number}</dd>
+                  <dt className="font-semibold text-secondaryText">Fecha</dt>
+                  <dd className="font-mono text-night">{formatAppDateTime(summaryDelivery.issuedAt || summaryDelivery.plannedDate)}</dd>
+                  <dt className="font-semibold text-secondaryText">Autorizado</dt>
+                  <dd className="min-w-0 break-words text-night">{summaryDelivery.receiver || "sin informar"}</dd>
+                  <dt className="font-semibold text-secondaryText">Almacen retiro</dt>
+                  <dd className="font-mono text-night">{summaryDeliveryWarehouse}</dd>
+                  <dt className="font-semibold text-secondaryText">Unidades</dt>
+                  <dd className="font-mono text-night">{formatQty(summaryDeliveryTotals.deliveryUnits)}</dd>
+                  <dt className="font-semibold text-secondaryText">Peso</dt>
+                  <dd className="font-mono text-night">{formatMeasure(summaryDeliveryTotals.weightKg, "kg")}</dd>
+                  <dt className="font-semibold text-secondaryText">Volumen</dt>
+                  <dd className="font-mono text-night">{formatMeasure(summaryDeliveryTotals.volumeM3, "m3", 4)}</dd>
+                  <dt className="font-semibold text-secondaryText">Preparador</dt>
+                  <dd className="font-mono text-night">{summaryDelivery.preparationAssignee ?? "sin asignar"}</dd>
+                </dl>
+                <div className="mt-3 border-t border-borderSoft pt-3">
+                  <h4 className="text-[11px] font-semibold uppercase text-secondaryText">Articulos remitidos</h4>
+                  <table className="mt-2 w-full border-collapse text-left text-[11px]">
+                    <thead className="bg-softMid text-secondaryText">
+                      <tr>
+                        <th className="px-2 py-1 font-semibold">Articulo</th>
+                        <th className="px-2 py-1 font-semibold">Cantidad</th>
+                        <th className="px-2 py-1 font-semibold">Almacen</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {summaryDeliveryLines.map((line) => (
+                        <tr key={line.id} className="border-t border-borderSoft">
+                          <td className="px-2 py-1 text-night">
+                            <div className="font-mono font-semibold">{line.itemRef}</div>
+                            <div className="mt-0.5 leading-4">{line.itemName}</div>
+                          </td>
+                          <td className="px-2 py-1 font-mono text-night">
+                            <div>{formatQty(line.deliveryQty, line.deliveryUom)}</div>
+                            {line.conversionFactor !== 1 && (
+                              <div className="mt-0.5 text-secondaryText">{formatQty(line.commercialQty, line.commercialUom)}</div>
+                            )}
+                          </td>
+                          <td className="px-2 py-1 font-mono text-night">{line.warehouse || "s/d"}</td>
+                        </tr>
+                      ))}
+                      {!summaryDeliveryLines.length && (
+                        <tr>
+                          <td className="px-2 py-2 text-secondaryText" colSpan={3}>
+                            Sin articulos asignados.
+                          </td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </>
             ) : (
               <p className="mt-3 text-[12px] text-secondaryText">Selecciona una entrega para revisar el remito.</p>
             )}

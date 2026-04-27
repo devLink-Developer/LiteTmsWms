@@ -6,6 +6,7 @@ import {
   type ApiPreparationTaskListItem,
 } from "../../api/fulfillment";
 import { StatusBadge } from "../../shared/components/StatusBadge";
+import { formatAppDateTime } from "../../shared/utils/dateFormat";
 import type { StatusTone } from "../../types/operations";
 
 type TaskFilter = "open" | "assigned" | "preparing" | "prepared" | "all";
@@ -39,16 +40,6 @@ function asNumber(value: string | number | null | undefined) {
 
 function formatQty(value: string | number | null | undefined) {
   return new Intl.NumberFormat("es-AR", { maximumFractionDigits: 2 }).format(asNumber(value));
-}
-
-function formatDateTime(value: string | null) {
-  if (!value) {
-    return "sin fecha";
-  }
-  return new Intl.DateTimeFormat("es-AR", {
-    dateStyle: "short",
-    timeStyle: "short",
-  }).format(new Date(value));
 }
 
 export function PreparationTasksPage() {
@@ -223,7 +214,7 @@ export function PreparationTasksPage() {
                 <dt className="font-semibold text-secondaryText">Entrega</dt>
                 <dd className="font-mono text-night">{activeTask.delivery.delivery_number}</dd>
                 <dt className="font-semibold text-secondaryText">Asignada</dt>
-                <dd className="text-night">{formatDateTime(activeTask.assigned_at)}</dd>
+                <dd className="text-night">{formatAppDateTime(activeTask.assigned_at)}</dd>
                 <dt className="font-semibold text-secondaryText">Preparador</dt>
                 <dd className="font-mono text-night">{activeTask.assigned_employee_ref}</dd>
                 <dt className="font-semibold text-secondaryText">Estado</dt>
