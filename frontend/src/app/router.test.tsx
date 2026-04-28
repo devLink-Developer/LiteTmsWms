@@ -4,6 +4,27 @@ import { RouterProvider, createMemoryRouter } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { appRoutes } from "./router";
+import { useSessionStore } from "../stores/useSessionStore";
+import type { SessionBootstrap } from "../types/session";
+
+const authenticatedSession: SessionBootstrap = {
+  authenticated: true,
+  csrfToken: "csrf",
+  appName: "Lite Logistic",
+  user: {
+    username: "operator@example.com",
+    email: "operator@example.com",
+    displayName: "Operador",
+    alias: "operator",
+  },
+  workspace: {
+    warehouse_ref: "PS003MT",
+    branch_ref: "Sucursal Norte",
+    role: "operador",
+    permissions: [],
+    authorized_warehouses: ["PS003MT"],
+  },
+};
 
 function jsonResponse(payload: unknown) {
   return {
@@ -25,6 +46,7 @@ function renderRoute(path: string) {
 
 describe("app router", () => {
   beforeEach(() => {
+    useSessionStore.setState({ bootstrap: authenticatedSession, status: "ready", error: null });
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL) => {
@@ -44,6 +66,18 @@ describe("app router", () => {
         return jsonResponse({ results: [] });
       }),
     );
+  });
+
+  it("redirects unauthenticated users to login", async () => {
+    useSessionStore.setState({
+      bootstrap: { authenticated: false, csrfToken: "csrf", appName: "Lite Logistic", user: null, workspace: null },
+      status: "ready",
+      error: null,
+    });
+    const router = renderRoute("/pedidos/entrega");
+
+    await waitFor(() => expect(router.state.location.pathname).toBe("/login/"));
+    expect(await screen.findByRole("heading", { name: "Ingresar" })).toBeInTheDocument();
   });
 
   it.each([

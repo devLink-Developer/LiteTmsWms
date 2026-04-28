@@ -5,6 +5,7 @@ services:
     command: gunicorn config.wsgi:application --bind 0.0.0.0:8021 --workers 3
     environment:
       POSTGRES_ENGINE: django.db.backends.postgresql
+      DJANGO_CSRF_TRUSTED_ORIGINS: ${DJANGO_CSRF_TRUSTED_ORIGINS:-http://localhost:8021,http://127.0.0.1:8021}
       POSTGRES_DB_NAME: litecore
       POSTGRES_DB_USER: litecore
       POSTGRES_DB_PASS: litecorepass
@@ -17,11 +18,16 @@ services:
       LITECORE_DB_PORT: "5433"
       TMSWMS_DB_SCHEMA: tmswms
       TMSWMS_DEFAULT_ACTOR: ${TMSWMS_DEFAULT_ACTOR:-eespinoza}
+      LDAP_SERVER: ${LDAP_SERVER:-}
+      LDAP_DOMAIN: ${LDAP_DOMAIN:-}
+      LDAP_DOMAIN_TG: ${LDAP_DOMAIN_TG:-}
+      LDAP_TIMEOUT: ${LDAP_TIMEOUT:-10}
       MASTER_DATA_PARQUET_DIR: /srv/data/parquet
       ROUTING_PROVIDER: ${ROUTING_PROVIDER:-ors}
       ORS_API_KEY: ${ORS_API_KEY:-}
       ORS_BASE_URL: ${ORS_BASE_URL:-https://api.openrouteservice.org}
       ROUTING_SERVICE_MINUTES_PER_STOP: ${ROUTING_SERVICE_MINUTES_PER_STOP:-10}
+      WAREHOUSE_ORIGINS: ${WAREHOUSE_ORIGINS:-}
     expose:
       - "8021"
     volumes:
@@ -52,6 +58,7 @@ services:
       ORS_API_KEY: ${ORS_API_KEY:-}
       ORS_BASE_URL: ${ORS_BASE_URL:-https://api.openrouteservice.org}
       ROUTING_SERVICE_MINUTES_PER_STOP: ${ROUTING_SERVICE_MINUTES_PER_STOP:-10}
+      WAREHOUSE_ORIGINS: ${WAREHOUSE_ORIGINS:-}
     volumes:
       - ./backend:/app
     extra_hosts:

@@ -1,6 +1,8 @@
 import { Navigate, createBrowserRouter, type RouteObject } from "react-router-dom";
 
+import { RequireAuthGuard } from "./RequireAuthGuard";
 import { DashboardPage } from "../features/dashboard/DashboardPage";
+import { LoginPage } from "../features/auth/LoginPage";
 import { DeliveryExpeditionPage } from "../features/deliveries/DeliveryExpeditionPage";
 import { FleetAdminPage } from "../features/fleet/FleetAdminPage";
 import { DriverRouteExecutionPage } from "../features/reparto/DriverRouteExecutionPage";
@@ -9,6 +11,7 @@ import { PlaceholderPage } from "../features/operations/PlaceholderPage";
 import { RepartoConfirmationPage } from "../features/reparto/RepartoConfirmationPage";
 import { RepartoPreparationPage } from "../features/reparto/RepartoPreparationPage";
 import { RoutePlanningPage } from "../features/routing/RoutePlanningPage";
+import { StockBalancesPage } from "../features/stock/StockBalancesPage";
 import { PreparationTasksPage } from "../features/tasks/PreparationTasksPage";
 import { TransfersPage } from "../features/transfers/TransfersPage";
 import { AppShell } from "../layouts/AppShell";
@@ -30,9 +33,14 @@ const legacyRedirects: RouteObject[] = [
 ];
 
 export const appRoutes: RouteObject[] = [
+  { path: "/login/", element: <LoginPage /> },
   {
     path: "/",
-    element: <AppShell />,
+    element: (
+      <RequireAuthGuard>
+        <AppShell />
+      </RequireAuthGuard>
+    ),
     children: [
       { index: true, element: <Navigate to="/pedidos/entrega" replace /> },
       { path: "dashboard", element: <DashboardPage /> },
@@ -45,6 +53,7 @@ export const appRoutes: RouteObject[] = [
       { path: "maestros/choferes", element: <FleetAdminPage initialTab="drivers" /> },
       { path: "pedidos/tareas", element: <PreparationTasksPage /> },
       { path: "ingresos/tr-depositos", element: <TransfersPage /> },
+      { path: "stock/almacenes", element: <StockBalancesPage /> },
       ...legacyRedirects,
       ...routedOperationModules.map((module) => ({
         path: module.path.replace(/^\//, ""),

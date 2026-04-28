@@ -96,6 +96,31 @@ function stopSecondaryCode(stop: RouteStop) {
   return stop.sales_order_number || stop.customer_ref || "";
 }
 
+function addressPart(value: unknown) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function stopAddressText(stop: RouteStop) {
+  const address = stop.address_snapshot ?? {};
+  const formatted = addressPart(address.formatted) || addressPart(address.description) || addressPart(address.reference);
+  if (formatted) return formatted;
+  const streetLine = [addressPart(address.street), addressPart(address.street_number)].filter(Boolean).join(" ");
+  return [streetLine, addressPart(address.city), addressPart(address.state), addressPart(address.zip_code)].filter(Boolean).join(", ");
+}
+
+function stopCustomerName(stop: RouteStop) {
+  const address = stop.address_snapshot ?? {};
+  const candidates = [
+    stop.customer_name,
+    address.customer_name,
+    address.name,
+    address.receiver,
+    address.attention_to,
+    stop.customer_ref,
+  ];
+  return candidates.map(addressPart).find((value) => value && value !== stop.customer_ref) || stop.customer_ref || "Sin cliente";
+}
+
 function stopPosition(stop: RouteStop): [number, number] | null {
   const lat = Number(stop.lat);
   const lng = Number(stop.lng);
@@ -122,7 +147,17 @@ function routeGeometryPositions(route: RouteSheet | null): [number, number][] {
     .filter(Boolean) as [number, number][];
 }
 
-function markerIcon(sequence: number, tone: "planned" | "pending" | "done" | "failed") {
+function routeOriginPosition(route: RouteSheet | null): [number, number] | null {
+  const origin = route?.preview_payload?.input?.origin;
+  if (!origin || typeof origin !== "object") return null;
+  const rawOrigin = origin as Record<string, unknown>;
+  const lat = Number(rawOrigin.lat ?? rawOrigin.latitude);
+  const lng = Number(rawOrigin.lng ?? rawOrigin.longitude);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  return [lat, lng];
+}
+
+function markerIcon(label: number | string, tone: "planned" | "pending" | "done" | "failed") {
   const palette = {
     planned: "bg-primary text-white border-white",
     pending: "bg-amber-500 text-white border-white",
@@ -131,10 +166,24 @@ function markerIcon(sequence: number, tone: "planned" | "pending" | "done" | "fa
   };
   return L.divIcon({
     className: "",
-    html: `<div class="grid h-7 w-7 place-items-center rounded-full border-2 text-[11px] font-bold shadow ${palette[tone]}">${sequence}</div>`,
+    html: `<div class="grid h-7 w-7 place-items-center rounded-full border-2 text-[11px] font-bold shadow ${palette[tone]}">${label}</div>`,
     iconSize: [28, 28],
     iconAnchor: [14, 14],
   });
+}
+
+function StopMapLabel({ stop }: { stop: RouteStop }) {
+  const customerName = stopCustomerName(stop);
+  const address = stopAddressText(stop);
+  return (
+    <span className="block max-w-[260px]">
+      <span className="block font-mono text-[11px] font-semibold text-night">
+        {stop.sequence}. {stopDisplayCode(stop)}
+      </span>
+      <span className="mt-0.5 block text-[11px] font-semibold text-night">{customerName}</span>
+      <span className="mt-0.5 block whitespace-normal text-[11px] leading-snug text-secondaryText">{address || "Sin direccion"}</span>
+    </span>
+  );
 }
 
 function BoundsSync({ route, deliveries }: { route: RouteSheet | null; deliveries: RoutingDelivery[] }) {
@@ -166,9 +215,8 @@ function SortableStopRow({
     transform: CSS.Transform.toString(transform),
     transition,
   };
-  const address = [stop.address_snapshot.street, stop.address_snapshot.street_number, stop.address_snapshot.city]
-    .filter(Boolean)
-    .join(" ");
+  const address = stopAddressText(stop);
+  const customerName = stopCustomerName(stop);
   return (
     <button
       ref={setNodeRef}
@@ -188,7 +236,10 @@ function SortableStopRow({
         <span className="block truncate font-mono text-[12px] font-semibold text-night">{stopDisplayCode(stop)}</span>
         <span className="mt-1 block truncate text-[11px] text-secondaryText">
           {stopSecondaryCode(stop) ? `${stopSecondaryCode(stop)} / ` : ""}
-          {address || stop.customer_ref || "Sin direccion"}
+          {customerName}
+        </span>
+        <span className="mt-0.5 block truncate text-[11px] text-secondaryText">
+          {address || "Sin direccion"}
         </span>
       </span>
       <StatusBadge label={stop.status} tone={stopStatusTone[stop.status] ?? "neutral"} />
@@ -238,6 +289,8 @@ export function RoutePlanningPage() {
   const [vehicleId, setVehicleId] = useState("");
   const [driverRef, setDriverRef] = useState("");
   const [message, setMessage] = useState<string | null>(null);
+  const [openStopLabelIds, setOpenStopLabelIds] = useState<string[]>([]);
+  const [originLabelOpen, setOriginLabelOpen] = useState(false);
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
@@ -295,14 +348,25 @@ export function RoutePlanningPage() {
     setVehicleId(nextRoute.vehicle_id ?? "");
     setDriverRef(nextRoute.driver_ref || "");
     setActiveStopId(nextRoute.stops[0]?.id ?? "");
+    setOpenStopLabelIds([]);
+    setOriginLabelOpen(false);
     setMessage(nextRoute.status === "draft" ? "Hoja draft recuperada. Revisa el mapa antes de confirmar." : null);
   }, [routeDetailQuery.data]);
 
+  const hasDraftRoute = useMemo(
+    () => (routeSheetsQuery.data ?? []).some((summary) => summary.status === "draft"),
+    [routeSheetsQuery.data],
+  );
   const selectedDeliveries = useMemo(() => {
     const deliveries = deliveriesQuery.data ?? [];
-    if (!selectedIds.length) return deliveries.filter((delivery) => delivery.lat && delivery.lng);
+    if (!selectedIds.length || hasDraftRoute) return deliveries.filter((delivery) => delivery.lat && delivery.lng);
     return deliveries.filter((delivery) => selectedIds.includes(delivery.id));
-  }, [deliveriesQuery.data, selectedIds]);
+  }, [deliveriesQuery.data, hasDraftRoute, selectedIds]);
+  const optimizationWarehouse =
+    warehouse ||
+    selectedDeliveries[0]?.warehouse_ref ||
+    route?.warehouse_ref ||
+    (authorizedWarehouses.length === 1 ? authorizedWarehouses[0] : "");
 
   const selectedVehicle = useMemo(
     () => (vehiclesQuery.data ?? []).find((vehicle) => vehicle.id === (vehicleId || route?.vehicle_id || "")) ?? null,
@@ -323,6 +387,7 @@ export function RoutePlanningPage() {
   const activeStop = route?.stops.find((stop) => stop.id === activeStopId) ?? route?.stops[0] ?? null;
   const routePositions = route?.stops.map(stopPosition).filter(Boolean) as [number, number][] | undefined;
   const routeLinePositions = route ? routeGeometryPositions(route) : [];
+  const originPosition = routeOriginPosition(route);
   const mapCenter = routePositions?.[0] ?? routeLinePositions[0] ?? [-34.6037, -58.3816];
   const canConfirm = Boolean(route && route.status === "draft" && route.stops.length > 0 && (vehicleId || route.vehicle_id) && !capacity?.exceeded);
   const missingCoords = (deliveriesQuery.data ?? []).filter((delivery) => !delivery.lat || !delivery.lng).length;
@@ -330,8 +395,8 @@ export function RoutePlanningPage() {
   const optimizeMutation = useMutation({
     mutationFn: () =>
       optimizeRoute({
-        warehouse_ref: warehouse || selectedDeliveries[0]?.warehouse_ref || "",
-        branch_ref: warehouse || selectedDeliveries[0]?.warehouse_ref || "",
+        warehouse_ref: optimizationWarehouse,
+        branch_ref: optimizationWarehouse,
         planned_date: plannedDate,
         vehicle_id: vehicleId || undefined,
         driver_ref: driverRef || undefined,
@@ -347,6 +412,8 @@ export function RoutePlanningPage() {
       setVehicleId(nextRoute.vehicle_id ?? vehicleId);
       setDriverRef(nextRoute.driver_ref || driverRef);
       setActiveStopId(nextRoute.stops[0]?.id ?? "");
+      setOpenStopLabelIds([]);
+      setOriginLabelOpen(false);
       setMessage("Preview de ruta generado. Revisa el mapa y orden antes de confirmar.");
       void queryClient.invalidateQueries({ queryKey: ["routing-open-routes"] });
       void queryClient.invalidateQueries({ queryKey: ["routing-deliveries"] });
@@ -383,6 +450,7 @@ export function RoutePlanningPage() {
     onSuccess: (nextRoute) => {
       setRoute(nextRoute);
       setActiveStopId(nextRoute.stops[0]?.id ?? "");
+      setOpenStopLabelIds((current) => current.filter((stopId) => nextRoute.stops.some((stop) => stop.id === stopId)));
       setMessage("Parada quitada de la hoja. La entrega vuelve al pool de ruteo.");
       void queryClient.invalidateQueries({ queryKey: ["routing-deliveries"] });
       void queryClient.invalidateQueries({ queryKey: ["routing-open-routes"] });
@@ -434,7 +502,13 @@ export function RoutePlanningPage() {
   function loadRouteSheet(summary: RouteSheetSummary) {
     setRouteLoadId(summary.id);
     setSelectedIds([]);
+    setOpenStopLabelIds([]);
+    setOriginLabelOpen(false);
     setMessage(`Cargando ${summary.route_number}.`);
+  }
+
+  function toggleStopLabel(stopId: string) {
+    setOpenStopLabelIds((current) => (current.includes(stopId) ? current.filter((id) => id !== stopId) : [...current, stopId]));
   }
 
   function onDragEnd(event: DragEndEvent) {
@@ -504,7 +578,7 @@ export function RoutePlanningPage() {
           {route && <StatusBadge label={route.status} tone={routeStatusTone[route.status] ?? "neutral"} />}
           <button
             type="button"
-            disabled={!selectedDeliveries.length || busy}
+            disabled={busy || !optimizationWarehouse || (!selectedDeliveries.length && !hasDraftRoute)}
             onClick={() => optimizeMutation.mutate()}
             className="inline-flex min-h-9 items-center gap-2 rounded bg-primary px-3 text-[12px] font-semibold text-white transition hover:bg-primaryHover focus:outline-none focus:ring-2 focus:ring-primary/30 disabled:bg-softStart disabled:text-secondaryText"
           >
@@ -693,12 +767,27 @@ export function RoutePlanningPage() {
                 pathOptions={{ color: "#1f6bb4", weight: 4 }}
               />
             )}
+            {originPosition && (
+              <Marker
+                position={originPosition}
+                icon={markerIcon("D", "planned")}
+                eventHandlers={{ click: () => setOriginLabelOpen((current) => !current) }}
+              >
+                {originLabelOpen && (
+                  <Tooltip direction="right" offset={[18, 0]} opacity={1} permanent className="route-origin-tooltip">
+                    Origen {route?.warehouse_ref}
+                  </Tooltip>
+                )}
+              </Marker>
+            )}
             {(deliveriesQuery.data ?? []).map((delivery, index) => {
               const position = deliveryPosition(delivery);
               if (!position || route) return null;
               return (
                 <Marker key={delivery.id} position={position} icon={markerIcon(index + 1, selectedIds.includes(delivery.id) ? "planned" : "pending")}>
-                  <Tooltip>{delivery.delivery_number}</Tooltip>
+                  <Tooltip direction="right" offset={[18, 0]}>
+                    {delivery.delivery_number}
+                  </Tooltip>
                 </Marker>
               );
             })}
@@ -713,19 +802,26 @@ export function RoutePlanningPage() {
                   draggable={route.status === "draft"}
                   icon={markerIcon(stop.sequence, tone)}
                   eventHandlers={{
-                    click: () => setActiveStopId(stop.id),
+                    click: () => {
+                      setActiveStopId(stop.id);
+                      toggleStopLabel(stop.id);
+                    },
                     dragend: (event) => {
                       const point = event.target.getLatLng();
                       updateMarker(stop, point.lat, point.lng);
                     },
                   }}
                 >
-                  <Tooltip>{stopDisplayCode(stop)}</Tooltip>
+                  {openStopLabelIds.includes(stop.id) && (
+                    <Tooltip direction="right" offset={[18, 0]} opacity={1} permanent className="route-stop-tooltip">
+                      <StopMapLabel stop={stop} />
+                    </Tooltip>
+                  )}
                 </Marker>
               );
             })}
           </MapContainer>
-          <div className="absolute left-3 top-3 z-[400] flex flex-wrap gap-2">
+          <div className="absolute right-3 top-3 z-[400] flex flex-col items-end gap-2">
             <div className="rounded border border-borderSoft bg-white px-3 py-2 text-[12px] font-semibold text-night shadow-panel">
               {route ? `${route.route_number} / ${route.routing_provider}` : "Sin preview activo"}
             </div>
@@ -864,6 +960,10 @@ export function RoutePlanningPage() {
                 <dl className="mt-3 grid grid-cols-[7rem_minmax(0,1fr)] gap-x-3 gap-y-2 text-[12px]">
                   <dt className="font-semibold text-secondaryText">Estado</dt>
                   <dd><StatusBadge label={activeStop.status} tone={stopStatusTone[activeStop.status] ?? "neutral"} /></dd>
+                  <dt className="font-semibold text-secondaryText">Cliente</dt>
+                  <dd className="min-w-0 text-night">{stopCustomerName(activeStop)}</dd>
+                  <dt className="font-semibold text-secondaryText">Direccion</dt>
+                  <dd className="min-w-0 text-night">{stopAddressText(activeStop) || "Sin direccion"}</dd>
                   <dt className="font-semibold text-secondaryText">Peso</dt>
                   <dd className="font-mono text-night">{formatNumber(activeStop.planned_weight_kg)} kg</dd>
                   <dt className="font-semibold text-secondaryText">Volumen</dt>

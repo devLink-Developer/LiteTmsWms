@@ -12,13 +12,13 @@ export function formatAppDate(value: string | null | undefined, fallback = "sin 
   const text = String(value).trim();
   const dateOnly = DATE_ONLY_PATTERN.exec(text);
   if (dateOnly) {
-    return `${dateOnly[2]}/${dateOnly[3]}/${dateOnly[1]}`;
+    return `${dateOnly[3]}/${dateOnly[2]}/${dateOnly[1]}`;
   }
   const parsed = new Date(text);
   if (Number.isNaN(parsed.getTime())) {
     return fallback;
   }
-  return `${twoDigits(parsed.getMonth() + 1)}/${twoDigits(parsed.getDate())}/${parsed.getFullYear()}`;
+  return `${twoDigits(parsed.getDate())}/${twoDigits(parsed.getMonth() + 1)}/${parsed.getFullYear()}`;
 }
 
 export function formatAppDateTime(value: string | null | undefined, fallback = "sin fecha") {

@@ -1,4 +1,4 @@
-import { actorHeaders, apiGet, apiPost, apiUrl } from "./client";
+import { apiGet, apiHeaders, apiPost, apiUrl } from "./client";
 
 export type CapacityProfile = {
   id: string;
@@ -80,12 +80,11 @@ type CommandResult<T> = {
 async function apiPatch<T>(path: string, body: unknown) {
   const response = await fetch(apiUrl(path), {
     method: "PATCH",
-    headers: {
-      Accept: "application/json",
+    credentials: "include",
+    headers: apiHeaders({
       "Content-Type": "application/json",
       "Idempotency-Key": crypto.randomUUID?.() ?? `${Date.now()}-${Math.random()}`,
-      ...actorHeaders(),
-    },
+    }),
     body: JSON.stringify(body),
   });
   const payload = (await response.json().catch(() => ({}))) as CommandResult<T>;

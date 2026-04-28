@@ -9,7 +9,7 @@ from django.views.decorators.http import require_GET, require_POST, require_http
 from apps.common.api import error_response, json_response, parse_json_body, require_idempotency_key
 from apps.fulfillment.models import DeliveryOrder
 from apps.logistics.parquet_master_data import MasterDataSourceError, employee_delivery_permissions
-from apps.routes.models import RouteSheet
+from apps.routes.models import RouteSheet, RouteStop
 from apps.routes.services import (
     RouteCapacityError,
     RouteRuleError,
@@ -43,6 +43,81 @@ def _authorized_warehouses(request) -> list[str]:
     return employee_delivery_permissions(_request_actor(request)).get("authorized_warehouses", [])
 
 
+def _authorized_warehouse_set(request) -> set[str]:
+    return {str(warehouse).strip() for warehouse in _authorized_warehouses(request) if str(warehouse).strip()}
+
+
+def _forbidden_without_warehouse(authorized_warehouses: set[str]):
+    if authorized_warehouses:
+        return None
+    return error_response(
+        "forbidden",
+        "El usuario no tiene depositos autorizados para operar reparto.",
+        status=403,
+    )
+
+
+def _forbidden_for_warehouse(warehouse_ref: str, authorized_warehouses: set[str]):
+    forbidden = _forbidden_without_warehouse(authorized_warehouses)
+    if forbidden:
+        return forbidden
+    if str(warehouse_ref or "").strip() not in authorized_warehouses:
+        return error_response(
+            "forbidden",
+            "El usuario no tiene permiso para operar reparto en este deposito.",
+            status=403,
+        )
+    return None
+
+
+def _delivery_ids_from_payload(payload: dict) -> list[str]:
+    delivery_ids = []
+    for row in payload.get("deliveries") or []:
+        raw_id = (row.get("delivery_id") or row.get("id")) if isinstance(row, dict) else row
+        delivery_id = str(raw_id or "").strip()
+        if delivery_id:
+            delivery_ids.append(delivery_id)
+    return delivery_ids
+
+
+def _forbidden_for_payload_deliveries(payload: dict, authorized_warehouses: set[str]):
+    delivery_ids = _delivery_ids_from_payload(payload)
+    if not delivery_ids:
+        return None
+    unauthorized_exists = DeliveryOrder.objects.filter(id__in=delivery_ids).exclude(warehouse_ref__in=authorized_warehouses).exists()
+    if unauthorized_exists:
+        return error_response(
+            "forbidden",
+            "El usuario no tiene permiso para rutear entregas de otro deposito.",
+            status=403,
+        )
+    return None
+
+
+def _route_warehouse_forbidden(request, route_id: str):
+    try:
+        authorized_warehouses = _authorized_warehouse_set(request)
+    except MasterDataSourceError as exc:
+        return error_response("master_data_unavailable", str(exc), status=503)
+    try:
+        route = RouteSheet.objects.only("warehouse_ref").get(id=route_id)
+    except RouteSheet.DoesNotExist:
+        return error_response("not_found", "Hoja de ruta no encontrada.", status=404)
+    return _forbidden_for_warehouse(route.warehouse_ref, authorized_warehouses)
+
+
+def _route_stop_warehouse_forbidden(request, route_stop_id: str):
+    try:
+        authorized_warehouses = _authorized_warehouse_set(request)
+    except MasterDataSourceError as exc:
+        return error_response("master_data_unavailable", str(exc), status=503)
+    try:
+        stop = RouteStop.objects.select_related("route").only("route__warehouse_ref").get(id=route_stop_id)
+    except RouteStop.DoesNotExist:
+        return error_response("not_found", "Parada de ruta no encontrada.", status=404)
+    return _forbidden_for_warehouse(stop.route.warehouse_ref, authorized_warehouses)
+
+
 def _route_error_response(exc: Exception):
     if isinstance(exc, RouteCapacityError):
         return error_response("capacity_violation", str(exc), status=422)
@@ -60,6 +135,13 @@ def _route_error_response(exc: Exception):
 def route_sheets(request):
     if request.method == "POST":
         return create_sheet(request)
+    try:
+        authorized_warehouses = _authorized_warehouse_set(request)
+    except MasterDataSourceError as exc:
+        return error_response("master_data_unavailable", str(exc), status=503)
+    forbidden = _forbidden_without_warehouse(authorized_warehouses)
+    if forbidden:
+        return forbidden
     rows = RouteSheet.objects.select_related("vehicle", "vehicle__capacity_profile").order_by("-planned_date", "-created_at")
     planned_date = parse_date(request.GET.get("planned_date", ""))
     warehouse_ref = request.GET.get("warehouse_ref", "").strip() or request.GET.get("warehouse", "").strip()
@@ -68,9 +150,12 @@ def route_sheets(request):
         for status in request.GET.get("status", "").split(",")
         if status.strip()
     ]
+    rows = rows.filter(warehouse_ref__in=authorized_warehouses)
     if planned_date:
         rows = rows.filter(planned_date=planned_date)
     if warehouse_ref:
+        if warehouse_ref not in authorized_warehouses:
+            return json_response({"results": []})
         rows = rows.filter(warehouse_ref=warehouse_ref)
     driver_ref = request.GET.get("driver_ref", "").strip() or request.GET.get("driver", "").strip()
     if driver_ref:
@@ -103,6 +188,9 @@ def route_sheets(request):
 
 @require_GET
 def route_sheet_detail(request, route_id):
+    forbidden = _route_warehouse_forbidden(request, str(route_id))
+    if forbidden:
+        return forbidden
     try:
         route = RouteSheet.objects.get(id=route_id)
     except RouteSheet.DoesNotExist:
@@ -114,11 +202,14 @@ def route_sheet_detail(request, route_id):
 def pending_deliveries(request):
     planned_date = parse_date(request.GET.get("planned_date", ""))
     try:
-        authorized_warehouses = _authorized_warehouses(request)
+        authorized_warehouses = _authorized_warehouse_set(request)
     except MasterDataSourceError as exc:
         return error_response("master_data_unavailable", str(exc), status=503)
+    forbidden = _forbidden_without_warehouse(authorized_warehouses)
+    if forbidden:
+        return forbidden
     warehouse_ref = request.GET.get("warehouse_ref", "").strip() or request.GET.get("warehouse", "").strip()
-    if warehouse_ref and authorized_warehouses and warehouse_ref not in authorized_warehouses:
+    if warehouse_ref and warehouse_ref not in authorized_warehouses:
         return json_response({"results": []})
     return json_response(
         {
@@ -135,12 +226,22 @@ def pending_deliveries(request):
 @require_POST
 def optimize(request):
     try:
+        payload = parse_json_body(request)
+        authorized_warehouses = _authorized_warehouse_set(request)
+        forbidden = _forbidden_for_warehouse(str(payload.get("warehouse_ref") or "").strip(), authorized_warehouses)
+        if forbidden:
+            return forbidden
+        forbidden = _forbidden_for_payload_deliveries(payload, authorized_warehouses)
+        if forbidden:
+            return forbidden
         result = optimize_route(
-            payload=parse_json_body(request),
+            payload=payload,
             idempotency_key=require_idempotency_key(request),
             actor=_request_actor(request),
         )
         return json_response(result.payload, status=result.status)
+    except MasterDataSourceError as exc:
+        return error_response("master_data_unavailable", str(exc), status=503)
     except Exception as exc:
         return _route_error_response(exc)
 
@@ -149,12 +250,22 @@ def optimize(request):
 @require_POST
 def create_sheet(request):
     try:
+        payload = parse_json_body(request)
+        authorized_warehouses = _authorized_warehouse_set(request)
+        forbidden = _forbidden_for_warehouse(str(payload.get("warehouse_ref") or "").strip(), authorized_warehouses)
+        if forbidden:
+            return forbidden
+        forbidden = _forbidden_for_payload_deliveries(payload, authorized_warehouses)
+        if forbidden:
+            return forbidden
         result = create_route_sheet(
-            payload=parse_json_body(request),
+            payload=payload,
             idempotency_key=require_idempotency_key(request),
             actor=_request_actor(request),
         )
         return json_response(result.payload, status=result.status)
+    except MasterDataSourceError as exc:
+        return error_response("master_data_unavailable", str(exc), status=503)
     except Exception as exc:
         return _route_error_response(exc)
 
@@ -163,6 +274,9 @@ def create_sheet(request):
 @require_http_methods(["PATCH"])
 def patch_stops(request, route_id):
     try:
+        forbidden = _route_warehouse_forbidden(request, str(route_id))
+        if forbidden:
+            return forbidden
         result = update_route_stops(
             route_id=str(route_id),
             payload=parse_json_body(request),
@@ -178,6 +292,9 @@ def patch_stops(request, route_id):
 @require_http_methods(["PUT"])
 def confirm(request, route_id):
     try:
+        forbidden = _route_warehouse_forbidden(request, str(route_id))
+        if forbidden:
+            return forbidden
         result = confirm_route(
             route_id=str(route_id),
             payload=parse_json_body(request),
@@ -193,6 +310,9 @@ def confirm(request, route_id):
 @require_POST
 def send_to_preparation(request, route_id):
     try:
+        forbidden = _route_warehouse_forbidden(request, str(route_id))
+        if forbidden:
+            return forbidden
         result = confirm_route(
             route_id=str(route_id),
             payload={**parse_json_body(request), "reviewed": True},
@@ -208,6 +328,9 @@ def send_to_preparation(request, route_id):
 @require_POST
 def start_loading(request, route_id):
     try:
+        forbidden = _route_warehouse_forbidden(request, str(route_id))
+        if forbidden:
+            return forbidden
         result = start_loading_route(
             route_id=str(route_id),
             payload=parse_json_body(request),
@@ -223,6 +346,9 @@ def start_loading(request, route_id):
 @require_POST
 def depart(request, route_id):
     try:
+        forbidden = _route_warehouse_forbidden(request, str(route_id))
+        if forbidden:
+            return forbidden
         result = depart_route(
             route_id=str(route_id),
             payload=parse_json_body(request),
@@ -238,6 +364,9 @@ def depart(request, route_id):
 @require_POST
 def close(request, route_id):
     try:
+        forbidden = _route_warehouse_forbidden(request, str(route_id))
+        if forbidden:
+            return forbidden
         result = close_route(
             route_id=str(route_id),
             payload=parse_json_body(request),
@@ -253,11 +382,17 @@ def close(request, route_id):
 @require_POST
 def execute_delivery(request):
     try:
+        payload = parse_json_body(request)
+        forbidden = _route_stop_warehouse_forbidden(request, str(payload.get("route_stop_id") or "").strip())
+        if forbidden:
+            return forbidden
         result = execute_delivery_stop(
-            payload=parse_json_body(request),
+            payload=payload,
             idempotency_key=require_idempotency_key(request),
             actor=_request_actor(request),
         )
         return json_response(result.payload, status=result.status)
+    except MasterDataSourceError as exc:
+        return error_response("master_data_unavailable", str(exc), status=503)
     except Exception as exc:
         return _route_error_response(exc)

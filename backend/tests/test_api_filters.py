@@ -8,10 +8,11 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+from django.contrib.auth import get_user_model
 from django.test import TestCase
 from django.utils import timezone
 
-from apps.fulfillment.models import DeliveryOrder, FulfillmentOrder
+from apps.fulfillment.models import DeliveryOrder, DeliveryPreparationTask, FulfillmentOrder
 from apps.inventory.models import (
     InventoryBalance,
     InventoryLedgerEntry,
@@ -19,6 +20,8 @@ from apps.inventory.models import (
     PurchaseOrderReceiptLine,
     StockState,
 )
+from apps.logistics.models import MaterialMasterSnapshot
+from apps.routes.models import RouteSheet
 from apps.shipping.models import Shipment, ShipmentEvent
 from apps.transfers.models import TransferOrder
 
@@ -92,6 +95,226 @@ class ApiFilterTests(TestCase):
         self.assertEqual(results[0]["warehouse_ref"], "WH-A")
         self.assertEqual(results[0]["item_ref"], "ITEM-1")
         self.assertEqual(results[0]["stock_state"], StockState.ON_HAND)
+
+    @patch("apps.inventory.api.fulfillment_warehouse_codes_for_stores")
+    @patch("apps.inventory.api.employee_delivery_permissions")
+    def test_inventory_balances_are_scoped_to_stock_fulfillment_group(self, employee_delivery_permissions, fulfillment_warehouse_codes_for_stores):
+        get_user_model().objects.create_user(username="operator@example.com")
+        self.client.force_login(get_user_model().objects.get(username="operator@example.com"))
+        employee_delivery_permissions.return_value = {
+            "employee": {"store_codes": ["S001"], "branch_ref": "S001"},
+            "authorized_warehouses": ["W-SHIPPING"],
+            "permissions": ["stock:view"],
+        }
+        fulfillment_warehouse_codes_for_stores.return_value = {"WH-A", "WH-C"}
+        InventoryBalance.objects.create(
+            warehouse_ref="WH-A",
+            item_ref="ITEM-1",
+            lot_ref="",
+            stock_state=StockState.ON_HAND,
+            uom="UN",
+            quantity=Decimal("10"),
+        )
+        InventoryBalance.objects.create(
+            warehouse_ref="WH-B",
+            item_ref="ITEM-2",
+            lot_ref="",
+            stock_state=StockState.ON_HAND,
+            uom="UN",
+            quantity=Decimal("5"),
+        )
+        InventoryBalance.objects.create(
+            warehouse_ref="WH-C",
+            item_ref="ITEM-3",
+            lot_ref="",
+            stock_state=StockState.RESERVED,
+            uom="UN",
+            quantity=Decimal("2"),
+        )
+
+        response = self.client.get("/api/v1/inventory/balances/")
+
+        self.assertEqual(response.status_code, 200, response.content)
+        payload = json.loads(response.content)
+        self.assertEqual(payload["allowed_warehouses"], ["WH-A", "WH-C"])
+        self.assertEqual({row["warehouse_ref"] for row in payload["results"]}, {"WH-A", "WH-C"})
+        fulfillment_warehouse_codes_for_stores.assert_called_once_with({"S001"})
+
+    @patch("apps.inventory.api.fulfillment_warehouse_codes_for_stores")
+    @patch("apps.inventory.api.employee_delivery_permissions")
+    def test_inventory_balances_reject_warehouses_outside_stock_scope(self, employee_delivery_permissions, fulfillment_warehouse_codes_for_stores):
+        get_user_model().objects.create_user(username="operator@example.com")
+        self.client.force_login(get_user_model().objects.get(username="operator@example.com"))
+        employee_delivery_permissions.return_value = {
+            "employee": {"store_codes": ["S001"], "branch_ref": "S001"},
+            "authorized_warehouses": ["W-SHIPPING"],
+            "permissions": ["stock:view"],
+        }
+        fulfillment_warehouse_codes_for_stores.return_value = {"WH-A"}
+
+        response = self.client.get("/api/v1/inventory/balances/", {"warehouse": "WH-B"})
+
+        self.assertEqual(response.status_code, 403, response.content)
+
+    def test_inventory_advanced_stock_aggregates_states_by_item_warehouse_and_location(self):
+        for stock_state, quantity in [
+            (StockState.ON_HAND, "10"),
+            (StockState.RESERVED, "2"),
+            (StockState.PICKING, "1"),
+            (StockState.PACKED, "3"),
+            (StockState.IN_TRANSIT, "4"),
+            (StockState.SCRAPPED, "0.5"),
+        ]:
+            InventoryBalance.objects.create(
+                warehouse_ref="WH-A",
+                item_ref="ITEM-1",
+                lot_ref="LOC-01",
+                stock_state=stock_state,
+                uom="UN",
+                quantity=Decimal(quantity),
+            )
+        InventoryBalance.objects.create(
+            warehouse_ref="WH-A",
+            item_ref="ITEM-1",
+            lot_ref="LOC-01",
+            stock_state=StockState.DELIVERED,
+            uom="UN",
+            quantity=Decimal("99"),
+        )
+        InventoryBalance.objects.create(
+            warehouse_ref="WH-A",
+            item_ref="ITEM-1",
+            lot_ref="LOC-02",
+            stock_state=StockState.ON_HAND,
+            uom="UN",
+            quantity=Decimal("7"),
+        )
+
+        results = self._results(
+            "/api/v1/inventory/advanced-stock/",
+            {"warehouse": "WH-A", "item": "ITEM-1", "location_ref": "LOC-01"},
+        )
+
+        self.assertEqual(len(results), 1)
+        row = results[0]
+        self.assertEqual(row["warehouse_ref"], "WH-A")
+        self.assertEqual(row["item_ref"], "ITEM-1")
+        self.assertEqual(row["lot_ref"], "LOC-01")
+        self.assertEqual(row["location_ref"], "LOC-01")
+        self.assertEqual(row["location_name"], "")
+        self.assertEqual(row["quantities"]["available"], "10")
+        self.assertEqual(row["quantities"]["reserved"], "2")
+        self.assertEqual(row["quantities"]["in_preparation"], "1")
+        self.assertEqual(row["quantities"]["prepared"], "3")
+        self.assertEqual(row["quantities"]["in_transit"], "4")
+        self.assertEqual(row["quantities"]["damaged_waste"], "0.5")
+        self.assertEqual(row["quantities"]["total"], "20.5")
+        self.assertEqual([state["label"] for state in row["state_quantities"]], [
+            "Disponible",
+            "Reservado",
+            "En Preparacion",
+            "Preparado",
+            "En Transito",
+            "Roto/Merma",
+        ])
+
+    def test_inventory_advanced_stock_enriches_items_and_filters_by_name(self):
+        InventoryBalance.objects.create(
+            warehouse_ref="WH-A",
+            item_ref="ITEM-1",
+            lot_ref="",
+            stock_state=StockState.PACKED,
+            uom="UN",
+            quantity=Decimal("5"),
+        )
+        InventoryBalance.objects.create(
+            warehouse_ref="WH-A",
+            item_ref="ITEM-2",
+            lot_ref="",
+            stock_state=StockState.PACKED,
+            uom="UN",
+            quantity=Decimal("7"),
+        )
+        MaterialMasterSnapshot.objects.create(item_ref="ITEM-1", name="Porcelanato gris", category="CER")
+        MaterialMasterSnapshot.objects.create(item_ref="ITEM-2", name="Bacha blanca", category="SAN")
+
+        results = self._results("/api/v1/inventory/advanced-stock/", {"item": "porcelanato"})
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["item_ref"], "ITEM-1")
+        self.assertEqual(results[0]["item_name"], "Porcelanato gris")
+        self.assertEqual(results[0]["category_ref"], "CER")
+
+    def test_inventory_advanced_stock_filters_by_category(self):
+        InventoryBalance.objects.create(
+            warehouse_ref="WH-A",
+            item_ref="ITEM-1",
+            lot_ref="",
+            stock_state=StockState.PACKED,
+            uom="UN",
+            quantity=Decimal("5"),
+        )
+        InventoryBalance.objects.create(
+            warehouse_ref="WH-A",
+            item_ref="ITEM-2",
+            lot_ref="",
+            stock_state=StockState.PACKED,
+            uom="UN",
+            quantity=Decimal("7"),
+        )
+        MaterialMasterSnapshot.objects.create(item_ref="ITEM-1", name="Porcelanato gris", category="CER")
+        MaterialMasterSnapshot.objects.create(item_ref="ITEM-2", name="Bacha blanca", category="SAN")
+
+        results = self._results("/api/v1/inventory/advanced-stock/", {"category": "san"})
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["item_ref"], "ITEM-2")
+
+    @patch("apps.inventory.api.fulfillment_warehouse_codes_for_stores")
+    @patch("apps.inventory.api.employee_delivery_permissions")
+    def test_inventory_advanced_stock_uses_fulfillment_group_scope(self, employee_delivery_permissions, fulfillment_warehouse_codes_for_stores):
+        get_user_model().objects.create_user(username="operator@example.com")
+        self.client.force_login(get_user_model().objects.get(username="operator@example.com"))
+        employee_delivery_permissions.return_value = {
+            "employee": {"store_codes": ["S001"], "branch_ref": "S001"},
+            "authorized_warehouses": ["W-SHIPPING"],
+            "permissions": ["stock:view"],
+        }
+        fulfillment_warehouse_codes_for_stores.return_value = {"WH-A", "WH-C"}
+        for warehouse_ref in ["WH-A", "WH-B", "WH-C"]:
+            InventoryBalance.objects.create(
+                warehouse_ref=warehouse_ref,
+                item_ref=f"ITEM-{warehouse_ref}",
+                lot_ref="",
+                stock_state=StockState.ON_HAND,
+                uom="UN",
+                quantity=Decimal("1"),
+            )
+
+        response = self.client.get("/api/v1/inventory/advanced-stock/")
+
+        self.assertEqual(response.status_code, 200, response.content)
+        payload = json.loads(response.content)
+        self.assertEqual(payload["allowed_warehouses"], ["WH-A", "WH-C"])
+        self.assertEqual({row["warehouse_ref"] for row in payload["results"]}, {"WH-A", "WH-C"})
+        self.assertEqual({row["location_ref"] for row in payload["results"]}, {""})
+        fulfillment_warehouse_codes_for_stores.assert_called_once_with({"S001"})
+
+    @patch("apps.inventory.api.fulfillment_warehouse_codes_for_stores")
+    @patch("apps.inventory.api.employee_delivery_permissions")
+    def test_inventory_advanced_stock_rejects_warehouses_outside_stock_scope(self, employee_delivery_permissions, fulfillment_warehouse_codes_for_stores):
+        get_user_model().objects.create_user(username="operator@example.com")
+        self.client.force_login(get_user_model().objects.get(username="operator@example.com"))
+        employee_delivery_permissions.return_value = {
+            "employee": {"store_codes": ["S001"], "branch_ref": "S001"},
+            "authorized_warehouses": ["W-SHIPPING"],
+            "permissions": ["stock:view"],
+        }
+        fulfillment_warehouse_codes_for_stores.return_value = {"WH-A"}
+
+        response = self.client.get("/api/v1/inventory/advanced-stock/", {"warehouse": "WH-B"})
+
+        self.assertEqual(response.status_code, 403, response.content)
 
     def test_pos_freight_product_refs_reads_automatic_freight_params(self):
         from apps.logistics import parquet_master_data
@@ -371,13 +594,16 @@ class ApiFilterTests(TestCase):
         self.assertEqual(results[0]["sales_order_number"], "")
         self.assertEqual(results[0]["customer_ref"], "CUST-1")
 
-    def test_reparto_confirmation_queue_includes_uncreated_fulfillment_orders(self):
+    @patch("apps.fulfillment.api.employee_delivery_permissions")
+    def test_reparto_confirmation_queue_includes_uncreated_fulfillment_orders(self, employee_delivery_permissions):
+        employee_delivery_permissions.return_value = {"authorized_warehouses": ["WH-A"]}
+        planned_date = timezone.localdate()
         fulfillment = FulfillmentOrder.objects.create(
             fulfillment_number="FUL-101",
             customer_ref="CUST-1",
             delivery_mode="Repart Prg",
             warehouse_ref="WH-A",
-            requested_date=date(2026, 4, 24),
+            requested_date=planned_date,
             legacy_sales_order_number="VENT8-101",
             address_snapshot={
                 "address_id": "ADDR-1",
@@ -397,7 +623,7 @@ class ApiFilterTests(TestCase):
 
         results = self._results(
             "/api/v1/fulfillment/reparto-confirmation/",
-            {"planned_date": "2026-04-24"},
+            {"planned_date": planned_date.isoformat()},
         )
 
         self.assertEqual(len(results), 1)
@@ -407,3 +633,239 @@ class ApiFilterTests(TestCase):
         self.assertEqual(results[0]["address_snapshot"]["address_id"], "ADDR-1")
         self.assertEqual(results[0]["address_snapshot"]["street"], "Uruguay")
         self.assertEqual(results[0]["lines"][0]["split_qty"], "2.000000")
+
+    @patch("apps.fulfillment.api.employee_delivery_permissions")
+    def test_reparto_confirmation_queue_filters_authorized_warehouse(self, employee_delivery_permissions):
+        employee_delivery_permissions.return_value = {"authorized_warehouses": ["WH-A"]}
+        planned_date = timezone.localdate()
+        for warehouse_ref in ["WH-A", "WH-B"]:
+            fulfillment = FulfillmentOrder.objects.create(
+                fulfillment_number=f"FUL-{warehouse_ref}",
+                customer_ref="CUST-1",
+                delivery_mode="Repart Prg",
+                warehouse_ref=warehouse_ref,
+                requested_date=planned_date,
+                legacy_sales_order_number=f"VENT8-{warehouse_ref}",
+            )
+            fulfillment.lines.create(
+                ordered_qty=Decimal("1"),
+                uom="UN",
+                item_ref=f"ITEM-{warehouse_ref}",
+                warehouse_ref=warehouse_ref,
+                legacy_sales_order_number=f"VENT8-{warehouse_ref}",
+                legacy_line_id="10",
+            )
+
+        results = self._results(
+            "/api/v1/fulfillment/reparto-confirmation/",
+            {"planned_date": planned_date.isoformat()},
+        )
+
+        self.assertEqual([row["warehouse_ref"] for row in results], ["WH-A"])
+
+    @patch("apps.fulfillment.api.employee_delivery_permissions")
+    def test_reparto_confirmation_queue_rejects_unauthorized_warehouse_filter(self, employee_delivery_permissions):
+        employee_delivery_permissions.return_value = {"authorized_warehouses": ["WH-A"]}
+        planned_date = timezone.localdate()
+        fulfillment = FulfillmentOrder.objects.create(
+            fulfillment_number="FUL-WH-B",
+            customer_ref="CUST-1",
+            delivery_mode="Repart Prg",
+            warehouse_ref="WH-B",
+            requested_date=planned_date,
+            legacy_sales_order_number="VENT8-WH-B",
+        )
+        fulfillment.lines.create(
+            ordered_qty=Decimal("1"),
+            uom="UN",
+            item_ref="ITEM-WH-B",
+            warehouse_ref="WH-B",
+            legacy_sales_order_number="VENT8-WH-B",
+            legacy_line_id="10",
+        )
+
+        results = self._results(
+            "/api/v1/fulfillment/reparto-confirmation/",
+            {"planned_date": planned_date.isoformat(), "warehouse_ref": "WH-B"},
+        )
+
+        self.assertEqual(results, [])
+
+    @patch("apps.fulfillment.api.employee_delivery_permissions")
+    def test_reparto_confirmation_queue_does_not_return_past_deliveries(self, employee_delivery_permissions):
+        employee_delivery_permissions.return_value = {"authorized_warehouses": ["WH-A"]}
+        past_date = timezone.localdate() - timedelta(days=1)
+        fulfillment = FulfillmentOrder.objects.create(
+            fulfillment_number="FUL-PAST",
+            customer_ref="CUST-1",
+            delivery_mode="Repart Prg",
+            warehouse_ref="WH-A",
+            requested_date=past_date,
+            legacy_sales_order_number="VENT8-PAST",
+        )
+        fulfillment.lines.create(
+            ordered_qty=Decimal("1"),
+            uom="UN",
+            item_ref="ITEM-PAST",
+            warehouse_ref="WH-A",
+            legacy_sales_order_number="VENT8-PAST",
+            legacy_line_id="10",
+        )
+
+        results = self._results(
+            "/api/v1/fulfillment/reparto-confirmation/",
+            {"planned_date": past_date.isoformat()},
+        )
+
+        self.assertEqual(results, [])
+
+    @patch("apps.fulfillment.api.employee_delivery_permissions")
+    def test_reparto_stock_check_rejects_past_delivery_date(self, employee_delivery_permissions):
+        employee_delivery_permissions.return_value = {"authorized_warehouses": ["WH-A"]}
+        fulfillment = FulfillmentOrder.objects.create(
+            fulfillment_number="FUL-PAST-CMD",
+            customer_ref="CUST-1",
+            delivery_mode="Repart Prg",
+            warehouse_ref="WH-A",
+            legacy_sales_order_number="VENT8-PAST-CMD",
+        )
+        delivery = DeliveryOrder.objects.create(
+            delivery_number="DEL-PAST-CMD",
+            fulfillment=fulfillment,
+            status=DeliveryOrder.DeliveryStatus.CREATED,
+            delivery_mode="Repart Prg",
+            warehouse_ref="WH-A",
+            planned_date=timezone.localdate() - timedelta(days=1),
+        )
+
+        response = self.client.post(f"/api/v1/fulfillment/deliveries/{delivery.id}/stock-check")
+
+        self.assertEqual(response.status_code, 422)
+
+    @patch("apps.fulfillment.api.employee_delivery_permissions")
+    def test_expedition_queue_is_not_filtered_by_authorized_warehouse(self, employee_delivery_permissions):
+        employee_delivery_permissions.return_value = {"authorized_warehouses": ["WH-A"]}
+        fulfillment = FulfillmentOrder.objects.create(
+            fulfillment_number="FUL-ENTREGA",
+            customer_ref="CUST-1",
+            delivery_mode="Repart Prg",
+            warehouse_ref="WH-B",
+            requested_date=date(2026, 4, 24),
+            legacy_sales_order_number="VENT8-ENTREGA",
+        )
+        fulfillment.lines.create(
+            ordered_qty=Decimal("1"),
+            uom="UN",
+            item_ref="ITEM-WH-B",
+            warehouse_ref="WH-B",
+            legacy_sales_order_number="VENT8-ENTREGA",
+            legacy_line_id="10",
+        )
+
+        with patch(
+            "apps.fulfillment.services._resolve_customer_snapshots",
+            return_value={"CUST-1": {"name": "Cliente 1", "document_number": "", "address": {}}},
+        ):
+            results = self._results(
+                "/api/v1/fulfillment/expedition-queue/",
+                {"sales_order_number": "VENT8-ENTREGA"},
+            )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["warehouse_ref"], "WH-B")
+
+    @patch("apps.fulfillment.api.employee_delivery_permissions")
+    def test_preparation_tasks_filter_authorized_warehouse_not_date(self, employee_delivery_permissions):
+        employee_delivery_permissions.return_value = {"authorized_warehouses": ["WH-A"]}
+        now = timezone.now()
+        fulfillment_a = FulfillmentOrder.objects.create(
+            fulfillment_number="FUL-TASK-A",
+            customer_ref="CUST-1",
+            delivery_mode="Repart Prg",
+            warehouse_ref="WH-A",
+            legacy_sales_order_number="VENT8-TASK-A",
+        )
+        delivery_today = DeliveryOrder.objects.create(
+            delivery_number="DEL-TASK-TODAY",
+            fulfillment=fulfillment_a,
+            status=DeliveryOrder.DeliveryStatus.PREPARING,
+            delivery_mode="Repart Prg",
+            warehouse_ref="WH-A",
+            planned_date=timezone.localdate(),
+        )
+        delivery_later = DeliveryOrder.objects.create(
+            delivery_number="DEL-TASK-LATER",
+            fulfillment=fulfillment_a,
+            status=DeliveryOrder.DeliveryStatus.PREPARING,
+            delivery_mode="Repart Prg",
+            warehouse_ref="WH-A",
+            planned_date=timezone.localdate() + timedelta(days=1),
+        )
+        fulfillment_b = FulfillmentOrder.objects.create(
+            fulfillment_number="FUL-TASK-B",
+            customer_ref="CUST-1",
+            delivery_mode="Repart Prg",
+            warehouse_ref="WH-B",
+            legacy_sales_order_number="VENT8-TASK-B",
+        )
+        delivery_other_warehouse = DeliveryOrder.objects.create(
+            delivery_number="DEL-TASK-WH-B",
+            fulfillment=fulfillment_b,
+            status=DeliveryOrder.DeliveryStatus.PREPARING,
+            delivery_mode="Repart Prg",
+            warehouse_ref="WH-B",
+            planned_date=timezone.localdate(),
+        )
+        DeliveryPreparationTask.objects.create(
+            delivery=delivery_today,
+            status=DeliveryPreparationTask.TaskStatus.ASSIGNED,
+            assigned_to="prep",
+            assigned_at=now,
+            warehouse_ref="WH-A",
+        )
+        DeliveryPreparationTask.objects.create(
+            delivery=delivery_later,
+            status=DeliveryPreparationTask.TaskStatus.ASSIGNED,
+            assigned_to="prep",
+            assigned_at=now - timedelta(minutes=1),
+            warehouse_ref="WH-A",
+        )
+        DeliveryPreparationTask.objects.create(
+            delivery=delivery_other_warehouse,
+            status=DeliveryPreparationTask.TaskStatus.ASSIGNED,
+            assigned_to="prep",
+            assigned_at=now - timedelta(minutes=2),
+            warehouse_ref="WH-B",
+        )
+
+        results = self._results(
+            "/api/v1/fulfillment/preparation-tasks/",
+            {"status": "all", "planned_date": timezone.localdate().isoformat()},
+        )
+
+        self.assertEqual({row["delivery"]["delivery_number"] for row in results}, {"DEL-TASK-TODAY", "DEL-TASK-LATER"})
+        self.assertEqual({row["warehouse_ref"] for row in results}, {"WH-A"})
+
+    @patch("apps.routes.api.employee_delivery_permissions")
+    def test_route_sheets_filter_authorized_warehouse(self, employee_delivery_permissions):
+        employee_delivery_permissions.return_value = {"authorized_warehouses": ["WH-A"]}
+        RouteSheet.objects.create(route_number="R-WH-A", branch_ref="BR-1", warehouse_ref="WH-A", planned_date=date(2026, 4, 24))
+        RouteSheet.objects.create(route_number="R-WH-B", branch_ref="BR-1", warehouse_ref="WH-B", planned_date=date(2026, 4, 24))
+
+        results = self._results("/api/v1/routesheets/")
+
+        self.assertEqual([row["route_number"] for row in results], ["R-WH-A"])
+
+    @patch("apps.routes.api.employee_delivery_permissions")
+    def test_route_sheet_detail_rejects_unauthorized_warehouse(self, employee_delivery_permissions):
+        employee_delivery_permissions.return_value = {"authorized_warehouses": ["WH-A"]}
+        route = RouteSheet.objects.create(
+            route_number="R-WH-B",
+            branch_ref="BR-1",
+            warehouse_ref="WH-B",
+            planned_date=date(2026, 4, 24),
+        )
+
+        response = self.client.get(f"/api/v1/routesheets/{route.id}/")
+
+        self.assertEqual(response.status_code, 403)

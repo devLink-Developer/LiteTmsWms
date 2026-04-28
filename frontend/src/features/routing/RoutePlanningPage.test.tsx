@@ -15,11 +15,22 @@ vi.mock("leaflet", () => ({
 vi.mock("react-leaflet", () => ({
   MapContainer: ({ children }: { children: ReactNode }) => <div aria-label="Mapa de reparto">{children}</div>,
   TileLayer: () => null,
-  Marker: ({ children }: { children?: ReactNode }) => <div data-testid="route-marker">{children}</div>,
+  Marker: ({ children, eventHandlers }: { children?: ReactNode; eventHandlers?: { click?: () => void } }) => (
+    <button
+      type="button"
+      data-testid={eventHandlers?.click ? "clickable-route-marker" : "route-marker"}
+      onClick={(event) => {
+        event.stopPropagation();
+        eventHandlers?.click?.();
+      }}
+    >
+      {children}
+    </button>
+  ),
   Polyline: ({ positions }: { positions: Array<[number, number]> }) => (
     <div data-testid="route-line" data-points={positions.length} data-first={`${positions[0]?.[0]},${positions[0]?.[1]}`} />
   ),
-  Tooltip: ({ children }: { children: ReactNode }) => <span>{children}</span>,
+  Tooltip: ({ children }: { children: ReactNode }) => <span data-testid="route-tooltip">{children}</span>,
   useMap: () => ({ fitBounds: vi.fn() }),
 }));
 
@@ -127,7 +138,8 @@ describe("RoutePlanningPage", () => {
                     sales_order_number: "SO-1",
                     delivery_mode: "Reparto programado",
                     customer_ref: "CUST-1",
-                    address_snapshot: { street: "Calle", street_number: "1", city: "Posadas" },
+                    customer_name: "Cliente Uno",
+                    address_snapshot: { formatted: "Calle 1, Posadas, Misiones", street: "Calle", street_number: "1", city: "Posadas" },
                     lat: "-34.60",
                     lng: "-58.38",
                     planned_weight_kg: "9",
@@ -184,7 +196,8 @@ describe("RoutePlanningPage", () => {
                     sales_order_number: "SO-1",
                     delivery_mode: "Reparto programado",
                     customer_ref: "CUST-1",
-                    address_snapshot: { street: "Calle", street_number: "1", city: "Posadas" },
+                    customer_name: "Cliente Uno",
+                    address_snapshot: { formatted: "Calle 1, Posadas, Misiones", street: "Calle", street_number: "1", city: "Posadas" },
                     lat: "-34.60",
                     lng: "-58.38",
                     planned_weight_kg: "9",
@@ -205,7 +218,8 @@ describe("RoutePlanningPage", () => {
                     sales_order_number: "SO-2",
                     delivery_mode: "Reparto programado",
                     customer_ref: "CUST-2",
-                    address_snapshot: { street: "Avenida", street_number: "2", city: "Posadas" },
+                    customer_name: "Cliente Dos",
+                    address_snapshot: { formatted: "Avenida 2, Posadas, Misiones", street: "Avenida", street_number: "2", city: "Posadas" },
                     lat: "-34.61",
                     lng: "-58.39",
                     planned_weight_kg: "4",
@@ -255,6 +269,9 @@ describe("RoutePlanningPage", () => {
 
     await waitFor(() => expect(screen.getByText(/HR-000000001/)).toBeInTheDocument());
     expect(screen.getByText("fallback_no_ors_key")).toBeInTheDocument();
+    expect(screen.getAllByText("Cliente Uno").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Calle 1, Posadas, Misiones").length).toBeGreaterThan(0);
+    expect(screen.queryAllByTestId("route-tooltip")).toHaveLength(0);
     expect(screen.getByTestId("route-line")).toHaveAttribute("data-points", "3");
   });
 

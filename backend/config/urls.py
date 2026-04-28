@@ -7,6 +7,7 @@ from apps.routes import api as routes_api
 
 urlpatterns = [
     path("admin/", admin.site.urls),
+    path("auth/", include("apps.authentication.urls")),
     path("api/v1/health/", healthcheck, name="healthcheck"),
     path("api/v1/inventory/", include("apps.inventory.urls")),
     path("api/v1/transfers/", include("apps.transfers.urls")),

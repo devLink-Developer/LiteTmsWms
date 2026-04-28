@@ -131,8 +131,8 @@ async function mapWithConcurrency<T, R>(items: T[], limit: number, handler: (ite
 
 export function RepartoConfirmationPage() {
   const queryClient = useQueryClient();
+  const today = useMemo(() => localDateInputValue(), []);
   const [plannedDate, setPlannedDate] = useState(localDateInputValue());
-  const [warehouse, setWarehouse] = useState("");
   const [query, setQuery] = useState("");
   const [statusView, setStatusView] = useState<StatusView>("pending");
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
@@ -142,11 +142,10 @@ export function RepartoConfirmationPage() {
   const [message, setMessage] = useState<string | null>(null);
 
   const deliveriesQuery = useQuery({
-    queryKey: ["reparto-confirmation", plannedDate, warehouse, query, statusView],
+    queryKey: ["reparto-confirmation", plannedDate, query, statusView],
     queryFn: () =>
       fetchRepartoDeliveries({
         plannedDate,
-        warehouse: warehouse.trim(),
         query: query.trim(),
         status: statusParam(statusView),
       }),
@@ -170,7 +169,11 @@ export function RepartoConfirmationPage() {
     setValidatedRows({});
     setStockResults({});
     setExpandedIds([]);
-  }, [plannedDate, warehouse, query, statusView]);
+  }, [plannedDate, query, statusView]);
+
+  function handlePlannedDateChange(value: string) {
+    setPlannedDate(value && value >= today ? value : today);
+  }
 
   const validateStockMutation = useMutation({
     mutationFn: async (rows: ApiRepartoDelivery[]) => {
@@ -316,7 +319,7 @@ export function RepartoConfirmationPage() {
         </div>
       )}
 
-      <section className="grid shrink-0 gap-2 rounded border border-borderSoft bg-white p-3 shadow-panel lg:grid-cols-[180px_180px_minmax(220px,1fr)_auto]">
+      <section className="grid shrink-0 gap-2 rounded border border-borderSoft bg-white p-3 shadow-panel lg:grid-cols-[180px_minmax(220px,1fr)_auto]">
         <label className="grid gap-1 text-[11px] font-semibold text-secondaryText">
           Fecha entrega
           <span className="relative">
@@ -324,19 +327,13 @@ export function RepartoConfirmationPage() {
             <input
               type="date"
               value={plannedDate}
-              onChange={(event) => setPlannedDate(event.target.value)}
+              min={today}
+              required
+              onBlur={(event) => handlePlannedDateChange(event.target.value)}
+              onChange={(event) => handlePlannedDateChange(event.target.value)}
               className="h-10 w-full rounded border border-borderSoft bg-white pl-8 pr-2 text-[13px] text-night outline-none focus:border-primary focus:ring-2 focus:ring-primary/20"
             />
           </span>
-        </label>
-        <label className="grid gap-1 text-[11px] font-semibold text-secondaryText">
-          Deposito
-          <input
-            value={warehouse}
-            onChange={(event) => setWarehouse(event.target.value)}
-            placeholder="Todos"
-            className="h-10 rounded border border-borderSoft bg-white px-2 text-[13px] text-night outline-none focus:border-primary focus:ring-2 focus:ring-primary/20"
-          />
         </label>
         <label className="grid gap-1 text-[11px] font-semibold text-secondaryText">
           Buscar
@@ -449,7 +446,6 @@ export function RepartoConfirmationPage() {
                 </th>
                 <th className="px-3 py-2 font-semibold">Pedido / entrega</th>
                 <th className="px-3 py-2 font-semibold">Cliente</th>
-                <th className="px-3 py-2 font-semibold">Deposito</th>
                 <th className="px-3 py-2 font-semibold">Estado</th>
                 <th className="px-3 py-2 font-semibold">Carga</th>
                 <th className="px-3 py-2 font-semibold">Direccion</th>
@@ -491,15 +487,11 @@ export function RepartoConfirmationPage() {
                       <div className="font-mono text-[12px] font-semibold text-night">
                         {orderRef(delivery)}
                       </div>
-                      <div className="mt-1 font-mono text-[11px] text-secondaryText">
-                        {delivery.source_type === "fulfillment" ? formatIdentifier(delivery.fulfillment_number) : delivery.delivery_number}
-                      </div>
                       {delivery.source_type === "fulfillment" && (
                         <div className="mt-1 text-[11px] font-semibold text-amber-700">sin entrega generada</div>
                       )}
                     </td>
                     <td className="whitespace-nowrap px-3 py-2 font-mono text-night">{delivery.customer_ref}</td>
-                    <td className="whitespace-nowrap px-3 py-2 font-mono text-night">{delivery.warehouse_ref}</td>
                     <td className="whitespace-nowrap px-3 py-2">
                       <div className="flex flex-col items-start gap-1">
                         <StatusBadge label={statusLabel[delivery.status] ?? delivery.status} tone={statusTone[delivery.status] ?? "neutral"} />
@@ -543,7 +535,7 @@ export function RepartoConfirmationPage() {
                   </tr>
                   {expanded && (
                     <tr className="border-b border-borderSoft bg-[#f8fbfe]">
-                      <td colSpan={8} className="px-3 py-2">
+                      <td colSpan={7} className="px-3 py-2">
                         <div className="grid gap-1">
                           {delivery.lines.map((line) => {
                             const validationLine = stockLineFor(line, stockResult);

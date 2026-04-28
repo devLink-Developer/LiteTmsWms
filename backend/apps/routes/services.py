@@ -4,6 +4,7 @@ import json
 import hashlib
 import math
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
@@ -30,6 +31,7 @@ from apps.fulfillment.services import (
 )
 from apps.inventory.models import InventoryLedgerEntry, StockState
 from apps.inventory.services import InventoryRuleError, LedgerCommand, post_ledger_entry
+from apps.logistics.parquet_master_data import warehouse_origin_snapshot
 from apps.routes.models import RouteOptimizationRun, RouteRendition, RouteRenditionLine, RouteSheet, RouteStop, RouteStopLine
 from apps.vehicles.models import Vehicle
 
@@ -141,6 +143,119 @@ def _address_coordinates(address: dict) -> tuple[Decimal | None, Decimal | None]
     return lat, lng
 
 
+def _configured_warehouse_origin(warehouse_ref: str) -> tuple[tuple[Decimal, Decimal] | None, dict]:
+    origins = getattr(settings, "WAREHOUSE_ORIGINS", {}) or {}
+    if not isinstance(origins, dict):
+        return None, {}
+    warehouse_key = str(warehouse_ref or "").strip()
+    candidates = [warehouse_key, warehouse_key.upper(), warehouse_key.lower()]
+    snapshot = next((origins.get(candidate) for candidate in candidates if candidate in origins), None)
+    if not isinstance(snapshot, dict):
+        return None, {}
+    snapshot = dict(snapshot)
+    snapshot.setdefault("warehouse_ref", warehouse_key)
+    snapshot.setdefault("source", "settings.WAREHOUSE_ORIGINS")
+    origin = _address_coordinates(snapshot)
+    if origin[0] is None or origin[1] is None:
+        return None, snapshot
+    snapshot["latitude"] = str(origin[0])
+    snapshot["longitude"] = str(origin[1])
+    snapshot.setdefault("geo_source", snapshot.get("source") or "settings.WAREHOUSE_ORIGINS")
+    return (origin[0], origin[1]), snapshot
+
+
+def _clean_origin_street(value: str) -> str:
+    text = str(value or "").strip()
+    if " - " in text:
+        return text.rsplit(" - ", 1)[-1].strip()
+    if text.lower().startswith("unimaco") and "-" in text:
+        return text.split("-", 1)[-1].strip()
+    return text
+
+
+def _origin_geocode_text(snapshot: dict) -> str:
+    street = _clean_origin_street(str(snapshot.get("street") or ""))
+    street_number = str(snapshot.get("street_number") or "").strip()
+    city = str(snapshot.get("city") or "").strip()
+    state = str(snapshot.get("state_name") or snapshot.get("state") or "").strip()
+    zip_code = str(snapshot.get("zip_code") or snapshot.get("zip") or "").strip()
+    country = str(snapshot.get("country") or "ARG").strip()
+    street_line = " ".join(part for part in [street, street_number] if part)
+    parts = [street_line, city, state, zip_code, country]
+    return ", ".join(part for part in parts if part)
+
+
+def _geocode_origin_snapshot(snapshot: dict) -> tuple[Decimal | None, Decimal | None]:
+    query = _origin_geocode_text(snapshot)
+    if not settings.ORS_API_KEY or not query:
+        return None, None
+    url = f"{settings.ORS_BASE_URL.rstrip('/')}/geocode/search?{urllib.parse.urlencode({'text': query, 'boundary.country': 'ARG', 'size': '1'})}"
+    request = urllib.request.Request(
+        url,
+        headers={"Authorization": settings.ORS_API_KEY, "Accept": "application/json"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=8) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        coordinates = payload.get("features", [{}])[0].get("geometry", {}).get("coordinates", [])
+        if len(coordinates) < 2:
+            return None, None
+        lng = _decimal(coordinates[0], "")
+        lat = _decimal(coordinates[1], "")
+        if lat == ZERO and lng == ZERO:
+            return None, None
+        snapshot["latitude"] = str(lat)
+        snapshot["longitude"] = str(lng)
+        snapshot["geo_source"] = "ors_geocode"
+        snapshot["geocode_query"] = query
+        return lat, lng
+    except (urllib.error.URLError, TimeoutError, KeyError, ValueError, IndexError, json.JSONDecodeError):
+        snapshot["geo_source"] = "unresolved"
+        snapshot["geocode_query"] = query
+        return None, None
+
+
+def _warehouse_origin(warehouse_ref: str) -> tuple[tuple[Decimal, Decimal] | None, dict]:
+    configured_origin, configured_snapshot = _configured_warehouse_origin(warehouse_ref)
+    if configured_origin is not None:
+        return configured_origin, configured_snapshot
+    snapshot = warehouse_origin_snapshot(warehouse_ref)
+    origin = _address_coordinates(snapshot)
+    if origin[0] is None or origin[1] is None:
+        origin = _geocode_origin_snapshot(snapshot)
+    if origin[0] is None or origin[1] is None:
+        return None, snapshot
+    snapshot["latitude"] = str(origin[0])
+    snapshot["longitude"] = str(origin[1])
+    return (origin[0], origin[1]), snapshot
+
+
+def _origin_payload(origin: tuple[Decimal, Decimal] | None, snapshot: dict) -> dict:
+    payload = dict(snapshot or {})
+    if origin is not None:
+        payload["lat"] = str(origin[0])
+        payload["lng"] = str(origin[1])
+    return payload
+
+
+def _clean_text(value) -> str:
+    return str(value or "").strip()
+
+
+def _delivery_customer_name(delivery: DeliveryOrder | None, fallback: str = "") -> str:
+    if delivery is None:
+        return fallback
+    customer_ref = _clean_text(getattr(delivery.fulfillment, "customer_ref", "")) or fallback
+    snapshots = [delivery.fulfillment.address_snapshot or {}, delivery.address_snapshot or {}]
+    for snapshot in snapshots:
+        for key in ["customer_name", "name", "receiver", "attention_to"]:
+            value = _clean_text(snapshot.get(key))
+            if value and value != customer_ref:
+                return value
+    return customer_ref
+
+
 def _delivery_is_reparto(delivery: DeliveryOrder) -> bool:
     return is_shipping_delivery_mode(delivery.delivery_mode)
 
@@ -237,6 +352,8 @@ def _fallback_ordered_route(
     distance = ZERO
     current = origin
     coordinates = []
+    if origin is not None:
+        coordinates.append([float(origin[1]), float(origin[0])])
     for stop in ordered:
         if stop.latitude is None or stop.longitude is None:
             continue
@@ -255,6 +372,18 @@ def _fallback_ordered_route(
         "provider": "manual",
         "routing_status": routing_status,
     }
+
+
+def _geometry_with_origin_coordinate(geometry: dict, origin: tuple[Decimal, Decimal] | None) -> dict:
+    if origin is None or geometry.get("type") != "LineString":
+        return geometry
+    coordinates = geometry.get("coordinates")
+    if not isinstance(coordinates, list):
+        return geometry
+    origin_coordinate = [float(origin[1]), float(origin[0])]
+    if not coordinates:
+        return {**geometry, "coordinates": [origin_coordinate]}
+    return {**geometry, "coordinates": [origin_coordinate, *coordinates[1:]]}
 
 
 def _fallback_route(origin: tuple[Decimal, Decimal] | None, stops: list[RouteStopDraft]) -> dict:
@@ -289,7 +418,7 @@ def _ors_ordered_route(origin: tuple[Decimal, Decimal] | None, ordered) -> dict:
             "ordered": ordered,
             "distance_km": distance,
             "time_minutes": travel_minutes + int(settings.ROUTING_SERVICE_MINUTES_PER_STOP) * len(ordered),
-            "geometry": payload.get("features", [{}])[0].get("geometry", {}),
+            "geometry": _geometry_with_origin_coordinate(payload.get("features", [{}])[0].get("geometry", {}), origin),
             "provider": "ors",
             "routing_status": "optimized",
         }
@@ -363,12 +492,7 @@ def _serialize_route(route: RouteSheet) -> dict:
     ]
     deliveries_by_id = {
         str(delivery.id): delivery
-        for delivery in DeliveryOrder.objects.filter(id__in=delivery_ids).only(
-            "id",
-            "delivery_number",
-            "legacy_sales_order_number",
-            "delivery_mode",
-        )
+        for delivery in DeliveryOrder.objects.select_related("fulfillment").filter(id__in=delivery_ids)
     }
     route_lines = [line for stop in stops for line in stop.lines.all()]
     delivery_line_ids = [line.source_line_ref for line in route_lines if line.source_line_ref]
@@ -425,6 +549,7 @@ def _serialize_route(route: RouteSheet) -> dict:
                     else ""
                 ),
                 "customer_ref": stop.customer_ref,
+                "customer_name": _delivery_customer_name(deliveries_by_id.get(stop.source_ref), stop.customer_ref),
                 "address_snapshot": stop.address_snapshot,
                 "lat": str(stop.latitude) if stop.latitude is not None else None,
                 "lng": str(stop.longitude) if stop.longitude is not None else None,
@@ -570,6 +695,75 @@ def _source_deliveries_from_payload(payload: dict) -> tuple[list[RouteStopDraft]
     return drafts, excluded
 
 
+def _delivery_id_from_payload(row) -> str:
+    if isinstance(row, dict):
+        return str(row.get("delivery_id") or row.get("id") or "").strip()
+    return str(row or "").strip()
+
+
+def _merge_delivery_payloads(*payload_groups: list[dict]) -> list[dict]:
+    delivery_payload_by_id: dict[str, dict] = {}
+    ordered_ids = []
+    for payloads in payload_groups:
+        for row in payloads:
+            delivery_id = _delivery_id_from_payload(row)
+            if not delivery_id:
+                continue
+            if delivery_id not in delivery_payload_by_id:
+                ordered_ids.append(delivery_id)
+                delivery_payload_by_id[delivery_id] = {"delivery_id": delivery_id}
+            if isinstance(row, dict):
+                delivery_payload_by_id[delivery_id].update(row)
+            else:
+                delivery_payload_by_id[delivery_id]["delivery_id"] = delivery_id
+    return [delivery_payload_by_id[delivery_id] for delivery_id in ordered_ids]
+
+
+def _draft_route_delivery_payloads(*, warehouse_ref: str, planned_date) -> tuple[list[RouteSheet], list[dict]]:
+    draft_routes = list(
+        RouteSheet.objects.select_for_update()
+        .prefetch_related("stops")
+        .filter(
+            warehouse_ref=warehouse_ref,
+            planned_date=planned_date,
+            status=RouteSheet.RouteStatus.DRAFT,
+        )
+        .order_by("created_at")
+    )
+    delivery_payloads = []
+    for route in draft_routes:
+        for stop in route.stops.all():
+            if stop.source_type != "delivery_order" or not stop.source_ref:
+                continue
+            delivery_payloads.append(
+                {
+                    "delivery_id": stop.source_ref,
+                    "lat": str(stop.latitude) if stop.latitude is not None else None,
+                    "lng": str(stop.longitude) if stop.longitude is not None else None,
+                }
+            )
+    return draft_routes, delivery_payloads
+
+
+def _cancel_superseded_draft_routes(*, draft_routes: list[RouteSheet], superseded_by: RouteSheet, actor: str) -> None:
+    for draft_route in draft_routes:
+        draft_route.status = RouteSheet.RouteStatus.CANCELLED
+        draft_route.updated_by = actor
+        preview_payload = dict(draft_route.preview_payload or {})
+        preview_payload["superseded_by"] = str(superseded_by.id)
+        draft_route.preview_payload = preview_payload
+        draft_route.save(update_fields=["status", "preview_payload", "updated_by", "updated_at"])
+        _status_history(
+            "route_sheet",
+            str(draft_route.id),
+            RouteSheet.RouteStatus.DRAFT,
+            RouteSheet.RouteStatus.CANCELLED,
+            actor,
+            "Reoptimizacion de reparto",
+            {"superseded_by": str(superseded_by.id)},
+        )
+
+
 def _write_route_stops(route: RouteSheet, ordered_stops: list[RouteStopDraft], *, actor: str) -> None:
     route.stops.all().delete()
     for sequence, draft in enumerate(ordered_stops, start=1):
@@ -648,10 +842,26 @@ def optimize_route(*, payload: dict, idempotency_key: str, actor: str) -> Idempo
     vehicle = Vehicle.objects.filter(id=payload.get("vehicle_id")).first() if payload.get("vehicle_id") else None
     origin_payload = payload.get("origin") or {}
     origin = None
+    origin_snapshot = {}
     if origin_payload.get("lat") not in [None, ""] and origin_payload.get("lng") not in [None, ""]:
         origin = (_decimal(origin_payload.get("lat")), _decimal(origin_payload.get("lng")))
+        origin_snapshot = dict(origin_payload)
+    else:
+        origin, origin_snapshot = _warehouse_origin(warehouse_ref)
 
-    drafts, excluded = _source_deliveries_from_payload(payload)
+    superseded_drafts, draft_delivery_payloads = _draft_route_delivery_payloads(
+        warehouse_ref=warehouse_ref,
+        planned_date=planned_date,
+    )
+    effective_payload = {
+        **payload,
+        "origin": _origin_payload(origin, origin_snapshot),
+        "deliveries": _merge_delivery_payloads(draft_delivery_payloads, payload.get("deliveries") or []),
+    }
+
+    drafts, excluded = _source_deliveries_from_payload(effective_payload)
+    if not drafts:
+        raise RouteRuleError("No hay entregas con coordenadas para rutear.")
     route_result = _ors_route(origin, drafts)
     route = RouteSheet.objects.create(
         route_number=allocate_sequence_number(ROUTE_SEQUENCE_NAME, actor=actor),
@@ -667,15 +877,21 @@ def optimize_route(*, payload: dict, idempotency_key: str, actor: str) -> Idempo
         total_time_minutes=route_result["time_minutes"],
         routing_provider=route_result["provider"],
         route_geometry=route_result["geometry"],
-        preview_payload={"excluded": excluded, "routing_status": route_result["routing_status"], "input": payload},
+        preview_payload={
+            "excluded": excluded,
+            "routing_status": route_result["routing_status"],
+            "input": effective_payload,
+            "superseded_draft_routes": [str(draft_route.id) for draft_route in superseded_drafts],
+        },
         generated_by="auto",
         created_by=actor,
     )
     _write_route_stops(route, route_result["ordered"], actor=actor)
+    _cancel_superseded_draft_routes(draft_routes=superseded_drafts, superseded_by=route, actor=actor)
     RouteOptimizationRun.objects.create(
         route=route,
         algorithm=f"{route_result['provider']}_nearest_neighbor_v1",
-        input_payload=payload,
+        input_payload=effective_payload,
         output_payload=_serialize_route(route),
         accepted=False,
         created_by=actor,
@@ -907,6 +1123,7 @@ def start_loading_route(*, route_id: str, payload: dict, idempotency_key: str, a
             idempotency_key=f"{idempotency_key}:remito:{delivery.id}",
             actor=actor,
             authorized_warehouses=[delivery.warehouse_ref],
+            allow_route_delivery=True,
         )
         for line in delivery.lines.select_for_update().all():
             qty = max(ZERO, line.planned_qty - line.dispatched_qty)

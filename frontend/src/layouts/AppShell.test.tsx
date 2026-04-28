@@ -1,20 +1,28 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { useSessionStore } from "../stores/useSessionStore";
 import { useWorkspaceStore } from "../stores/useWorkspaceStore";
 import { AppShell } from "./AppShell";
 
-function contextResponse() {
+function jsonResponse(payload: unknown, status = 200) {
   return {
-    ok: true,
-    json: async () => ({
-      warehouse_ref: "PS003MT",
-      branch_ref: "Sucursal Norte",
-      role: "operador",
-      permissions: [],
-      authorized_warehouses: ["PS003MT", "PS03DP"],
-    }),
+    ok: status >= 200 && status < 300,
+    status,
+    statusText: status >= 200 && status < 300 ? "OK" : "Error",
+    headers: new Headers({ "content-type": "application/json" }),
+    json: async () => payload,
+  };
+}
+
+function contextPayload() {
+  return {
+    warehouse_ref: "PS003MT",
+    branch_ref: "Sucursal Norte",
+    role: "operador",
+    permissions: [],
+    authorized_warehouses: ["PS003MT"],
   };
 }
 
@@ -27,7 +35,17 @@ describe("AppShell", () => {
       permissions: [],
       authorizedWarehouses: [],
     });
-    vi.stubGlobal("fetch", vi.fn(async () => contextResponse()));
+    useSessionStore.setState({ bootstrap: null, status: "ready", error: null });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes("/auth/api/logout/")) {
+          return jsonResponse({ success: true, redirectTo: "/login/" });
+        }
+        return jsonResponse(contextPayload());
+      }),
+    );
   });
 
   it("renders the grouped operations menu without Despacho tienda", async () => {
@@ -38,6 +56,7 @@ describe("AppShell", () => {
     );
 
     await waitFor(() => expect(screen.getByText("Contexto operativo PS003MT")).toBeInTheDocument());
+    expect(screen.getByText("PS003MT")).toBeInTheDocument();
 
     const desktopNav = screen.getAllByRole("navigation", { name: "Modulos" })[0];
     expect(within(desktopNav).getByText("Pedidos")).toBeInTheDocument();
@@ -72,6 +91,15 @@ describe("AppShell", () => {
       "href",
       "/ingresos/devoluciones",
     );
+    expect(within(desktopNav).getByText("Stock")).toBeInTheDocument();
+    expect(within(desktopNav).getByRole("link", { name: "Stock por almacen" })).toHaveAttribute(
+      "href",
+      "/stock/almacenes",
+    );
+    expect(within(desktopNav).getByRole("link", { name: "Movimientos de Stock" })).toHaveAttribute(
+      "href",
+      "/stock/movimientos",
+    );
     expect(within(desktopNav).getByText("Operaciones")).toBeInTheDocument();
     expect(within(desktopNav).getByRole("link", { name: "Corte de chapas" })).toBeInTheDocument();
     expect(within(desktopNav).getByText("Maestros")).toBeInTheDocument();
@@ -81,5 +109,23 @@ describe("AppShell", () => {
     );
     expect(within(desktopNav).getByRole("link", { name: "Choferes" })).toHaveAttribute("href", "/maestros/choferes");
     expect(screen.queryByText("Despacho tienda")).not.toBeInTheDocument();
+  });
+
+  it("renders a logout button in the top bar", async () => {
+    render(
+      <MemoryRouter initialEntries={["/reparto/confirmacion"]}>
+        <AppShell />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByText("Contexto operativo PS003MT")).toBeInTheDocument());
+    const logoutButtons = screen.getAllByRole("button", { name: "Cerrar sesion" });
+    expect(logoutButtons.length).toBeGreaterThanOrEqual(2);
+    expect(screen.getByText("Cerrar sesion")).toBeInTheDocument();
+    fireEvent.click(logoutButtons[0]);
+
+    await waitFor(() =>
+      expect(fetch).toHaveBeenCalledWith(expect.stringContaining("/auth/api/logout/"), expect.objectContaining({ method: "POST" })),
+    );
   });
 });

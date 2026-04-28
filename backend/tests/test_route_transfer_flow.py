@@ -1,16 +1,19 @@
 from decimal import Decimal
+from unittest.mock import patch
 from uuid import uuid4
 
 from django.db import connection
+from django.test import override_settings
 from django.test import TestCase
 from django.utils import timezone
 
 from apps.fulfillment.models import DeliveryDocument, DeliveryOrder, DeliveryOrderLine, FulfillmentOrder, FulfillmentOrderLine
 from apps.inventory.models import InventoryBalance, StockState
-from apps.fulfillment.services import issue_remito
+from apps.fulfillment.services import FulfillmentRuleError, issue_remito
 from apps.routes.models import RouteSheet
 from apps.routes.services import (
     RouteRuleError,
+    _geometry_with_origin_coordinate,
     close_route,
     confirm_route,
     depart_route,
@@ -108,6 +111,7 @@ class RouteExecutionFlowTests(TestCase):
             delivery_mode="Reparto programado",
             warehouse_ref="W001",
             legacy_sales_order_number="SO-R-1",
+            address_snapshot={"receiver": "Cliente Uno"},
         )
         self.fulfillment_line = FulfillmentOrderLine.objects.create(
             fulfillment=self.fulfillment,
@@ -164,6 +168,49 @@ class RouteExecutionFlowTests(TestCase):
             actor="planner",
         ).payload["result"]
 
+    def _create_prepared_delivery(self, suffix: str, *, lat: str, lng: str, weight: str = "4"):
+        fulfillment = FulfillmentOrder.objects.create(
+            fulfillment_number=f"FUL-R-{suffix}",
+            status=FulfillmentOrder.FulfillmentStatus.READY_FOR_DISPATCH,
+            customer_ref=f"CUST-{suffix}",
+            delivery_mode="Reparto programado",
+            warehouse_ref="W001",
+            legacy_sales_order_number=f"SO-R-{suffix}",
+        )
+        fulfillment_line = FulfillmentOrderLine.objects.create(
+            fulfillment=fulfillment,
+            ordered_qty=Decimal("1"),
+            prepared_qty=Decimal("1"),
+            uom="UN",
+            item_ref=f"ITEM-{suffix}",
+            warehouse_ref="W001",
+            legacy_sales_order_number=f"SO-R-{suffix}",
+            legacy_line_id="1",
+        )
+        delivery = DeliveryOrder.objects.create(
+            fulfillment=fulfillment,
+            delivery_number=f"DEL-R-{suffix}",
+            status=DeliveryOrder.DeliveryStatus.PREPARED,
+            delivery_mode="Reparto programado",
+            planned_date=timezone.localdate(),
+            warehouse_ref="W001",
+            legacy_sales_order_number=f"SO-R-{suffix}",
+            address_snapshot={"latitude": lat, "longitude": lng, "street": f"Calle {suffix}"},
+        )
+        DeliveryOrderLine.objects.create(
+            delivery=delivery,
+            fulfillment_line=fulfillment_line,
+            planned_qty=Decimal("1"),
+            uom="UN",
+            item_ref=f"ITEM-{suffix}",
+            warehouse_ref="W001",
+            planned_weight_kg=Decimal(weight),
+            planned_volume_m3=Decimal("0.100000"),
+            legacy_sales_order_number=f"SO-R-{suffix}",
+            legacy_line_id="1",
+        )
+        return delivery
+
     def test_route_requires_review_before_confirm_and_preview_is_idempotent(self):
         first = self._preview_route()
         replay = optimize_route(
@@ -180,6 +227,7 @@ class RouteExecutionFlowTests(TestCase):
         ).payload["result"]
 
         self.assertEqual(first["id"], replay["id"])
+        self.assertEqual(first["stops"][0]["customer_name"], "Cliente Uno")
         self.assertEqual(RouteSheet.objects.count(), 1)
         with self.assertRaises(RouteRuleError):
             confirm_route(route_id=first["id"], payload={"vehicle_id": str(self.vehicle.id)}, idempotency_key="route-confirm-blocked", actor="planner")
@@ -225,6 +273,147 @@ class RouteExecutionFlowTests(TestCase):
         self.assertEqual(Decimal(updated["planned_volume_m3"]), Decimal("0"))
         pending = pending_reparto_deliveries(warehouse_ref="W001", planned_date=timezone.localdate())
         self.assertEqual([row["delivery_number"] for row in pending], ["DEL-R-1"])
+
+    def test_reoptimization_consolidates_existing_draft_stops(self):
+        first_route = self._preview_route()
+        second_delivery = self._create_prepared_delivery("2", lat="-34.61", lng="-58.39")
+
+        route = optimize_route(
+            payload={
+                "warehouse_ref": "W001",
+                "branch_ref": "BR-1",
+                "planned_date": timezone.localdate().isoformat(),
+                "vehicle_id": str(self.vehicle.id),
+                "driver_ref": "driver-1",
+                "deliveries": [{"delivery_id": str(second_delivery.id), "lat": "-34.61", "lng": "-58.39"}],
+            },
+            idempotency_key="route-preview-merge-drafts",
+            actor="planner",
+        ).payload["result"]
+
+        self.assertEqual({stop["delivery_number"] for stop in route["stops"]}, {"DEL-R-1", "DEL-R-2"})
+        self.assertEqual(RouteSheet.objects.filter(status=RouteSheet.RouteStatus.DRAFT).count(), 1)
+        self.assertEqual(RouteSheet.objects.get(id=first_route["id"]).status, RouteSheet.RouteStatus.CANCELLED)
+        self.assertEqual(route["preview_payload"]["superseded_draft_routes"], [first_route["id"]])
+
+    def test_reoptimization_without_payload_uses_existing_draft_stops(self):
+        first_route = self._preview_route()
+
+        route = optimize_route(
+            payload={
+                "warehouse_ref": "W001",
+                "branch_ref": "BR-1",
+                "planned_date": timezone.localdate().isoformat(),
+                "vehicle_id": str(self.vehicle.id),
+                "driver_ref": "driver-1",
+            },
+            idempotency_key="route-preview-merge-existing-draft",
+            actor="planner",
+        ).payload["result"]
+
+        self.assertEqual([stop["delivery_number"] for stop in route["stops"]], ["DEL-R-1"])
+        self.assertEqual(RouteSheet.objects.filter(status=RouteSheet.RouteStatus.DRAFT).count(), 1)
+        self.assertEqual(RouteSheet.objects.get(id=first_route["id"]).status, RouteSheet.RouteStatus.CANCELLED)
+        self.assertEqual(route["preview_payload"]["superseded_draft_routes"], [first_route["id"]])
+
+    def test_route_preview_without_deliveries_rejects_empty_route(self):
+        with self.assertRaisesRegex(RouteRuleError, "No hay entregas"):
+            optimize_route(
+                payload={
+                    "warehouse_ref": "W001",
+                    "branch_ref": "BR-1",
+                    "planned_date": timezone.localdate().isoformat(),
+                    "vehicle_id": str(self.vehicle.id),
+                    "driver_ref": "driver-1",
+                    "deliveries": [],
+                },
+                idempotency_key="route-preview-empty",
+                actor="planner",
+            )
+
+        self.assertEqual(RouteSheet.objects.count(), 0)
+
+    @override_settings(ORS_API_KEY="")
+    @patch("apps.routes.services.warehouse_origin_snapshot")
+    def test_route_origin_defaults_to_warehouse_address(self, warehouse_origin_snapshot):
+        warehouse_origin_snapshot.return_value = {
+            "warehouse_ref": "W001",
+            "formatted": "Deposito W001",
+            "latitude": "-34.590000",
+            "longitude": "-58.370000",
+            "source": "test",
+        }
+
+        route = optimize_route(
+            payload={
+                "warehouse_ref": "W001",
+                "branch_ref": "BR-1",
+                "planned_date": timezone.localdate().isoformat(),
+                "vehicle_id": str(self.vehicle.id),
+                "driver_ref": "driver-1",
+                "deliveries": [{"delivery_id": str(self.delivery.id), "lat": "-34.60", "lng": "-58.38"}],
+            },
+            idempotency_key="route-preview-origin",
+            actor="planner",
+        ).payload["result"]
+
+        self.assertEqual(route["preview_payload"]["input"]["origin"]["lat"], "-34.590000")
+        self.assertEqual(route["preview_payload"]["input"]["origin"]["lng"], "-58.370000")
+        self.assertEqual(route["route_geometry"]["coordinates"][0], [-58.37, -34.59])
+        self.assertEqual(route["route_geometry"]["coordinates"][1], [-58.38, -34.6])
+
+    @override_settings(
+        ORS_API_KEY="",
+        WAREHOUSE_ORIGINS={
+            "W001": {
+                "lat": "-34.590001",
+                "lng": "-58.370002",
+                "formatted": "Origen manual W001",
+                "source": "test_manual",
+            }
+        },
+    )
+    @patch("apps.routes.services.warehouse_origin_snapshot")
+    def test_route_origin_uses_configured_warehouse_coordinates(self, warehouse_origin_snapshot):
+        route = optimize_route(
+            payload={
+                "warehouse_ref": "W001",
+                "branch_ref": "BR-1",
+                "planned_date": timezone.localdate().isoformat(),
+                "vehicle_id": str(self.vehicle.id),
+                "driver_ref": "driver-1",
+                "deliveries": [{"delivery_id": str(self.delivery.id), "lat": "-34.60", "lng": "-58.38"}],
+            },
+            idempotency_key="route-preview-configured-origin",
+            actor="planner",
+        ).payload["result"]
+
+        warehouse_origin_snapshot.assert_not_called()
+        self.assertEqual(route["preview_payload"]["input"]["origin"]["lat"], "-34.590001")
+        self.assertEqual(route["preview_payload"]["input"]["origin"]["lng"], "-58.370002")
+        self.assertEqual(route["preview_payload"]["input"]["origin"]["source"], "test_manual")
+        self.assertEqual(route["route_geometry"]["coordinates"][0], [-58.370002, -34.590001])
+
+    def test_route_geometry_keeps_exact_origin_coordinate(self):
+        geometry = {"type": "LineString", "coordinates": [[-58.400000, -34.700000], [-58.380000, -34.600000]]}
+
+        fixed = _geometry_with_origin_coordinate(geometry, (Decimal("-34.590001"), Decimal("-58.370002")))
+
+        self.assertEqual(fixed["coordinates"][0], [-58.370002, -34.590001])
+        self.assertEqual(fixed["coordinates"][1], [-58.38, -34.6])
+
+    def test_direct_remito_is_blocked_when_delivery_is_in_route_sheet(self):
+        route = self._preview_route()
+
+        with self.assertRaisesRegex(FulfillmentRuleError, route["route_number"]):
+            issue_remito(
+                delivery_id=str(self.delivery.id),
+                idempotency_key="direct-remito-route-blocked",
+                actor="counter",
+                authorized_warehouses=["W001"],
+            )
+
+        self.assertFalse(DeliveryDocument.objects.filter(delivery=self.delivery).exists())
 
     def test_reparto_remito_stays_open_until_rendition_closes_it(self):
         route_payload = self._preview_route()

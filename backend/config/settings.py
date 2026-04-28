@@ -1,14 +1,35 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+
+def json_env(*names: str, default):
+    for name in names:
+        raw = os.getenv(name, "")
+        if not raw:
+            continue
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+    return default
+
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "dev-only-tms-wms-secret")
 DEBUG = os.getenv("DJANGO_DEBUG", "1") == "1"
 ALLOWED_HOSTS = [host for host in os.getenv("DJANGO_ALLOWED_HOSTS", "*").split(",") if host]
+CSRF_TRUSTED_ORIGINS = [
+    origin
+    for origin in os.getenv(
+        "DJANGO_CSRF_TRUSTED_ORIGINS",
+        "http://localhost:8021,http://127.0.0.1:8021" if DEBUG else "",
+    ).split(",")
+    if origin
+]
 
 INSTALLED_APPS = [
     "whitenoise.runserver_nostatic",
@@ -20,6 +41,7 @@ INSTALLED_APPS = [
     "django.contrib.staticfiles",
     "apps.common",
     "apps.core",
+    "apps.authentication",
     "apps.integrations.legacy",
     "apps.inventory",
     "apps.transfers",
@@ -125,6 +147,7 @@ ROUTING_PROVIDER = os.getenv("ROUTING_PROVIDER", "ors")
 ORS_API_KEY = os.getenv("ORS_API_KEY", "")
 ORS_BASE_URL = os.getenv("ORS_BASE_URL", "https://api.openrouteservice.org")
 ROUTING_SERVICE_MINUTES_PER_STOP = int(os.getenv("ROUTING_SERVICE_MINUTES_PER_STOP", "10"))
+WAREHOUSE_ORIGINS = json_env("WAREHOUSE_ORIGINS", "WAREHOUSE_ORIGINS_JSON", default={})
 DATABASE_ROUTERS = ["apps.core.dbrouters.TmsWmsDatabaseRouter"]
 MASTER_DATA_PARQUET_DIR = os.getenv("MASTER_DATA_PARQUET_DIR", "/srv/data/parquet")
 MASTER_DATA_PARQUET_FALLBACK_DIRS = [
@@ -132,3 +155,4 @@ MASTER_DATA_PARQUET_FALLBACK_DIRS = [
     for path in os.getenv("MASTER_DATA_PARQUET_FALLBACK_DIRS", "/srv/data/paarquet,C:/cache").split(",")
     if path
 ]
+SESSION_COOKIE_AGE = int(os.getenv("DJANGO_SESSION_COOKIE_AGE", str(60 * 60 * 4)))

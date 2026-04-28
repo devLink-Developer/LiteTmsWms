@@ -194,7 +194,6 @@ export const routedOperationModules = [
   "transfers",
   "returns",
   "routes",
-  "stock",
   "stock-movements",
   "audits",
   "shipping",
@@ -266,8 +265,14 @@ export const navigationEntries: NavigationEntry[] = [
       { key: "income-returns", label: "Ingresos por devoluciones", path: operationModuleByKey("returns").path },
     ],
   },
-  { key: "stock", label: "Stock", path: operationModuleByKey("stock").path },
-  { key: "stock-movements", label: "Movimientos de Stock", path: operationModuleByKey("stock-movements").path },
+  {
+    key: "stock",
+    label: "Stock",
+    items: [
+      { key: "stock-balances", label: "Stock por almacen", path: operationModuleByKey("stock").path },
+      { key: "stock-movements", label: "Movimientos de Stock", path: operationModuleByKey("stock-movements").path },
+    ],
+  },
   {
     key: "operations",
     label: "Operaciones",

@@ -51,7 +51,7 @@ describe("RepartoConfirmationPage", () => {
                 delivery_number: "ENT-100",
                 status: "created",
                 delivery_mode: "Repart Prg",
-                planned_date: "2026-04-24",
+                planned_date: "2026-04-27",
                 fulfillment_id: "fulfillment-1",
                 sales_order_number: "VENT8-100",
                 documents: [],
@@ -69,7 +69,7 @@ describe("RepartoConfirmationPage", () => {
                 delivery_number: "ENT-100",
                 status: "confirmed",
                 delivery_mode: "Repart Prg",
-                planned_date: "2026-04-24",
+                planned_date: "2026-04-27",
                 fulfillment_id: "fulfillment-1",
                 sales_order_number: "VENT8-100",
                 documents: [],
@@ -91,7 +91,7 @@ describe("RepartoConfirmationPage", () => {
                 status: "pending",
                 delivery_mode: "Repart Prg",
                 warehouse_ref: "PS003MT",
-                planned_date: "2026-04-24",
+                planned_date: "2026-04-27",
                 fulfillment_id: "fulfillment-1",
                 fulfillment_number: "FUL-100",
                 sales_order_number: "VENT8-100",
@@ -127,13 +127,15 @@ describe("RepartoConfirmationPage", () => {
   it("filters reparto deliveries by delivery date and confirms a pending delivery", async () => {
     renderWithQuery(<RepartoConfirmationPage />);
 
-    fireEvent.change(screen.getByLabelText("Fecha entrega"), { target: { value: "2026-04-24" } });
+    fireEvent.change(screen.getByLabelText("Fecha entrega"), { target: { value: "2026-04-27" } });
 
     await waitFor(() => expect(screen.getByText("VENT8-100")).toBeInTheDocument());
-    expect(screen.getByText("100")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Deposito")).not.toBeInTheDocument();
+    expect(screen.queryByRole("columnheader", { name: "Deposito" })).not.toBeInTheDocument();
+    expect(screen.getByText("27/04/2026")).toBeInTheDocument();
+    expect(screen.queryByText("100")).not.toBeInTheDocument();
     expect(screen.getByText("sin entrega generada")).toBeInTheDocument();
     expect(screen.getByText("CLI-1")).toBeInTheDocument();
-    expect(screen.getByText("PS003MT")).toBeInTheDocument();
 
     const row = screen.getByRole("row", { name: /VENT8-100/i });
     expect(within(row).getByRole("button", { name: "Crear y confirmar" })).toBeDisabled();
@@ -151,7 +153,7 @@ describe("RepartoConfirmationPage", () => {
   it("selects all pending rows from the toolbar", async () => {
     renderWithQuery(<RepartoConfirmationPage />);
 
-    fireEvent.change(screen.getByLabelText("Fecha entrega"), { target: { value: "2026-04-24" } });
+    fireEvent.change(screen.getByLabelText("Fecha entrega"), { target: { value: "2026-04-27" } });
 
     await waitFor(() => expect(screen.getByText("VENT8-100")).toBeInTheDocument());
     const validateSelected = screen.getByRole("button", { name: "Validar Stock seleccionadas" });

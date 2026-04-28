@@ -1,12 +1,13 @@
 from django.conf import settings
 from django.db.models import Count, Q
 from django.http import HttpResponse
+from django.utils import timezone
 from django.utils.dateparse import parse_date
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET, require_POST
 
 from apps.common.api import error_response, json_response, parse_json_body, require_idempotency_key
-from apps.fulfillment.delivery_modes import delivery_mode_filter_q, shipping_delivery_mode_q
+from apps.fulfillment.delivery_modes import delivery_mode_filter_q, is_shipping_delivery_mode, shipping_delivery_mode_q
 from apps.fulfillment.models import DeliveryDocument, DeliveryOrder, DeliveryPreparationTask, FulfillmentOrder
 from apps.fulfillment.services import (
     FulfillmentAuthorizationError,
@@ -194,6 +195,53 @@ def _delivery_statuses(value: str) -> list[str]:
     return [status.strip() for status in value.split(",") if status.strip()]
 
 
+def _reparto_filter_date(raw_value: object):
+    today = timezone.localdate()
+    planned_date = parse_date(str(raw_value or "")) or today
+    return planned_date if planned_date >= today else today
+
+
+def _forbidden_for_past_reparto_delivery(delivery: DeliveryOrder):
+    if not is_shipping_delivery_mode(delivery.delivery_mode):
+        return None
+    if not delivery.planned_date or delivery.planned_date < timezone.localdate():
+        return error_response(
+            "validation_error",
+            "Solo se pueden operar pedidos de reparto con fecha de hoy en adelante.",
+            status=422,
+        )
+    return None
+
+
+def _forbidden_for_past_reparto_fulfillment(fulfillment: FulfillmentOrder, planned_date=None):
+    if not is_shipping_delivery_mode(fulfillment.delivery_mode):
+        return None
+    effective_date = planned_date or fulfillment.requested_date
+    if not effective_date or effective_date < timezone.localdate():
+        return error_response(
+            "validation_error",
+            "Solo se pueden operar pedidos de reparto con fecha de hoy en adelante.",
+            status=422,
+        )
+    return None
+
+
+def _forbidden_for_delivery_id(delivery_id):
+    try:
+        delivery = DeliveryOrder.objects.only("id", "delivery_mode", "planned_date").get(id=delivery_id)
+    except DeliveryOrder.DoesNotExist:
+        raise
+    return _forbidden_for_past_reparto_delivery(delivery)
+
+
+def _forbidden_for_fulfillment_id(fulfillment_id, planned_date=None):
+    try:
+        fulfillment = FulfillmentOrder.objects.only("id", "delivery_mode", "requested_date").get(id=fulfillment_id)
+    except FulfillmentOrder.DoesNotExist:
+        raise
+    return _forbidden_for_past_reparto_fulfillment(fulfillment, planned_date=planned_date)
+
+
 def _serialize_reparto_delivery(row: DeliveryOrder, *, item_snapshots: dict | None = None) -> dict:
     all_lines = list(row.lines.all())
     if item_snapshots is None:
@@ -314,8 +362,19 @@ def _serialize_reparto_fulfillment(
 
 @require_GET
 def reparto_confirmation_queue(request):
-    planned_date = parse_date(str(request.GET.get("planned_date") or ""))
+    try:
+        authorized_warehouses = _authorized_warehouses(request)
+    except MasterDataSourceError as exc:
+        return error_response("master_data_unavailable", str(exc), status=503)
+    forbidden = _forbidden_without_warehouse(authorized_warehouses)
+    if forbidden:
+        return forbidden
+
+    authorized_warehouse_set = {str(warehouse).strip() for warehouse in authorized_warehouses if str(warehouse).strip()}
+    planned_date = _reparto_filter_date(request.GET.get("planned_date"))
     warehouse = (request.GET.get("warehouse") or request.GET.get("warehouse_ref") or "").strip()
+    if warehouse and warehouse not in authorized_warehouse_set:
+        return json_response({"results": []})
     query = request.GET.get("q", "").strip()
     statuses = _delivery_statuses(request.GET.get("status", "created,planned").strip())
     include_uncreated = not statuses or bool({"created", "planned"} & set(statuses))
@@ -325,14 +384,15 @@ def reparto_confirmation_queue(request):
         .prefetch_related("lines__fulfillment_line")
         .annotate(documents_total=Count("documents", distinct=True))
         .filter(shipping_delivery_mode_q())
+        .filter(warehouse_ref__in=authorized_warehouse_set)
+        .filter(planned_date__gte=timezone.localdate())
         .order_by("planned_date", "-created_at")
     )
     if statuses:
         delivery_qs = delivery_qs.filter(status__in=statuses)
-    if planned_date:
-        delivery_qs = delivery_qs.filter(planned_date=planned_date)
+    delivery_qs = delivery_qs.filter(planned_date=planned_date)
     if warehouse:
-        delivery_qs = delivery_qs.filter(warehouse_ref__icontains=warehouse)
+        delivery_qs = delivery_qs.filter(warehouse_ref=warehouse)
     if query:
         delivery_qs = delivery_qs.filter(
             Q(delivery_number__icontains=query)
@@ -356,12 +416,13 @@ def reparto_confirmation_queue(request):
             .filter(shipping_delivery_mode_q())
             .filter(status__in=FULFILLMENT_PENDING_DELIVERY_STATUSES)
             .filter(deliveries__isnull=True)
+            .filter(warehouse_ref__in=authorized_warehouse_set)
+            .filter(requested_date__gte=timezone.localdate())
             .order_by("requested_date", "-created_at")
         )
-        if planned_date:
-            fulfillment_qs = fulfillment_qs.filter(requested_date=planned_date)
+        fulfillment_qs = fulfillment_qs.filter(requested_date=planned_date)
         if warehouse:
-            fulfillment_qs = fulfillment_qs.filter(warehouse_ref__icontains=warehouse)
+            fulfillment_qs = fulfillment_qs.filter(warehouse_ref=warehouse)
         if query:
             fulfillment_qs = fulfillment_qs.filter(
                 Q(fulfillment_number__icontains=query)
@@ -482,19 +543,9 @@ def expedition_queue_view(request):
     if not any(filters.values()):
         return json_response({"results": []})
     try:
-        permissions = _delivery_permissions(request)
-        forbidden = _forbidden_without_warehouse(permissions.get("authorized_warehouses", []))
-        if forbidden:
-            return forbidden
         return json_response(
             {
-                "results": expedition_queue(
-                    **filters,
-                    authorized_warehouses=permissions.get("authorized_warehouses", []),
-                ),
-                "permissions": {
-                    "authorized_warehouses": permissions.get("authorized_warehouses", []),
-                },
+                "results": expedition_queue(**filters),
             }
         )
     except MasterDataSourceError as exc:
@@ -530,6 +581,9 @@ def check_fulfillment_stock(request, fulfillment_id):
         forbidden = _forbidden_without_warehouse(authorized_warehouses)
         if forbidden:
             return forbidden
+        forbidden = _forbidden_for_fulfillment_id(fulfillment_id)
+        if forbidden:
+            return forbidden
         result = check_fulfillment_stock_for_split(
             fulfillment_id=fulfillment_id,
             lines=payload.get("lines") or [],
@@ -555,11 +609,15 @@ def split_fulfillment(request, fulfillment_id):
         forbidden = _forbidden_without_warehouse(authorized_warehouses)
         if forbidden:
             return forbidden
+        planned_date = parse_date(str(payload.get("planned_date") or ""))
+        forbidden = _forbidden_for_fulfillment_id(fulfillment_id, planned_date=planned_date)
+        if forbidden:
+            return forbidden
         result = split_fulfillment_delivery(
             fulfillment_id=fulfillment_id,
             lines=payload.get("lines") or [],
             delivery_mode=str(payload.get("delivery_mode") or ""),
-            planned_date=parse_date(str(payload.get("planned_date") or "")),
+            planned_date=planned_date,
             reason=str(payload.get("reason") or "Split local de prueba"),
             idempotency_key=require_idempotency_key(request),
             actor=_request_actor(request) or "local.tmswms",
@@ -586,6 +644,9 @@ def stock_check(request, delivery_id):
         forbidden = _forbidden_without_warehouse(authorized_warehouses)
         if forbidden:
             return forbidden
+        forbidden = _forbidden_for_delivery_id(delivery_id)
+        if forbidden:
+            return forbidden
         result = check_delivery_stock(delivery_id=delivery_id, authorized_warehouses=authorized_warehouses)
         return json_response({"result": result})
     except DeliveryOrder.DoesNotExist:
@@ -604,6 +665,9 @@ def validate_stock(request, delivery_id):
     try:
         authorized_warehouses = _authorized_warehouses(request)
         forbidden = _forbidden_without_warehouse(authorized_warehouses)
+        if forbidden:
+            return forbidden
+        forbidden = _forbidden_for_delivery_id(delivery_id)
         if forbidden:
             return forbidden
         result = validate_delivery_stock(
@@ -630,6 +694,9 @@ def send_to_prepare(request, delivery_id):
         payload = parse_json_body(request)
         authorized_warehouses = _authorized_warehouses(request)
         forbidden = _forbidden_without_warehouse(authorized_warehouses)
+        if forbidden:
+            return forbidden
+        forbidden = _forbidden_for_delivery_id(delivery_id)
         if forbidden:
             return forbidden
         result = send_delivery_to_prepare(
@@ -660,6 +727,15 @@ def mark_prepared(request, task_id):
         forbidden = _forbidden_without_warehouse(authorized_warehouses)
         if forbidden:
             return forbidden
+        task = DeliveryPreparationTask.objects.select_related("delivery").only(
+            "id",
+            "delivery__id",
+            "delivery__delivery_mode",
+            "delivery__planned_date",
+        ).get(id=task_id)
+        forbidden = _forbidden_for_past_reparto_delivery(task.delivery)
+        if forbidden:
+            return forbidden
         result = mark_preparation_task_prepared(
             task_id=task_id,
             idempotency_key=require_idempotency_key(request),
@@ -688,6 +764,9 @@ def mark_delivery_prepared(request, delivery_id):
         forbidden = _forbidden_without_warehouse(authorized_warehouses)
         if forbidden:
             return forbidden
+        forbidden = _forbidden_for_delivery_id(delivery_id)
+        if forbidden:
+            return forbidden
         result = mark_preparation_task_prepared(
             task_id=str(task.id),
             idempotency_key=require_idempotency_key(request),
@@ -712,6 +791,9 @@ def remito(request, delivery_id):
     try:
         authorized_warehouses = _authorized_warehouses(request)
         forbidden = _forbidden_without_warehouse(authorized_warehouses)
+        if forbidden:
+            return forbidden
+        forbidden = _forbidden_for_delivery_id(delivery_id)
         if forbidden:
             return forbidden
         result = issue_remito(

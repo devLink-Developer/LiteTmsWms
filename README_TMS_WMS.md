@@ -131,6 +131,21 @@ docker compose exec -T backend python manage.py migrate --noinput
 docker compose exec -T backend python manage.py sync_legacy_orders --limit 10
 ```
 
+### Migracion De Stock Desde Parquet
+
+El archivo `stock_cache.parquet` se resuelve desde `MASTER_DATA_PARQUET_DIR` y sus fallbacks, incluyendo el volumen Docker `C:/cache:/srv/data/parquet:ro`.
+
+```powershell
+docker compose exec -T backend python manage.py import_stock_cache --dry-run
+docker compose exec -T backend python manage.py import_stock_cache
+```
+
+Por defecto carga `disponible_entrega` en el bucket operativo `packed`, que es el stock usado para validar entregas. Para cargar disponibilidad comercial y comprometido:
+
+```powershell
+docker compose exec -T backend python manage.py import_stock_cache --mapping on_hand=disponible_venta --mapping reserved=comprometido
+```
+
 Endpoints principales de la prueba:
 
 - `POST /api/v1/fulfillment/from-legacy-order`

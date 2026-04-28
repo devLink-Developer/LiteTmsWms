@@ -1,4 +1,4 @@
-import { actorHeaders, apiGet, apiPost, apiUrl } from "./client";
+import { apiGet, apiHeaders, apiPost, apiUrl } from "./client";
 
 export type ApiFulfillmentLine = {
   id: string;
@@ -113,6 +113,13 @@ export type ApiDeliveryOrder = {
   warehouse_ref?: string;
   store_ref?: string;
   address_snapshot?: Record<string, string>;
+  route_sheet?: {
+    id: string;
+    route_number: string;
+    status: string;
+    stop_id?: string;
+    stop_status?: string;
+  } | null;
   lines: ApiDeliveryLine[];
   documents: ApiDeliveryDocument[];
   preparation_task?: ApiDeliveryPreparationTask | null;
@@ -347,7 +354,8 @@ export async function issueDeliveryRemito(deliveryId: string) {
 
 export async function downloadDeliveryRemitoPdf(deliveryId: string, documentNumber?: string) {
   const response = await fetch(apiUrl(`/api/v1/fulfillment/deliveries/${deliveryId}/remito.pdf`), {
-    headers: { Accept: "application/pdf", ...actorHeaders() },
+    credentials: "include",
+    headers: apiHeaders({ Accept: "application/pdf" }),
   });
   if (!response.ok) {
     throw new Error(`No se pudo descargar el remito PDF (${response.status}).`);

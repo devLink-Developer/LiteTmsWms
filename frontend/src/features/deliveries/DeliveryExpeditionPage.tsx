@@ -45,6 +45,13 @@ type DeliveryDraft = {
   issuedAt?: string;
   preparationAssignee?: string;
   preparationTaskStatus?: string;
+  routeSheet?: {
+    id: string;
+    routeNumber: string;
+    status: string;
+    stopId?: string;
+    stopStatus?: string;
+  } | null;
   lines: DeliveryLineAllocation[];
 };
 
@@ -212,6 +219,10 @@ function getMaxDispatchableDeliveryUnitQty(line: ExpeditionLine, delivery?: Deli
   return Math.max(0, Math.floor(line.maxDispatchableDeliveryUnitQty + currentDeliveryQty));
 }
 
+function getCommittedQty(line: ExpeditionLine) {
+  return Math.max(line.reservedQty, line.plannedQty);
+}
+
 function getDeliveryTotals(order: ExpeditionOrder | undefined, delivery: DeliveryDraft | undefined) {
   if (!order || !delivery) {
     return {
@@ -350,6 +361,15 @@ function deliveryFromApi(delivery: ApiDeliveryOrder): DeliveryDraft {
     issuedAt: remito?.issued_at,
     preparationAssignee: delivery.preparation_task?.assigned_employee_ref,
     preparationTaskStatus: delivery.preparation_task?.status,
+    routeSheet: delivery.route_sheet
+      ? {
+          id: delivery.route_sheet.id,
+          routeNumber: delivery.route_sheet.route_number,
+          status: delivery.route_sheet.status,
+          stopId: delivery.route_sheet.stop_id,
+          stopStatus: delivery.route_sheet.stop_status,
+        }
+      : null,
     lines: delivery.lines.map((line) => ({
       lineId: line.fulfillment_line_id,
       qty: asNumber(line.delivery_unit_qty ?? line.planned_qty),
@@ -428,6 +448,10 @@ function orderFromApi(order: ApiFulfillmentOrder): ExpeditionOrder {
 
 function hasPendingDeliveryQty(order: ExpeditionOrder) {
   return order.lines.some((line) => line.pendingQty > 0);
+}
+
+function hasDispatchableDeliveryQty(order: ExpeditionOrder) {
+  return order.lines.some((line) => getMaxDispatchableDeliveryUnitQty(line) > 0);
 }
 
 function orderMatchesSearch(order: ExpeditionOrder, search: ExpeditionQueueSearch) {
@@ -603,6 +627,10 @@ export function DeliveryExpeditionPage() {
 
   function addDelivery() {
     if (!activeOrder) {
+      return;
+    }
+    if (!hasDispatchableDeliveryQty(activeOrder)) {
+      setMessage({ tone: "info", text: "El pedido ya esta completamente asignado a entregas u hojas de ruta." });
       return;
     }
     const nextIndex = activeOrder.deliveries.length + 1;
@@ -837,6 +865,13 @@ export function DeliveryExpeditionPage() {
     if (!activeDelivery) {
       return;
     }
+    if (activeDelivery.routeSheet) {
+      setMessage({
+        tone: "danger",
+        text: `La entrega pertenece a la hoja de ruta ${activeDelivery.routeSheet.routeNumber}; debe entregarse desde Ejecucion chofer.`,
+      });
+      return;
+    }
     if (activeDelivery.status !== "prepared") {
       setMessage({ tone: "danger", text: "El remito solo se puede generar cuando la entrega esta preparada." });
       return;
@@ -868,6 +903,8 @@ export function DeliveryExpeditionPage() {
   const summaryDeliveryLines = getDeliveryLineSummaries(activeOrder, summaryDelivery);
   const summaryDeliveryWarehouse = getDeliveryWarehouse(activeOrder, summaryDelivery);
   const activeDeliveryHasInvalidQty = getInvalidDeliveryQtyCount(activeOrder, activeDelivery) > 0;
+  const activeDeliveryLockedByRoute = Boolean(activeDelivery?.routeSheet);
+  const activeOrderHasDispatchableQty = activeOrder ? hasDispatchableDeliveryQty(activeOrder) : false;
   const activeDeliveryStockKey =
     activeOrder && activeDelivery
       ? [
@@ -891,17 +928,17 @@ export function DeliveryExpeditionPage() {
     <div className="flex flex-wrap items-center gap-2">
       <button
         type="button"
-        disabled={!activeOrder || processing}
+        disabled={!activeOrder || !activeOrderHasDispatchableQty || processing}
         onClick={addDelivery}
-        className="min-h-10 rounded border border-borderSoft bg-white px-3 text-[12px] font-semibold text-night transition hover:border-primary hover:text-primaryHover focus:outline-none focus:ring-2 focus:ring-primary/20 disabled:bg-softStart"
+        className="min-h-10 rounded border border-borderSoft bg-white px-3 text-[12px] font-semibold text-night transition hover:border-primary hover:text-primaryHover focus:outline-none focus:ring-2 focus:ring-primary/20 disabled:cursor-not-allowed disabled:bg-softStart disabled:text-secondaryText"
       >
         Agregar entrega
       </button>
       <button
         type="button"
-        disabled={!activeDelivery || activeDelivery.status !== "draft" || processing}
+        disabled={!activeDelivery || activeDelivery.status !== "draft" || !activeOrderHasDispatchableQty || processing}
         onClick={fillActiveDeliveryWithMaxQty}
-        className="min-h-10 rounded border border-borderSoft bg-white px-3 text-[12px] font-semibold text-night transition hover:border-primary hover:text-primaryHover focus:outline-none focus:ring-2 focus:ring-primary/20 disabled:bg-softStart"
+        className="min-h-10 rounded border border-borderSoft bg-white px-3 text-[12px] font-semibold text-night transition hover:border-primary hover:text-primaryHover focus:outline-none focus:ring-2 focus:ring-primary/20 disabled:cursor-not-allowed disabled:bg-softStart disabled:text-secondaryText"
       >
         Entregar todo
       </button>
@@ -939,7 +976,7 @@ export function DeliveryExpeditionPage() {
       </button>
       <button
         type="button"
-        disabled={!activeDelivery || activeDelivery.status !== "prepared" || activeDeliveryQty <= 0 || processing}
+        disabled={!activeDelivery || activeDelivery.status !== "prepared" || activeDeliveryQty <= 0 || activeDeliveryLockedByRoute || processing}
         onClick={() => void generateRemitoPdf()}
         className="min-h-10 rounded bg-primary px-3 text-[12px] font-semibold text-white transition hover:bg-primaryHover focus:outline-none focus:ring-2 focus:ring-primary/30 disabled:bg-softStart disabled:text-secondaryText"
       >
@@ -1108,6 +1145,14 @@ export function DeliveryExpeditionPage() {
                           </span>
                         </span>
                       )}
+                      {activeDelivery.routeSheet && (
+                        <span className="font-semibold text-blue-800">
+                          Hoja de ruta <span className="font-mono">{activeDelivery.routeSheet.routeNumber}</span>
+                        </span>
+                      )}
+                      {activeOrder && !activeOrderHasDispatchableQty ? (
+                        <span className="font-semibold text-blue-800">Pedido completo en entregas/HR</span>
+                      ) : null}
                     </div>
                   ) : (
                     "Crea una entrega para asignar cantidades."
@@ -1196,7 +1241,7 @@ export function DeliveryExpeditionPage() {
                             <div>{line.salesUom}</div>
                           </td>
                           <td className="whitespace-nowrap px-3 py-2 font-mono text-night">{formatQty(line.orderedQty, line.uom)}</td>
-                          <td className="whitespace-nowrap px-3 py-2 font-mono text-night">{formatQty(line.reservedQty, line.uom)}</td>
+                          <td className="whitespace-nowrap px-3 py-2 font-mono text-night">{formatQty(getCommittedQty(line), line.uom)}</td>
                           <td className="whitespace-nowrap px-3 py-2 font-mono text-night">{formatQty(line.preparedQty, line.uom)}</td>
                           <td className="whitespace-nowrap px-3 py-2 font-mono text-primaryHover">
                             <div>{formatQty(maxUnits, line.deliveryUom)}</div>
@@ -1304,6 +1349,11 @@ export function DeliveryExpeditionPage() {
                       <div className="col-span-2">
                         <span className="font-semibold">Preparador</span>
                         <div className="font-mono text-night">{delivery.preparationAssignee}</div>
+                      </div>
+                    )}
+                    {delivery.routeSheet && (
+                      <div className="col-span-2 rounded border border-blue-200 bg-blue-50 px-2 py-1 text-blue-800">
+                        En hoja de ruta <span className="font-mono font-semibold">{delivery.routeSheet.routeNumber}</span>
                       </div>
                     )}
                   </div>

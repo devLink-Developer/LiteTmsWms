@@ -5,10 +5,14 @@ import { DeliveryExpeditionPage } from "./DeliveryExpeditionPage";
 
 describe("DeliveryExpeditionPage", () => {
   let deliveryStatus: "confirmed" | "planned" | "preparing" | "prepared";
+  let routeLocked: boolean;
+  let orderFullyAllocated: boolean;
 
   beforeEach(() => {
     vi.useRealTimers();
     deliveryStatus = "planned";
+    routeLocked = false;
+    orderFullyAllocated = false;
     vi.stubGlobal("URL", {
       createObjectURL: vi.fn(() => "blob:remito"),
       revokeObjectURL: vi.fn(),
@@ -178,20 +182,20 @@ describe("DeliveryExpeditionPage", () => {
                     coverage_group: "STK",
                     warehouse_ref: "PS003MT",
                     ordered_qty: "18",
-                    reserved_qty: "18",
-                    prepared_qty: "14",
+                    reserved_qty: orderFullyAllocated ? "0" : "18",
+                    prepared_qty: orderFullyAllocated ? "18" : "14",
                     delivered_qty: "6",
                     cancelled_qty: "0",
                     pending_qty: "12",
-                    planned_qty: "10",
+                    planned_qty: orderFullyAllocated ? "18" : "10",
                     stock_available: "14",
-                    max_dispatchable_qty: "4",
+                    max_dispatchable_qty: orderFullyAllocated ? "0" : "4",
                     uom: "m2",
                     sales_uom: "m2",
                     delivery_uom: "caja",
                     conversion_factor: "1.44",
                     planned_delivery_unit_qty: "6.94",
-                    max_dispatchable_delivery_unit_qty: "2",
+                    max_dispatchable_delivery_unit_qty: orderFullyAllocated ? "0" : "2",
                     unit_weight_kg: "15",
                     unit_volume_m3: "0.02",
                     planned_weight_kg: "150",
@@ -235,6 +239,15 @@ describe("DeliveryExpeditionPage", () => {
                     delivery_mode: "Reparto programado",
                     planned_date: "2026-04-24",
                     warehouse_ref: "PS003MT",
+                    route_sheet: routeLocked
+                      ? {
+                          id: "route-1",
+                          route_number: "HR-000000123",
+                          status: "draft",
+                          stop_id: "stop-1",
+                          stop_status: "planned",
+                        }
+                      : null,
                     documents: [],
                     lines: [
                       {
@@ -346,7 +359,7 @@ describe("DeliveryExpeditionPage", () => {
     expect(screen.getByText("Almacen retiro")).toBeInTheDocument();
     expect(screen.getAllByText("PS003MT").length).toBeGreaterThan(0);
     expect(screen.getByText("6 caja")).toBeInTheDocument();
-    expect(screen.getAllByText("04/24/2026").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("24/04/2026").length).toBeGreaterThan(0);
     expect(screen.getByLabelText("Cantidad a entregar SIN-001")).toBeDisabled();
     expect(screen.getByRole("button", { name: "Agregar entrega" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Generar remito" })).toBeDisabled();
@@ -390,6 +403,31 @@ describe("DeliveryExpeditionPage", () => {
     fireEvent.click(screen.getByRole("button", { name: "Marcar preparada" }));
     await waitFor(() => expect(screen.getByText(/ENT-000184-1 marcada como preparada./)).toBeInTheDocument());
     expect(screen.getByRole("button", { name: "Generar remito" })).not.toBeDisabled();
+  });
+
+  it("blocks remito generation for deliveries already assigned to a route sheet", async () => {
+    deliveryStatus = "prepared";
+    routeLocked = true;
+    render(<DeliveryExpeditionPage />);
+
+    fireEvent.change(screen.getByLabelText("Busqueda"), { target: { value: "PED-000184" } });
+    fireEvent.click(screen.getByRole("button", { name: "Buscar pendientes" }));
+
+    await waitFor(() => expect(screen.getAllByText("HR-000000123").length).toBeGreaterThan(0));
+    expect(screen.getByRole("button", { name: "Generar remito" })).toBeDisabled();
+    expect(screen.getByText(/En hoja de ruta/)).toBeInTheDocument();
+  });
+
+  it("blocks adding another delivery when the order is fully allocated", async () => {
+    orderFullyAllocated = true;
+    render(<DeliveryExpeditionPage />);
+
+    fireEvent.change(screen.getByLabelText("Busqueda"), { target: { value: "PED-000184" } });
+    fireEvent.click(screen.getByRole("button", { name: "Buscar pendientes" }));
+
+    await waitFor(() => expect(screen.getByText("Pedido completo en entregas/HR")).toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "Agregar entrega" })).toBeDisabled();
+    expect(screen.getAllByText("18 m2").length).toBeGreaterThan(0);
   });
 
   it("confirms a new local delivery before preparation", async () => {

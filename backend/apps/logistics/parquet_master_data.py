@@ -421,11 +421,163 @@ def _warehouse_codes_for_stores(store_codes: set[str]) -> set[str]:
     for store in stores:
         if _normalize_lookup(store.get("codigo")) not in normalized_store_codes:
             continue
-        for key in ["deposito_pickup", "deposito_envio"]:
-            code = str(store.get(key) or "").strip()
-            if code:
-                warehouses.add(code)
+        code = str(store.get("deposito_envio") or store.get("deposito_pickup") or "").strip()
+        if code:
+            warehouses.add(code)
     return warehouses
+
+
+def _warehouse_codes_from_group(value: Any) -> set[str]:
+    if not value:
+        return set()
+    if isinstance(value, list):
+        entries = value
+    elif isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            parsed = []
+        entries = parsed if isinstance(parsed, list) else []
+    else:
+        entries = []
+
+    codes: set[str] = set()
+    for entry in entries:
+        if isinstance(entry, dict):
+            code = (
+                entry.get("warehouse_code")
+                or entry.get("warehouse_ref")
+                or entry.get("WarehouseId")
+                or entry.get("codigo")
+                or entry.get("code")
+            )
+        else:
+            code = entry
+        code = str(code or "").strip()
+        if code:
+            codes.add(code)
+    return codes
+
+
+def fulfillment_warehouse_codes_for_stores(store_codes: set[str]) -> set[str]:
+    if not store_codes:
+        return set()
+
+    _, stores = _read_rows(
+        "tiendas.parquet",
+        columns=[
+            "codigo",
+            "deposito_envio",
+            "deposito_pickup",
+            "fulfillment_group_warehouses",
+            "pickup_group_warehouses",
+        ],
+    )
+    normalized_store_codes = {_normalize_lookup(code) for code in store_codes}
+    warehouses: set[str] = set()
+    for store in stores:
+        if _normalize_lookup(store.get("codigo")) not in normalized_store_codes:
+            continue
+        group_codes = _warehouse_codes_from_group(store.get("fulfillment_group_warehouses"))
+        if not group_codes:
+            group_codes = _warehouse_codes_from_group(store.get("pickup_group_warehouses"))
+        if group_codes:
+            warehouses.update(group_codes)
+            continue
+        code = str(store.get("deposito_envio") or store.get("deposito_pickup") or "").strip()
+        if code:
+            warehouses.add(code)
+    return warehouses
+
+
+def _warehouse_business_unit(warehouse_ref: str) -> str:
+    value = str(warehouse_ref or "").strip()
+    if value.upper().endswith("DP"):
+        return value[:-2]
+    return value
+
+
+def _warehouse_store_match_score(row: dict[str, Any], warehouse_ref: str) -> int:
+    warehouse = str(warehouse_ref or "").strip()
+    business_unit = _warehouse_business_unit(warehouse)
+    score = 0
+    if str(row.get("deposito_pickup") or "").strip() == warehouse:
+        score += 60
+    if str(row.get("deposito_envio") or "").strip() == warehouse:
+        score += 60
+    if str(row.get("business_unit_pickup") or "").strip() == business_unit:
+        score += 40
+    if str(row.get("business_unit_shipping") or "").strip() == business_unit:
+        score += 40
+    if str(row.get("centro_externo") or "").strip() == business_unit:
+        score += 25
+    if str(row.get("codigo") or "").strip().startswith(business_unit[:2]):
+        score += 5
+    return score
+
+
+def _address_value(address: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = address.get(key)
+        if value not in [None, ""]:
+            return value
+    return ""
+
+
+def _warehouse_address_snapshot(row: dict[str, Any], warehouse_ref: str) -> dict[str, Any]:
+    addresses = _parse_json_list(row.get("direcciones_tienda"))
+    address = addresses[0] if addresses else {}
+    snapshot = {
+        "warehouse_ref": warehouse_ref,
+        "store_code": row.get("codigo") or "",
+        "store_name": row.get("nombre") or "",
+        "alias": _address_value(address, "alias"),
+        "street": _address_value(address, "street", "AddressStreet"),
+        "street_number": _address_value(address, "street_number", "AddressStreetNumber"),
+        "city": _address_value(address, "city", "AddressCity") or row.get("localidad") or row.get("logistic_site_name") or "",
+        "state": _address_value(address, "state", "AddressState") or row.get("provincia") or "",
+        "state_name": _address_value(address, "state_name"),
+        "zip_code": _address_value(address, "zip", "AddressZipCode"),
+        "country": _address_value(address, "country", "AddressCountry") or "ARG",
+        "formatted": _address_value(address, "full_address", "formatted"),
+        "location_id": _address_value(address, "location_id", "AddressLocationId"),
+        "latitude": _address_value(address, "latitude", "lat", "AddressLatitude"),
+        "longitude": _address_value(address, "longitude", "lng", "lon", "AddressLongitude"),
+        "source": "tiendas.parquet",
+    }
+    return {key: value for key, value in snapshot.items() if value not in [None, ""]}
+
+
+@lru_cache(maxsize=256)
+def warehouse_origin_snapshot(warehouse_ref: str) -> dict[str, Any]:
+    warehouse = str(warehouse_ref or "").strip()
+    if not warehouse:
+        return {}
+    path, stores = _read_rows(
+        "tiendas.parquet",
+        columns=[
+            "codigo",
+            "nombre",
+            "provincia",
+            "localidad",
+            "centro_externo",
+            "business_unit_pickup",
+            "business_unit_shipping",
+            "logistic_site_name",
+            "deposito_pickup",
+            "deposito_envio",
+            "direcciones_tienda",
+        ],
+    )
+    candidates = [
+        row
+        for row in stores
+        if warehouse in {str(row.get("deposito_pickup") or "").strip(), str(row.get("deposito_envio") or "").strip()}
+    ]
+    if not candidates:
+        return {"warehouse_ref": warehouse, "source_file": str(path)}
+    best = max(candidates, key=lambda row: (_warehouse_store_match_score(row, warehouse), str(row.get("codigo") or "")))
+    return {**_warehouse_address_snapshot(best, warehouse), "source_file": str(path)}
 
 
 def _pos_store_matches(row: dict[str, Any], store: str) -> bool:
@@ -592,11 +744,6 @@ def employee_delivery_permissions(actor: str) -> dict[str, Any]:
         return {"source_file": str(path), "employee": None, "authorized_warehouses": [], "permissions": []}
 
     store_codes = {str(employee.get("sucursal_codigo") or "").strip()}
-    for group in _parse_json_list(employee.get("pos_groups_json")):
-        store_code = str(group.get("store_code") or "").strip()
-        if store_code:
-            store_codes.add(store_code)
-
     warehouses = sorted(_warehouse_codes_for_stores({code for code in store_codes if code}))
     permissions = [
         "receipts:view",

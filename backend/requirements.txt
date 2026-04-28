@@ -3,3 +3,4 @@ gunicorn==23.0.0
 whitenoise==6.9.0
 psycopg[binary]==3.2.9
 pyarrow==21.0.0
+ldap3==2.9.1

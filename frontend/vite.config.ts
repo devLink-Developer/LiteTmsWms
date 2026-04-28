@@ -14,6 +14,10 @@ export default defineConfig({
         target: process.env.VITE_API_PROXY_TARGET ?? "http://backend:8021",
         changeOrigin: true,
       },
+      "/auth": {
+        target: process.env.VITE_API_PROXY_TARGET ?? "http://backend:8021",
+        changeOrigin: true,
+      },
     },
   },
   preview: {

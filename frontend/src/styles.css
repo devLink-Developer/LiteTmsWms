@@ -45,6 +45,84 @@ button:disabled {
   color: white;
 }
 
+.litelogistic-mark {
+  position: relative;
+  display: inline-block;
+  width: 15px;
+  height: 15px;
+  flex: 0 0 auto;
+  border: 2px solid #111827;
+  border-radius: 4px;
+  box-sizing: border-box;
+}
+
+.litelogistic-mark::before {
+  content: "";
+  position: absolute;
+  inset: 3px;
+  border: 1.5px solid #111827;
+  border-radius: 999px;
+}
+
+.litelogistic-mark::after {
+  content: "";
+  position: absolute;
+  width: 3px;
+  height: 3px;
+  top: 2px;
+  right: 2px;
+  border-radius: 999px;
+  background: #111827;
+  box-shadow:
+    -6px 0 0 #111827,
+    -3px 6px 0 #111827;
+}
+
+.login-submit-icon {
+  position: relative;
+  display: inline-block;
+  width: 15px;
+  height: 15px;
+  color: currentColor;
+}
+
+.login-submit-icon::before {
+  content: "";
+  position: absolute;
+  left: 1px;
+  top: 6px;
+  width: 8px;
+  height: 2px;
+  border-radius: 999px;
+  background: currentColor;
+}
+
+.login-submit-icon::after {
+  content: "";
+  position: absolute;
+  left: 6px;
+  top: 3px;
+  width: 7px;
+  height: 9px;
+  border: 2px solid currentColor;
+  border-left: 0;
+  border-radius: 1px;
+}
+
+.route-stop-tooltip,
+.route-origin-tooltip {
+  border: 1px solid #c8d9ea;
+  border-radius: 4px;
+  box-shadow: 0 6px 16px rgb(7 26 46 / 12%);
+  color: #071a2e;
+  padding: 6px 8px;
+}
+
+.route-stop-tooltip::before,
+.route-origin-tooltip::before {
+  border-right-color: #c8d9ea;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

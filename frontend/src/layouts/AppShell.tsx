@@ -1,8 +1,10 @@
-import { NavLink, Outlet } from "react-router-dom";
+import { LogOut } from "lucide-react";
+import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import { useEffect, useRef, useState } from "react";
 
 import { fetchWorkspaceContext } from "../api/workspace";
 import { navigationEntries, navigationLinks } from "../shared/data/modules";
+import { useSessionStore } from "../stores/useSessionStore";
 import { useWorkspaceStore } from "../stores/useWorkspaceStore";
 import type { NavigationLink } from "../types/operations";
 
@@ -25,10 +27,19 @@ function DesktopNavLink({ link }: { link: NavigationLink }) {
 }
 
 export function AppShell() {
-  const { warehouseRef, branchRef, role, authorizedWarehouses, setContext } = useWorkspaceStore();
+  const { warehouseRef, role, authorizedWarehouses, setContext } = useWorkspaceStore();
+  const logout = useSessionStore((state) => state.logout);
+  const navigate = useNavigate();
   const [contextError, setContextError] = useState<string | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [isLoggingOut, setIsLoggingOut] = useState(false);
   const sidebarTimerRef = useRef<number | null>(null);
+  const warehouseLabel =
+    authorizedWarehouses.length === 1
+      ? authorizedWarehouses[0]
+      : authorizedWarehouses.length
+        ? `${authorizedWarehouses.length} depositos`
+        : warehouseRef || "sin warehouse";
 
   function clearSidebarTimer() {
     if (sidebarTimerRef.current !== null) {
@@ -48,6 +59,16 @@ export function AppShell() {
       setSidebarOpen(false);
       sidebarTimerRef.current = null;
     }, 3000);
+  }
+
+  async function handleLogout() {
+    setIsLoggingOut(true);
+    try {
+      await logout();
+      navigate("/login/", { replace: true });
+    } finally {
+      setIsLoggingOut(false);
+    }
   }
 
   useEffect(() => {
@@ -89,7 +110,7 @@ export function AppShell() {
         aria-label="Menu principal"
       >
         <div className={`min-w-60 shrink-0 border-b border-white/10 px-4 py-4 transition-opacity duration-150 ${sidebarOpen ? "opacity-100" : "opacity-0"}`}>
-          <div className="text-[13px] font-semibold">Lite TMS/WMS</div>
+          <div className="text-[13px] font-semibold">Lite Logistic</div>
           <div className="mt-1 text-[11px] text-white/70">Consola operativa</div>
         </div>
         <nav className={`min-w-60 min-h-0 flex-1 space-y-1 overflow-y-auto px-2 py-3 text-[12px] transition-opacity duration-150 ${sidebarOpen ? "opacity-100" : "pointer-events-none opacity-0"}`} aria-label="Modulos">
@@ -110,20 +131,42 @@ export function AppShell() {
             ),
           )}
         </nav>
+        <div className={`min-w-60 shrink-0 border-t border-white/10 p-3 transition-opacity duration-150 ${sidebarOpen ? "opacity-100" : "pointer-events-none opacity-0"}`}>
+          <button
+            aria-label="Cerrar sesion"
+            className="flex h-11 w-full items-center justify-center gap-2 rounded border border-white/15 bg-white/8 px-3 text-[12px] font-semibold text-white transition hover:border-white/35 hover:bg-white/12 focus:outline-none focus:ring-2 focus:ring-white/25 disabled:cursor-not-allowed disabled:opacity-50"
+            disabled={isLoggingOut}
+            onClick={() => void handleLogout()}
+            type="button"
+          >
+            <LogOut aria-hidden="true" size={16} strokeWidth={2} />
+            <span>Cerrar sesion</span>
+          </button>
+        </div>
       </aside>
       <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
         <header className="flex min-h-14 shrink-0 items-center justify-between gap-3 border-b border-borderSoft bg-surface px-4">
           <div className="min-w-0">
-            <div className="text-[11px] font-semibold uppercase text-secondaryText">{branchRef}</div>
             <div className="text-[13px] font-semibold text-night">
               {contextError ? "Contexto no disponible" : `Contexto operativo ${warehouseRef || "sin warehouse"}`}
             </div>
           </div>
           <div className="flex items-center gap-2">
             <div className="hidden rounded border border-borderSoft bg-white px-3 py-1 font-mono text-[12px] font-semibold text-night md:block">
-              {authorizedWarehouses.length ? `${authorizedWarehouses.length} depositos` : warehouseRef || "sin warehouse"}
+              {warehouseLabel}
             </div>
-            <div className="rounded border border-borderSoft bg-white px-3 py-1 text-[12px] font-semibold text-night">{role}</div>
+            <div className="hidden rounded border border-borderSoft bg-white px-3 py-1 text-[12px] font-semibold text-night sm:block">{role}</div>
+            <button
+              aria-label="Cerrar sesion"
+              className="flex h-11 min-w-11 items-center justify-center gap-2 rounded border border-borderSoft bg-white px-3 text-secondaryText transition hover:border-primary hover:text-primaryHover focus:outline-none focus:ring-2 focus:ring-primary/20 disabled:cursor-not-allowed disabled:opacity-50"
+              disabled={isLoggingOut}
+              onClick={() => void handleLogout()}
+              title="Cerrar sesion"
+              type="button"
+            >
+              <LogOut aria-hidden="true" size={16} strokeWidth={2} />
+              <span className="text-[12px] font-semibold">Salir</span>
+            </button>
           </div>
         </header>
         <nav className="flex shrink-0 gap-1 overflow-x-auto border-b border-borderSoft bg-white px-3 py-2 text-[12px] lg:hidden" aria-label="Modulos">

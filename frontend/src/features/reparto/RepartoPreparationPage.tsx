@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, PackageCheck, RefreshCw, Send } from "lucide-react";
 
@@ -10,11 +10,9 @@ import {
   type ApiPreparationTaskListItem,
   type ApiRepartoDelivery,
 } from "../../api/fulfillment";
-import { fetchWarehouseOptions, type WarehouseOption } from "../../api/routing";
 import { StatusBadge } from "../../shared/components/StatusBadge";
 import { formatAppDateTime } from "../../shared/utils/dateFormat";
 import { formatIdentifier } from "../../shared/utils/identifierFormat";
-import { useWorkspaceStore } from "../../stores/useWorkspaceStore";
 import type { StatusTone } from "../../types/operations";
 
 const statusTone: Record<string, StatusTone> = {
@@ -68,17 +66,15 @@ async function mapWithConcurrency<T, R>(items: T[], limit: number, handler: (ite
 
 export function RepartoPreparationPage() {
   const queryClient = useQueryClient();
-  const { authorizedWarehouses } = useWorkspaceStore();
-  const [plannedDate, setPlannedDate] = useState(localDateInputValue());
-  const [warehouse, setWarehouse] = useState("");
+  const today = localDateInputValue();
+  const [plannedDate, setPlannedDate] = useState(today);
   const [message, setMessage] = useState<string | null>(null);
 
   const deliveriesQuery = useQuery({
-    queryKey: ["reparto-preparation-deliveries", plannedDate, warehouse, authorizedWarehouses.join(",")],
+    queryKey: ["reparto-preparation-deliveries", plannedDate],
     queryFn: () =>
       fetchRepartoDeliveries({
         plannedDate,
-        warehouse,
         status: "confirmed",
       }),
   });
@@ -86,17 +82,10 @@ export function RepartoPreparationPage() {
     queryKey: ["reparto-preparation-tasks"],
     queryFn: () => fetchPreparationTasks("open"),
   });
-  const warehousesQuery = useQuery({ queryKey: ["routing-warehouses"], queryFn: fetchWarehouseOptions });
 
-  const warehouseOptions = useMemo(() => {
-    const masterByCode = new Map((warehousesQuery.data ?? []).map((option) => [option.warehouse_code, option]));
-    const authorizedCodes = authorizedWarehouses.length
-      ? authorizedWarehouses
-      : (warehousesQuery.data ?? []).map((option) => option.warehouse_code).filter(Boolean);
-    return Array.from(new Set(authorizedCodes))
-      .map<WarehouseOption>((code) => masterByCode.get(code) ?? { warehouse_code: code })
-      .sort((left, right) => left.warehouse_code.localeCompare(right.warehouse_code));
-  }, [authorizedWarehouses, warehousesQuery.data]);
+  function handlePlannedDateChange(value: string) {
+    setPlannedDate(value && value >= today ? value : today);
+  }
 
   const deliveries = deliveriesQuery.data ?? [];
   const tasks = (tasksQuery.data ?? []).filter(isRepartoTask);
@@ -156,7 +145,6 @@ export function RepartoPreparationPage() {
   const error =
     deliveriesQuery.error ||
     tasksQuery.error ||
-    warehousesQuery.error ||
     sendToPrepareMutation.error ||
     markPreparedMutation.error ||
     sendAllToPrepareMutation.error ||
@@ -224,29 +212,16 @@ export function RepartoPreparationPage() {
         </div>
       )}
 
-      <section className="grid shrink-0 grid-cols-1 gap-2 rounded border border-borderSoft bg-white p-3 md:grid-cols-[220px_180px]">
-        <label className="grid gap-1 text-[11px] font-semibold text-secondaryText">
-          Deposito
-          <select
-            value={warehouse}
-            onChange={(event) => setWarehouse(event.target.value)}
-            className="h-9 rounded border border-borderSoft bg-white px-2 text-[12px] text-night outline-none focus:border-primary focus:ring-2 focus:ring-primary/20"
-          >
-            <option value="">Todos habilitados</option>
-            {warehouseOptions.map((option) => (
-              <option key={option.warehouse_code} value={option.warehouse_code}>
-                {option.warehouse_code}
-                {option.warehouse_name ? ` / ${option.warehouse_name}` : ""}
-              </option>
-            ))}
-          </select>
-        </label>
+      <section className="grid shrink-0 grid-cols-1 gap-2 rounded border border-borderSoft bg-white p-3 md:grid-cols-[180px]">
         <label className="grid gap-1 text-[11px] font-semibold text-secondaryText">
           Fecha entrega
           <input
             type="date"
             value={plannedDate}
-            onChange={(event) => setPlannedDate(event.target.value)}
+            min={today}
+            required
+            onBlur={(event) => handlePlannedDateChange(event.target.value)}
+            onChange={(event) => handlePlannedDateChange(event.target.value)}
             className="h-9 rounded border border-borderSoft bg-white px-2 text-[12px] text-night outline-none focus:border-primary focus:ring-2 focus:ring-primary/20"
           />
         </label>
@@ -259,7 +234,6 @@ export function RepartoPreparationPage() {
               <tr>
                 <th className="px-3 py-2 font-semibold">Entrega</th>
                 <th className="px-3 py-2 font-semibold">Pedido</th>
-                <th className="px-3 py-2 font-semibold">Deposito</th>
                 <th className="px-3 py-2 font-semibold">Direccion</th>
                 <th className="px-3 py-2 font-semibold">Cantidad</th>
                 <th className="px-3 py-2 font-semibold">Estado</th>
@@ -274,7 +248,6 @@ export function RepartoPreparationPage() {
                     <div className="font-mono font-semibold text-night">{orderRef(delivery)}</div>
                     <div className="mt-1 text-[11px] text-secondaryText">{delivery.customer_ref}</div>
                   </td>
-                  <td className="whitespace-nowrap px-3 py-2 font-mono text-night">{delivery.warehouse_ref}</td>
                   <td className="max-w-[260px] truncate px-3 py-2 text-secondaryText">{rowAddress(delivery)}</td>
                   <td className="whitespace-nowrap px-3 py-2 font-mono text-night">{formatQty(delivery.total_qty)}</td>
                   <td className="whitespace-nowrap px-3 py-2">
@@ -295,7 +268,7 @@ export function RepartoPreparationPage() {
               ))}
               {!deliveries.length && (
                 <tr>
-                  <td colSpan={7} className="px-3 py-6 text-[12px] text-secondaryText">
+                  <td colSpan={6} className="px-3 py-6 text-[12px] text-secondaryText">
                     {deliveriesQuery.isLoading ? "Cargando entregas..." : "No hay entregas confirmadas para enviar a preparacion."}
                   </td>
                 </tr>
@@ -316,7 +289,7 @@ export function RepartoPreparationPage() {
                   <div className="min-w-0">
                     <div className="truncate font-mono text-[12px] font-semibold text-night">{task.delivery.delivery_number}</div>
                     <div className="mt-1 truncate text-[11px] text-secondaryText">
-                      {formatIdentifier(task.order.sales_order_number || task.order.fulfillment_number)} / {task.warehouse_ref}
+                      {formatIdentifier(task.order.sales_order_number || task.order.fulfillment_number)}
                     </div>
                   </div>
                   <StatusBadge label={task.status} tone={statusTone[task.status] ?? "neutral"} />

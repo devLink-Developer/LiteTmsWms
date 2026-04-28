@@ -1,4 +1,4 @@
-import { apiGet, apiPost, apiUrl, actorHeaders } from "./client";
+import { apiGet, apiHeaders, apiPost, apiUrl } from "./client";
 
 export type RoutingDelivery = {
   id: string;
@@ -42,6 +42,7 @@ export type RouteStop = {
   sales_order_number: string;
   delivery_mode: string;
   customer_ref: string;
+  customer_name?: string;
   address_snapshot: Record<string, string>;
   lat: string | null;
   lng: string | null;
@@ -74,6 +75,9 @@ export type RouteSheet = {
   preview_payload: {
     excluded?: Array<Record<string, string>>;
     routing_status?: string;
+    input?: {
+      origin?: Record<string, unknown>;
+    };
   };
   stops: RouteStop[];
 };
@@ -141,6 +145,14 @@ export async function fetchWarehouseOptions() {
   return response.results ?? [];
 }
 
+export async function fetchWarehouseOptionsForStore(store?: string) {
+  const params = new URLSearchParams();
+  if (store) params.set("store", store);
+  const response = await apiGet<WarehouseOption>(`/api/v1/logistics/master-data/warehouses/${params.toString() ? `?${params.toString()}` : ""}`);
+  if (response.error) throw new Error(response.error.message);
+  return response.results ?? [];
+}
+
 export async function fetchRouteSheets(filters: { warehouse?: string; plannedDate?: string; status?: string[]; driverRef?: string }) {
   const params = new URLSearchParams();
   if (filters.warehouse) params.set("warehouse_ref", filters.warehouse);
@@ -154,7 +166,8 @@ export async function fetchRouteSheets(filters: { warehouse?: string; plannedDat
 
 export async function fetchRouteSheet(routeId: string) {
   const response = await fetch(apiUrl(`/api/v1/routesheets/${routeId}/`), {
-    headers: { Accept: "application/json", ...actorHeaders() },
+    credentials: "include",
+    headers: apiHeaders(),
   });
   const payload = (await response.json().catch(() => ({}))) as CommandResult<RouteSheet> & {
     error?: { message: string };
@@ -183,12 +196,11 @@ export async function updateRouteStopOrder(
 ) {
   const response = await fetch(apiUrl(`/api/v1/routesheets/${routeId}/stops`), {
     method: "PATCH",
-    headers: {
-      Accept: "application/json",
+    credentials: "include",
+    headers: apiHeaders({
       "Content-Type": "application/json",
       "Idempotency-Key": crypto.randomUUID?.() ?? `${Date.now()}-${Math.random()}`,
-      ...actorHeaders(),
-    },
+    }),
     body: JSON.stringify({ stops, remove_stop_ids: removeStopIds }),
   });
   const payload = (await response.json().catch(() => ({}))) as CommandResult<RouteSheet> & {
@@ -201,12 +213,11 @@ export async function updateRouteStopOrder(
 export async function confirmRoute(routeId: string, payload: { vehicle_id?: string; driver_ref?: string; reviewed?: boolean }) {
   const response = await fetch(apiUrl(`/api/v1/routesheets/${routeId}/confirm`), {
     method: "PUT",
-    headers: {
-      Accept: "application/json",
+    credentials: "include",
+    headers: apiHeaders({
       "Content-Type": "application/json",
       "Idempotency-Key": crypto.randomUUID?.() ?? `${Date.now()}-${Math.random()}`,
-      ...actorHeaders(),
-    },
+    }),
     body: JSON.stringify(payload),
   });
   const body = (await response.json().catch(() => ({}))) as CommandResult<RouteSheet> & { error?: { message: string } };
@@ -229,12 +240,11 @@ export async function executeStop(payload: {
 }, idempotencyKey?: string) {
   const response = await fetch(apiUrl("/api/v1/deliveries/execute"), {
     method: "POST",
-    headers: {
-      Accept: "application/json",
+    credentials: "include",
+    headers: apiHeaders({
       "Content-Type": "application/json",
       "Idempotency-Key": idempotencyKey || crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`,
-      ...actorHeaders(),
-    },
+    }),
     body: JSON.stringify(payload),
   });
   const body = (await response.json().catch(() => ({}))) as CommandResult<RouteSheet> & { error?: { message: string } };

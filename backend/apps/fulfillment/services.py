@@ -957,6 +957,7 @@ def _serialize_fulfillment(
             "warehouse_ref": delivery.warehouse_ref,
             "store_ref": delivery.store_ref,
             "address_snapshot": delivery.address_snapshot,
+            "route_sheet": _delivery_route_assignment(str(delivery.id)),
             "documents": [
                 {
                     "id": str(document.id),
@@ -1437,6 +1438,7 @@ def _serialize_delivery(delivery: DeliveryOrder) -> dict:
         "warehouse_ref": delivery.warehouse_ref,
         "store_ref": delivery.store_ref,
         "address_snapshot": delivery.address_snapshot,
+        "route_sheet": _delivery_route_assignment(str(delivery.id)),
         "lines": [_serialize_delivery_line(line) for line in delivery_lines],
         "totals": _delivery_totals(delivery_lines),
         "documents": [
@@ -2000,16 +2002,53 @@ def mark_preparation_task_prepared(
 def delivery_uses_reparto_flow(delivery: DeliveryOrder) -> bool:
     if is_shipping_delivery_mode(delivery.delivery_mode):
         return True
-    try:
-        from apps.routes.models import RouteStopLine
+    return _delivery_route_assignment(str(delivery.id)) is not None
 
-        return RouteStopLine.objects.filter(delivery_ref=str(delivery.id)).exists()
+
+def _delivery_route_assignment(delivery_id: str) -> dict | None:
+    try:
+        from apps.routes.models import RouteSheet, RouteStop, RouteStopLine
+
+        route_stop = (
+            RouteStop.objects.select_related("route")
+            .filter(source_type="delivery_order", source_ref=str(delivery_id))
+            .exclude(route__status=RouteSheet.RouteStatus.CANCELLED)
+            .exclude(status=RouteStop.StopStatus.CANCELLED)
+            .order_by("-route__created_at")
+            .first()
+        )
+        if route_stop is None:
+            route_line = (
+                RouteStopLine.objects.select_related("stop", "stop__route")
+                .filter(delivery_ref=str(delivery_id))
+                .exclude(stop__route__status=RouteSheet.RouteStatus.CANCELLED)
+                .exclude(stop__status=RouteStop.StopStatus.CANCELLED)
+                .order_by("-stop__route__created_at")
+                .first()
+            )
+            route_stop = route_line.stop if route_line else None
+        if route_stop is None:
+            return None
+        return {
+            "id": str(route_stop.route_id),
+            "route_number": route_stop.route.route_number,
+            "status": route_stop.route.status,
+            "stop_id": str(route_stop.id),
+            "stop_status": route_stop.status,
+        }
     except Exception:
-        return False
+        return None
 
 
 @transaction.atomic
-def issue_remito(*, delivery_id: str, idempotency_key: str, actor: str, authorized_warehouses=None) -> IdempotentResult:
+def issue_remito(
+    *,
+    delivery_id: str,
+    idempotency_key: str,
+    actor: str,
+    authorized_warehouses=None,
+    allow_route_delivery: bool = False,
+) -> IdempotentResult:
     command_payload = {"delivery_id": delivery_id}
     idempotency, replay = _start_idempotent_command(
         key=idempotency_key,
@@ -2026,6 +2065,12 @@ def issue_remito(*, delivery_id: str, idempotency_key: str, actor: str, authoriz
     delivery_lines = physical_delivery_lines(list(delivery.lines.all()))
     for line in delivery_lines:
         _ensure_warehouse_authorized(line.warehouse_ref or delivery.warehouse_ref, authorized_warehouses)
+
+    route_assignment = _delivery_route_assignment(str(delivery.id))
+    if route_assignment and not allow_route_delivery:
+        raise FulfillmentRuleError(
+            f"La entrega pertenece a la hoja de ruta {route_assignment['route_number']}; debe entregarse desde Ejecucion chofer."
+        )
 
     existing = delivery.documents.filter(document_type=DeliveryDocument.DocumentType.REMITO).first()
     if existing:
@@ -2237,11 +2282,15 @@ def expedition_queue(
     sales_order_number = sales_order_number.strip()
     customer_ref = customer_ref.strip()
     customer_dni = customer_dni.strip()
-    authorized_warehouse_set = {str(warehouse).strip() for warehouse in (authorized_warehouses or []) if str(warehouse).strip()}
+    authorized_warehouse_set = (
+        None
+        if authorized_warehouses is None
+        else {str(warehouse).strip() for warehouse in authorized_warehouses if str(warehouse).strip()}
+    )
 
     if not (sales_order_number or customer_ref or customer_dni):
         return []
-    if not authorized_warehouse_set:
+    if authorized_warehouses is not None and not authorized_warehouse_set:
         return []
 
     customer_refs = {customer_ref} if customer_ref else set()
@@ -2256,17 +2305,19 @@ def expedition_queue(
     if customer_refs:
         filters &= Q(customer_ref__in=customer_refs)
 
-    fulfillments = list(
+    fulfillment_qs = (
         FulfillmentOrder.objects.prefetch_related(
             "lines",
             "deliveries__lines__fulfillment_line",
             "deliveries__documents",
         )
         .filter(filters)
-        .filter(warehouse_ref__in=authorized_warehouse_set)
         .distinct()
-        .order_by("-created_at")[:100]
+        .order_by("-created_at")
     )
+    if authorized_warehouse_set is not None:
+        fulfillment_qs = fulfillment_qs.filter(warehouse_ref__in=authorized_warehouse_set)
+    fulfillments = list(fulfillment_qs[:100])
     lines = [
         line
         for fulfillment in fulfillments
