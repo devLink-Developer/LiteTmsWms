@@ -1,4 +1,5 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -48,12 +49,19 @@ describe("AppShell", () => {
     );
   });
 
-  it("renders the grouped operations menu without Despacho tienda", async () => {
+  function renderShell() {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
     render(
-      <MemoryRouter initialEntries={["/reparto/confirmacion"]}>
-        <AppShell />
-      </MemoryRouter>,
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={["/reparto/confirmacion"]}>
+          <AppShell />
+        </MemoryRouter>
+      </QueryClientProvider>,
     );
+  }
+
+  it("renders the grouped operations menu without Despacho tienda", async () => {
+    renderShell();
 
     await waitFor(() => expect(screen.getByText("Contexto operativo PS003MT")).toBeInTheDocument());
     expect(screen.getByText("PS003MT")).toBeInTheDocument();
@@ -103,6 +111,10 @@ describe("AppShell", () => {
     expect(within(desktopNav).getByText("Operaciones")).toBeInTheDocument();
     expect(within(desktopNav).getByRole("link", { name: "Corte de chapas" })).toBeInTheDocument();
     expect(within(desktopNav).getByText("Maestros")).toBeInTheDocument();
+    expect(within(desktopNav).getByRole("link", { name: "Almacenes" })).toHaveAttribute(
+      "href",
+      "/maestros/almacenes",
+    );
     expect(within(desktopNav).getByRole("link", { name: "Vehiculo" })).toHaveAttribute(
       "href",
       "/maestros/vehiculos",
@@ -112,11 +124,7 @@ describe("AppShell", () => {
   });
 
   it("renders a logout button in the top bar", async () => {
-    render(
-      <MemoryRouter initialEntries={["/reparto/confirmacion"]}>
-        <AppShell />
-      </MemoryRouter>,
-    );
+    renderShell();
 
     await waitFor(() => expect(screen.getByText("Contexto operativo PS003MT")).toBeInTheDocument());
     const logoutButtons = screen.getAllByRole("button", { name: "Cerrar sesion" });

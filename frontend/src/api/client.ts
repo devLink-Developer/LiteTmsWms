@@ -1,3 +1,5 @@
+import { beginGlobalLoading, isGlobalLoadingSuppressed } from "../stores/useGlobalLoadingStore";
+
 export type ApiResult<T> = {
   results?: T[];
   modules?: string[];
@@ -14,15 +16,51 @@ export function apiUrl(path: string) {
   return `${import.meta.env.VITE_API_BASE_URL ?? ""}${path}`;
 }
 
+function loadingLabelForRequest(init?: RequestInit) {
+  const method = String(init?.method || "GET").toUpperCase();
+  return method === "GET" || method === "HEAD" ? "Cargando datos..." : "Procesando accion...";
+}
+
+export type RequestTrackingOptions = {
+  globalLoading?: boolean;
+  label?: string;
+};
+
+function trackingOptions(options?: string | RequestTrackingOptions): RequestTrackingOptions {
+  if (typeof options === "string") return { label: options };
+  return options ?? {};
+}
+
+export async function trackedFetch(path: string, init?: RequestInit, options?: string | RequestTrackingOptions): Promise<Response> {
+  const tracking = trackingOptions(options);
+  if (tracking.globalLoading === false || isGlobalLoadingSuppressed()) {
+    return fetch(apiUrl(path), init);
+  }
+  const finish = beginGlobalLoading(tracking.label || loadingLabelForRequest(init));
+  try {
+    return await fetch(apiUrl(path), init);
+  } finally {
+    finish();
+  }
+}
+
 export class ApiError extends Error {
   status: number;
   data: unknown;
+  code: string;
+  details: Record<string, unknown>;
 
   constructor(message: string, status: number, data: unknown) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.data = data;
+    const error = typeof data === "object" && data && "error" in data ? data.error : null;
+    this.code = typeof error === "object" && error && "code" in error && typeof error.code === "string" ? error.code : "";
+    this.details =
+      typeof error === "object" && error && "details" in error && typeof error.details === "object" && error.details
+        ? (error.details as Record<string, unknown>)
+        : {};
   }
 }
 
@@ -131,11 +169,11 @@ export function actorHeaders(): Record<string, string> {
   };
 }
 
-export async function apiGet<T>(path: string): Promise<ApiResult<T>> {
-  const response = await fetch(apiUrl(path), {
+export async function apiGet<T>(path: string, options?: RequestTrackingOptions): Promise<ApiResult<T>> {
+  const response = await trackedFetch(path, {
     credentials: "include",
     headers: buildActorHeaders(),
-  });
+  }, options);
   if (!response.ok) {
     return {
       error: {
@@ -150,7 +188,7 @@ export async function apiGet<T>(path: string): Promise<ApiResult<T>> {
 }
 
 export async function apiPost<T>(path: string, body?: unknown): Promise<T> {
-  const response = await fetch(apiUrl(path), {
+  const response = await trackedFetch(path, {
     method: "POST",
     credentials: "include",
     headers: buildHeaders({
@@ -162,13 +200,13 @@ export async function apiPost<T>(path: string, body?: unknown): Promise<T> {
   });
   const payload = (await response.json().catch(() => ({}))) as T & ApiResult<never>;
   if (!response.ok) {
-    throw new Error(payload.error?.message ?? `API ${path} respondio ${response.status}`);
+    throw new ApiError(errorMessage(payload, `API ${path} respondio ${response.status}`), response.status, payload);
   }
   return payload;
 }
 
 export async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(apiUrl(path), {
+  const response = await trackedFetch(path, {
     credentials: "include",
     ...init,
     headers: apiHeaders(init?.headers),

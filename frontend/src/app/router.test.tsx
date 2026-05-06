@@ -89,6 +89,7 @@ describe("app router", () => {
     ["/hojas-ruta", "/reparto/hojas-ruta", "Hojas de ruta"],
     ["/vehiculos", "/maestros/vehiculos", "ABM de flota"],
     ["/choferes", "/maestros/choferes", "ABM de flota"],
+    ["/almacenes", "/maestros/almacenes", "Maestro de almacenes"],
     ["/recepciones", "/ingresos/oc", "Ingresos por OC"],
     ["/stock", "/stock/almacenes", "Stock por almacen"],
     ["/despacho-tienda", "/pedidos/entrega", "Expedicion de entregas"],
@@ -108,9 +109,11 @@ describe("app router", () => {
     ["/reparto/hojas-ruta", "Hojas de ruta"],
     ["/maestros/vehiculos", "ABM de flota"],
     ["/maestros/choferes", "ABM de flota"],
+    ["/maestros/almacenes", "Maestro de almacenes"],
     ["/ingresos/tr-depositos", "Transferencias entre sucursales"],
     ["/ingresos/devoluciones", "Ingresos por devoluciones"],
     ["/stock/movimientos", "Movimientos de Stock"],
+    ["/operaciones/roturas-perdidas", "Roturas y perdidas"],
   ])("renders the operational route %s", async (path, heading) => {
     const router = renderRoute(path);
 
@@ -123,7 +126,7 @@ describe("app router", () => {
 
     await waitFor(() => expect(router.state.location.pathname).toBe("/operaciones/corte-chapas"));
     expect(await screen.findByRole("heading", { name: "Corte de chapas" })).toBeInTheDocument();
-    expect(screen.getByText("read-only")).toBeInTheDocument();
-    expect(screen.getByText("sin API")).toBeInTheDocument();
+    expect(screen.queryByText("read-only")).not.toBeInTheDocument();
+    expect(screen.queryByText("sin API")).not.toBeInTheDocument();
   });
 });

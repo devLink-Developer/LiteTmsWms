@@ -943,6 +943,327 @@ def _material_file(store: str) -> str:
     return "productos_cache.parquet"
 
 
+def _material_store_files(store: str = "") -> list[str]:
+    base_dir = master_data_dir()
+    if store:
+        store_file = base_dir / f"materiales_{store}.parquet"
+        if not store_file.exists():
+            raise MasterDataSourceError(f"No existe el archivo Parquet {store_file}.")
+        return [store_file.name]
+    return sorted(
+        path.name
+        for path in base_dir.glob("materiales_*.parquet")
+        if not path.stem.endswith("_test")
+    )
+
+
+def _length_cm(value: Any) -> Decimal:
+    length = _to_decimal(value)
+    return length if length > 0 else Decimal("0")
+
+
+def _number(value: Decimal | Any) -> int | float:
+    decimal = _to_decimal(value)
+    if decimal == decimal.to_integral_value():
+        return int(decimal)
+    return float(decimal)
+
+
+def _length_m(value: Decimal | Any) -> int | float:
+    return _number(_to_decimal(value) / Decimal("100"))
+
+
+MIN_SHEET_CUT_LENGTH_CM = Decimal("50")
+
+
+def _is_sheet_category(value: Any) -> bool:
+    return "chapa" in _normalize_lookup(value)
+
+
+def _sheet_material_payload(row: dict[str, Any], *, source_file: str) -> dict[str, Any]:
+    length_cm = _length_cm(row.get("largo"))
+    return {
+        "item_ref": row.get("numero_producto"),
+        "sap_code": row.get("codigo_sap"),
+        "sap_item_id": row.get("item_id_sap"),
+        "category": row.get("categoria_producto"),
+        "name": row.get("nombre_producto"),
+        "long_name": row.get("nombre_largo") or row.get("nombre_producto"),
+        "uom": row.get("unidad_medida"),
+        "uom_code": row.get("unidad_medida_codigo") or row.get("unidad_medida"),
+        "length_cm": _number(length_cm),
+        "length_m": _length_m(length_cm),
+        "width": row.get("ancho"),
+        "height": row.get("alto"),
+        "price_with_tax": row.get("precio_base_con_iva"),
+        "available_for_delivery": row.get("total_disponible_entrega"),
+        "store_number": row.get("store_number"),
+        "store_name": row.get("store_name"),
+        "source_file": source_file,
+    }
+
+
+def _sheet_material_rows(*, store: str = "") -> tuple[list[str], list[dict[str, Any]]]:
+    columns = [
+        "numero_producto",
+        "codigo_sap",
+        "item_id_sap",
+        "categoria_producto",
+        "nombre_producto",
+        "nombre_largo",
+        "unidad_medida",
+        "unidad_medida_codigo",
+        "largo",
+        "ancho",
+        "alto",
+        "precio_base_con_iva",
+        "total_disponible_entrega",
+        "store_number",
+        "store_name",
+    ]
+    source_files: list[str] = []
+    rows: list[dict[str, Any]] = []
+    for file_name in _material_store_files(store):
+        path, raw_rows = _read_rows(file_name, columns=_existing_columns(file_name, columns))
+        source_files.append(str(path))
+        for row in raw_rows:
+            category = row.get("categoria_producto")
+            if not _is_sheet_category(category):
+                continue
+            if _length_cm(row.get("largo")) < MIN_SHEET_CUT_LENGTH_CM:
+                continue
+            rows.append(_sheet_material_payload(row, source_file=str(path)))
+    return source_files, rows
+
+
+def _sheet_row_matches(row: dict[str, Any], query: str) -> bool:
+    return _contains(row, query, ["item_ref", "sap_code", "sap_item_id", "name", "long_name", "category"])
+
+
+def _category_key(value: Any) -> str:
+    return _normalize_lookup(value)
+
+
+def _length_key(value: Any) -> str:
+    return format(_to_decimal(value).normalize(), "f")
+
+
+def _summarize_sheet_categories(rows: list[dict[str, Any]], *, query: str = "", limit: int = 200) -> list[dict[str, Any]]:
+    categories: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if query and not _sheet_row_matches(row, query):
+            continue
+        category = str(row.get("category") or "").strip()
+        if not category:
+            continue
+        key = _category_key(category)
+        current = categories.setdefault(
+            key,
+            {
+                "category": category,
+                "item_count": 0,
+                "store_numbers": set(),
+                "min_length_cm": None,
+                "max_length_cm": None,
+                "lengths": set(),
+            },
+        )
+        length_cm = _to_decimal(row.get("length_cm"))
+        current["item_count"] += 1
+        if row.get("store_number"):
+            current["store_numbers"].add(row.get("store_number"))
+        current["lengths"].add(length_cm)
+        current["min_length_cm"] = length_cm if current["min_length_cm"] is None else min(current["min_length_cm"], length_cm)
+        current["max_length_cm"] = length_cm if current["max_length_cm"] is None else max(current["max_length_cm"], length_cm)
+
+    results = []
+    for category in categories.values():
+        lengths = sorted(category["lengths"])
+        results.append(
+            {
+                "category": category["category"],
+                "item_count": category["item_count"],
+                "store_count": len(category["store_numbers"]),
+                "min_length_cm": _number(category["min_length_cm"] or Decimal("0")),
+                "max_length_cm": _number(category["max_length_cm"] or Decimal("0")),
+                "min_length_m": _length_m(category["min_length_cm"] or Decimal("0")),
+                "max_length_m": _length_m(category["max_length_cm"] or Decimal("0")),
+                "length_count": len(lengths),
+            }
+        )
+    return sorted(results, key=lambda row: (-int(row["item_count"]), str(row["category"])))[:limit]
+
+
+def _summarize_sheet_lengths(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    lengths: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        length_cm = _to_decimal(row.get("length_cm"))
+        if length_cm <= 0:
+            continue
+        key = _length_key(length_cm)
+        current = lengths.setdefault(
+            key,
+            {
+                "length_cm": length_cm,
+                "item_count": 0,
+                "available_for_delivery": Decimal("0"),
+                "examples": [],
+            },
+        )
+        current["item_count"] += 1
+        current["available_for_delivery"] += _to_decimal(row.get("available_for_delivery"))
+        if len(current["examples"]) < 3:
+            current["examples"].append(
+                {
+                    "item_ref": row.get("item_ref"),
+                    "name": row.get("name"),
+                    "long_name": row.get("long_name"),
+                    "uom": row.get("uom"),
+                    "available_for_delivery": row.get("available_for_delivery"),
+                }
+            )
+    results = []
+    for row in lengths.values():
+        results.append(
+            {
+                "length_cm": _number(row["length_cm"]),
+                "length_m": _length_m(row["length_cm"]),
+                "item_count": row["item_count"],
+                "available_for_delivery": _number(row["available_for_delivery"]),
+                "examples": row["examples"],
+            }
+        )
+    return sorted(results, key=lambda row: _to_decimal(row["length_cm"]))
+
+
+def list_sheet_cutting_options(*, store: str = "", category: str = "", query: str = "", limit: int = 200) -> dict[str, Any]:
+    limit = min(max(limit, 1), 500)
+    source_files, rows = _sheet_material_rows(store=store)
+    categories = _summarize_sheet_categories(rows, query=query, limit=limit)
+    selected_category = _category_key(category)
+    category_rows = [
+        row
+        for row in rows
+        if selected_category and _category_key(row.get("category")) == selected_category and _sheet_row_matches(row, query)
+    ]
+    category_rows.sort(key=lambda row: (_to_decimal(row.get("length_cm")), str(row.get("item_ref") or "")))
+    return {
+        "source_files": source_files,
+        "unit": "cm",
+        "categories": categories,
+        "materials": category_rows[:limit],
+        "length_options": _summarize_sheet_lengths(category_rows),
+    }
+
+
+def _sheet_plan_item_for_length(rows: list[dict[str, Any]], length_cm: Decimal) -> dict[str, Any] | None:
+    for row in rows:
+        if _to_decimal(row.get("length_cm")) == length_cm:
+            return row
+    return None
+
+
+def calculate_sheet_cutting_plan(
+    *,
+    store: str = "",
+    category: str = "",
+    source_item_ref: str = "",
+    source_length_cm: Any = None,
+    source_quantity: Any = 1,
+    cuts: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    _source_files, rows = _sheet_material_rows(store=store)
+    selected_category = _category_key(category)
+    source_item = None
+    source_ref = str(source_item_ref or "").strip()
+    if source_ref:
+        source_item = next((row for row in rows if str(row.get("item_ref") or "").strip() == source_ref), None)
+        if not source_item:
+            raise ValueError(f"No se encontro el articulo origen {source_ref} en materiales_*.parquet.")
+        selected_category = selected_category or _category_key(source_item.get("category"))
+
+    if not selected_category:
+        raise ValueError("category es obligatorio para calcular el corte.")
+
+    category_rows = [row for row in rows if _category_key(row.get("category")) == selected_category]
+    if not category_rows:
+        raise ValueError(f"No hay chapas disponibles para la categoria {category}.")
+
+    if source_item:
+        source_length = _to_decimal(source_item.get("length_cm"))
+        category = str(source_item.get("category") or category).strip()
+    else:
+        source_length = _length_cm(source_length_cm)
+
+    if source_length <= 0:
+        raise ValueError("source_length_cm debe ser mayor a cero.")
+
+    source_qty = _to_decimal(source_quantity, "1")
+    if source_qty <= 0 or source_qty != source_qty.to_integral_value():
+        raise ValueError("source_quantity debe ser un entero positivo.")
+
+    normalized_cuts = cuts or []
+    outputs = []
+    used_total = Decimal("0")
+    available_lengths = {_length_key(row.get("length_cm")) for row in category_rows}
+
+    for index, cut in enumerate(normalized_cuts, start=1):
+        cut_item_ref = str(cut.get("item_ref") or "").strip()
+        cut_item = next((row for row in category_rows if str(row.get("item_ref") or "").strip() == cut_item_ref), None) if cut_item_ref else None
+        cut_length = _to_decimal(cut_item.get("length_cm") if cut_item else cut.get("length_cm"))
+        if cut_length <= 0:
+            raise ValueError(f"El corte #{index} no tiene largo valido.")
+        if _length_key(cut_length) not in available_lengths:
+            raise ValueError(f"El largo {cut_length} cm no existe en la categoria seleccionada.")
+        quantity = _to_decimal(cut.get("quantity"), "0")
+        if quantity <= 0 or quantity != quantity.to_integral_value():
+            raise ValueError(f"La cantidad del corte #{index} debe ser un entero positivo.")
+        representative = cut_item or _sheet_plan_item_for_length(category_rows, cut_length)
+        line_used = cut_length * quantity
+        used_total += line_used
+        outputs.append(
+            {
+                "item_ref": representative.get("item_ref") if representative else cut_item_ref,
+                "name": representative.get("name") if representative else "",
+                "long_name": representative.get("long_name") if representative else "",
+                "uom": representative.get("uom") if representative else "",
+                "uom_code": representative.get("uom_code") if representative else "",
+                "length_cm": _number(cut_length),
+                "length_m": _length_m(cut_length),
+                "quantity": int(quantity),
+                "used_cm": _number(line_used),
+                "used_m": _length_m(line_used),
+            }
+        )
+
+    source_total = source_length * source_qty
+    waste = source_total - used_total
+    valid = bool(outputs) and used_total <= source_total
+    return {
+        "unit": "cm",
+        "valid": valid,
+        "category": category,
+        "source": {
+            "item_ref": source_item.get("item_ref") if source_item else source_ref,
+            "name": source_item.get("name") if source_item else "",
+            "long_name": source_item.get("long_name") if source_item else "",
+            "uom": source_item.get("uom") if source_item else "",
+            "uom_code": source_item.get("uom_code") if source_item else "",
+            "length_cm": _number(source_length),
+            "length_m": _length_m(source_length),
+            "quantity": int(source_qty),
+            "total_cm": _number(source_total),
+            "total_m": _length_m(source_total),
+        },
+        "outputs": outputs,
+        "used_cm": _number(used_total),
+        "used_m": _length_m(used_total),
+        "waste_cm": _number(waste),
+        "waste_m": _length_m(waste),
+        "message": "Corte valido." if valid else "El corte excede el largo origen o no tiene salidas.",
+    }
+
+
 def list_materials(*, store: str = "", query: str = "", limit: int = 100) -> dict[str, Any]:
     limit = min(max(limit, 1), 500)
     file_name = _material_file(store)

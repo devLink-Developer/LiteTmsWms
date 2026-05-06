@@ -32,7 +32,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       set({ bootstrap: data, status: "ready", error: null });
       return data;
     } catch (error) {
-      const message = error instanceof Error ? error.message : "No se pudo cargar la sesion";
+      const message = error instanceof Error ? error.message : "Sesion no cargada.";
       set({ status: "error", error: message });
       notify({ message, tone: "error" });
       throw error;
@@ -45,7 +45,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       set({ bootstrap: response.session, status: "ready", error: null });
       return response;
     } catch (error) {
-      const message = error instanceof Error ? error.message : "No se pudo iniciar sesion";
+      const message = error instanceof Error ? error.message : "Inicio fallido.";
       set({ status: "error", error: message });
       notify({ message, tone: "error" });
       throw error;
@@ -62,4 +62,3 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     set({ error: null });
   },
 }));
-

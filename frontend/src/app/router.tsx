@@ -6,14 +6,17 @@ import { LoginPage } from "../features/auth/LoginPage";
 import { DeliveryExpeditionPage } from "../features/deliveries/DeliveryExpeditionPage";
 import { FleetAdminPage } from "../features/fleet/FleetAdminPage";
 import { DriverRouteExecutionPage } from "../features/reparto/DriverRouteExecutionPage";
+import { BreakagesLossesPage } from "../features/operations/BreakagesLossesPage";
 import { OperationalPage } from "../features/operations/OperationalPage";
 import { PlaceholderPage } from "../features/operations/PlaceholderPage";
+import { SheetCuttingPage } from "../features/operations/SheetCuttingPage";
 import { RepartoConfirmationPage } from "../features/reparto/RepartoConfirmationPage";
 import { RepartoPreparationPage } from "../features/reparto/RepartoPreparationPage";
 import { RoutePlanningPage } from "../features/routing/RoutePlanningPage";
 import { StockBalancesPage } from "../features/stock/StockBalancesPage";
 import { PreparationTasksPage } from "../features/tasks/PreparationTasksPage";
 import { TransfersPage } from "../features/transfers/TransfersPage";
+import { WarehouseMasterPage } from "../features/masters/WarehouseMasterPage";
 import { AppShell } from "../layouts/AppShell";
 import { placeholderPages, routedOperationModules } from "../shared/data/modules";
 
@@ -26,6 +29,7 @@ const legacyRedirects: RouteObject[] = [
   { path: "hojas-ruta", element: <Navigate to="/reparto/hojas-ruta" replace /> },
   { path: "vehiculos", element: <Navigate to="/maestros/vehiculos" replace /> },
   { path: "choferes", element: <Navigate to="/maestros/choferes" replace /> },
+  { path: "almacenes", element: <Navigate to="/maestros/almacenes" replace /> },
   { path: "recepciones", element: <Navigate to="/ingresos/oc" replace /> },
   { path: "transferencias", element: <Navigate to="/ingresos/tr-depositos" replace /> },
   { path: "stock", element: <Navigate to="/stock/almacenes" replace /> },
@@ -51,9 +55,12 @@ export const appRoutes: RouteObject[] = [
       { path: "reparto/chofer", element: <DriverRouteExecutionPage /> },
       { path: "maestros/vehiculos", element: <FleetAdminPage initialTab="vehicles" /> },
       { path: "maestros/choferes", element: <FleetAdminPage initialTab="drivers" /> },
+      { path: "maestros/almacenes", element: <WarehouseMasterPage /> },
       { path: "pedidos/tareas", element: <PreparationTasksPage /> },
       { path: "ingresos/tr-depositos", element: <TransfersPage /> },
       { path: "stock/almacenes", element: <StockBalancesPage /> },
+      { path: "operaciones/corte-chapas", element: <SheetCuttingPage /> },
+      { path: "operaciones/roturas-perdidas", element: <BreakagesLossesPage /> },
       ...legacyRedirects,
       ...routedOperationModules.map((module) => ({
         path: module.path.replace(/^\//, ""),

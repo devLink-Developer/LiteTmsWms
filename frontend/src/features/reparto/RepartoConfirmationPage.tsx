@@ -12,6 +12,7 @@ import {
   type ApiRepartoDelivery,
 } from "../../api/fulfillment";
 import { StatusBadge } from "../../shared/components/StatusBadge";
+import { notify, useToastError } from "../../shared/components/toast";
 import { formatAppDate } from "../../shared/utils/dateFormat";
 import { formatIdentifier } from "../../shared/utils/identifierFormat";
 import type { StatusTone } from "../../types/operations";
@@ -139,7 +140,6 @@ export function RepartoConfirmationPage() {
   const [validatedRows, setValidatedRows] = useState<Record<string, string>>({});
   const [stockResults, setStockResults] = useState<StockResultByRow>({});
   const [expandedIds, setExpandedIds] = useState<string[]>([]);
-  const [message, setMessage] = useState<string | null>(null);
 
   const deliveriesQuery = useQuery({
     queryKey: ["reparto-confirmation", plannedDate, query, statusView],
@@ -191,7 +191,7 @@ export function RepartoConfirmationPage() {
               ? await checkDeliveryStock(row.delivery_id)
               : null;
         if (!result) {
-          throw new Error("No se pudo validar stock de una fila sin entrega.");
+          throw new Error("Fila sin entrega.");
         }
         return { id: row.id, key: rowStockKey(row), result };
       });
@@ -214,11 +214,12 @@ export function RepartoConfirmationPage() {
         ...Object.fromEntries(validated.map((row) => [row.id, { key: row.key, result: row.result }])),
       }));
       setExpandedIds((current) => Array.from(new Set([...current, ...validated.map((row) => row.id)])));
-      setMessage(
-        blockedRows
-          ? `${okRows.length} con stock / ${blockedRows} con faltante. Revisa el detalle de lineas.`
-          : `${validated.length} pedido${validated.length === 1 ? "" : "s"} con stock validado. Ahora puede confirmar y reservar.`,
-      );
+      notify({
+        message: blockedRows
+          ? `${okRows.length} con stock / ${blockedRows} sin stock.`
+          : `${validated.length} pedido${validated.length === 1 ? "" : "s"} con stock.`,
+        tone: blockedRows ? "warning" : "success",
+      });
     },
   });
 
@@ -226,7 +227,7 @@ export function RepartoConfirmationPage() {
     mutationFn: async (rows: ApiRepartoDelivery[]) => {
       const missingValidation = rows.find((row) => validatedRows[row.id] !== rowStockKey(row));
       if (missingValidation) {
-        throw new Error(`Valida stock antes de confirmar ${orderRef(missingValidation)}.`);
+        throw new Error(`Stock sin validar ${orderRef(missingValidation)}.`);
       }
       return mapWithConcurrency(rows, 3, async (row) => {
         if (row.source_type === "fulfillment") {
@@ -243,7 +244,7 @@ export function RepartoConfirmationPage() {
         } else if (row.delivery_id) {
           return confirmDeliveryStock(row.delivery_id);
         }
-        throw new Error("No se pudo confirmar una fila sin entrega.");
+        throw new Error("Fila sin entrega.");
       });
     },
     onSuccess: (confirmed) => {
@@ -251,7 +252,10 @@ export function RepartoConfirmationPage() {
       setValidatedRows({});
       setStockResults({});
       setExpandedIds([]);
-      setMessage(`${confirmed.length} entrega${confirmed.length === 1 ? "" : "s"} confirmada${confirmed.length === 1 ? "" : "s"} para reparto.`);
+      notify({
+        message: `${confirmed.length} entrega${confirmed.length === 1 ? "" : "s"} confirmada${confirmed.length === 1 ? "" : "s"}.`,
+        tone: "success",
+      });
       void queryClient.invalidateQueries({ queryKey: ["reparto-confirmation"] });
     },
   });
@@ -274,15 +278,13 @@ export function RepartoConfirmationPage() {
 
   const busy = deliveriesQuery.isLoading || deliveriesQuery.isFetching || validateStockMutation.isPending || confirmMutation.isPending;
   const error = deliveriesQuery.error || validateStockMutation.error || confirmMutation.error;
+  useToastError(error);
 
   return (
     <div className="flex h-full min-h-0 flex-col gap-3 overflow-hidden p-3">
       <header className="flex shrink-0 flex-wrap items-start justify-between gap-3">
         <div className="min-w-0">
           <h1 className="text-[20px] font-semibold text-night">Confirmacion de reparto</h1>
-          <p className="mt-1 max-w-4xl text-[12px] leading-5 text-secondaryText">
-            Pedidos con metodo de entrega Reparto filtrados por fecha para reservar stock antes de ruteo.
-          </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <StatusBadge label={`${pendingCount} pendientes`} tone={pendingCount ? "warning" : "success"} />
@@ -307,17 +309,6 @@ export function RepartoConfirmationPage() {
           </button>
         </div>
       </header>
-
-      {(message || error) && (
-        <div
-          role="status"
-          className={`shrink-0 rounded border px-3 py-2 text-[12px] ${
-            error ? "border-red-200 bg-red-50 text-red-700" : "border-blue-200 bg-blue-50 text-blue-800"
-          }`}
-        >
-          {error instanceof Error ? error.message : message}
-        </div>
-      )}
 
       <section className="grid shrink-0 gap-2 rounded border border-borderSoft bg-white p-3 shadow-panel lg:grid-cols-[180px_minmax(220px,1fr)_auto]">
         <label className="grid gap-1 text-[11px] font-semibold text-secondaryText">
@@ -592,8 +583,8 @@ export function RepartoConfirmationPage() {
           {!deliveries.length && (
             <div className="px-3 py-10 text-center text-[12px] text-secondaryText">
               {deliveriesQuery.isLoading
-                ? "Cargando pedidos de reparto..."
-                : "No hay pedidos de reparto para los filtros seleccionados."}
+                ? "Cargando..."
+                : "Sin pedidos."}
             </div>
           )}
         </div>

@@ -8,6 +8,7 @@ import { MapContainer, Marker, Polyline, TileLayer, Tooltip, useMap } from "reac
 import { fetchDrivers } from "../../api/fleet";
 import { executeStop, fetchRouteSheet, fetchRouteSheets, routeCommand, type RouteSheet, type RouteStop } from "../../api/routing";
 import { StatusBadge } from "../../shared/components/StatusBadge";
+import { notify, useToastError } from "../../shared/components/toast";
 import type { StatusTone } from "../../types/operations";
 import {
   offlineRouteList,
@@ -94,7 +95,6 @@ export function DriverRouteExecutionPage() {
   const [gps, setGps] = useState<[number, number] | null>(null);
   const [offlineRoutes, setOfflineRoutes] = useState(() => offlineRouteList());
   const [pendingCount, setPendingCount] = useState(() => queuedExecutions().length);
-  const [message, setMessage] = useState<string | null>(null);
 
   const driversQuery = useQuery({ queryKey: ["drivers"], queryFn: fetchDrivers });
   const routesQuery = useQuery({
@@ -201,7 +201,7 @@ export function DriverRouteExecutionPage() {
       if (nextRoute) setRoute(nextRoute);
       setPendingCount(queuedExecutions().length);
       setOfflineRoutes(offlineRouteList());
-      setMessage("Ejecuciones offline sincronizadas.");
+      setMessage("Offline sincronizado.");
       void queryClient.invalidateQueries({ queryKey: ["driver-route-detail"] });
       void queryClient.invalidateQueries({ queryKey: ["driver-routes"] });
     },
@@ -215,7 +215,7 @@ export function DriverRouteExecutionPage() {
     if (!route) return;
     saveOfflineRoute(route);
     setOfflineRoutes(offlineRouteList());
-    setMessage(`${route.route_number} descargada para uso offline.`);
+    setMessage(`${route.route_number} offline.`);
   }
 
   async function submitExecution() {
@@ -239,7 +239,7 @@ export function DriverRouteExecutionPage() {
       setRoute(nextRoute);
       setPendingCount(queuedExecutions().length);
       setOfflineRoutes(offlineRouteList());
-      setMessage("Entrega guardada offline. Se sincronizara al recuperar senal.");
+      setMessage("Entrega offline.");
       return;
     }
     const nextRoute = await executeStop(payload);
@@ -250,6 +250,13 @@ export function DriverRouteExecutionPage() {
   }
 
   const error = driversQuery.error || routesQuery.error || routeQuery.error || commandMutation.error || syncMutation.error;
+  useToastError(error);
+
+  function setMessage(nextMessage: string | null) {
+    if (nextMessage) {
+      notify({ message: nextMessage, tone: "info" });
+    }
+  }
 
   return (
     <div className="flex h-full min-h-0 flex-col gap-3 overflow-hidden p-3">
@@ -274,19 +281,13 @@ export function DriverRouteExecutionPage() {
         </div>
       </header>
 
-      {(error || message) && (
-        <div role="status" className={`shrink-0 rounded border px-3 py-2 text-[12px] ${error ? "border-red-200 bg-red-50 text-red-700" : "border-blue-200 bg-blue-50 text-blue-800"}`}>
-          {error instanceof Error ? error.message : message}
-        </div>
-      )}
-
       <section className="grid min-h-0 flex-1 grid-cols-1 grid-rows-[auto_minmax(320px,1fr)_minmax(0,1fr)] gap-3 overflow-hidden xl:grid-cols-[330px_minmax(0,1fr)_420px] xl:grid-rows-1">
         <aside className="flex min-h-0 flex-col overflow-hidden rounded border border-borderSoft bg-surface shadow-panel">
           <div className="grid shrink-0 gap-2 border-b border-borderSoft bg-white p-3">
             <label className="grid gap-1 text-[11px] font-semibold text-secondaryText">
               Chofer
               <select value={driverRef} onChange={(event) => setDriverRef(event.target.value)} className="h-9 rounded border border-borderSoft bg-white px-2 text-[12px] text-night outline-none focus:border-primary focus:ring-2 focus:ring-primary/20">
-                <option value="">Seleccionar chofer</option>
+                <option value="">Sin chofer</option>
                 {(driversQuery.data ?? []).map((driver) => (
                   <option key={driver.id} value={driver.code}>{driver.code} / {driver.full_name}</option>
                 ))}
@@ -295,7 +296,7 @@ export function DriverRouteExecutionPage() {
             <label className="grid gap-1 text-[11px] font-semibold text-secondaryText">
               Rutas asignadas
               <select value={routeId} onChange={(event) => setRouteId(event.target.value)} className="h-9 rounded border border-borderSoft bg-white px-2 text-[12px] text-night outline-none focus:border-primary focus:ring-2 focus:ring-primary/20">
-                <option value="">Seleccionar ruta</option>
+                <option value="">Sin ruta</option>
                 {(routesQuery.data ?? []).map((summary) => (
                   <option key={summary.id} value={summary.id}>{summary.route_number} / {summary.status}</option>
                 ))}
@@ -331,7 +332,7 @@ export function DriverRouteExecutionPage() {
                 </div>
               </button>
             ))}
-            {!route && <div className="px-3 py-6 text-[12px] text-secondaryText">Selecciona una ruta asignada o descargada.</div>}
+            {!route && <div className="px-3 py-6 text-[12px] text-secondaryText">Sin ruta.</div>}
           </div>
         </aside>
 
@@ -366,7 +367,7 @@ export function DriverRouteExecutionPage() {
             <div className="flex items-start justify-between gap-2">
               <div className="min-w-0">
                 <h2 className="text-[13px] font-semibold text-night">{activeStop ? `Parada ${activeStop.sequence} / ${stopCode(activeStop)}` : "Parada"}</h2>
-                <p className="mt-1 truncate text-[11px] text-secondaryText">{activeStop?.sales_order_number || "Selecciona una parada."}</p>
+                <p className="mt-1 truncate text-[11px] text-secondaryText">{activeStop?.sales_order_number || "Sin parada."}</p>
               </div>
               <MapPin className="text-primary" size={18} />
             </div>
@@ -445,7 +446,7 @@ export function DriverRouteExecutionPage() {
               </label>
             </div>
           ) : (
-            <div className="px-3 py-6 text-[12px] text-secondaryText">Selecciona una parada para registrar la entrega.</div>
+            <div className="px-3 py-6 text-[12px] text-secondaryText">Sin parada.</div>
           )}
 
           <div className="shrink-0 border-t border-borderSoft bg-white p-3">
@@ -453,7 +454,7 @@ export function DriverRouteExecutionPage() {
               <Check size={15} />
               Registrar entrega
             </button>
-            {!canExecute && <div className="mt-2 text-[11px] text-secondaryText">La ruta debe estar en transito y la parada sin cierre.</div>}
+            {!canExecute && <div className="mt-2 text-[11px] text-secondaryText">No disponible.</div>}
           </div>
         </aside>
       </section>

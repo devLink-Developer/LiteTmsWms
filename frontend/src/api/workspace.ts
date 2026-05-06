@@ -1,4 +1,4 @@
-import { apiHeaders, apiUrl } from "./client";
+import { apiHeaders, requestJson, trackedFetch } from "./client";
 
 export type WorkspaceContext = {
   warehouse_ref: string;
@@ -9,7 +9,7 @@ export type WorkspaceContext = {
 };
 
 export async function fetchWorkspaceContext() {
-  const response = await fetch(apiUrl("/api/v1/logistics/context/"), {
+  const response = await trackedFetch("/api/v1/logistics/context/", {
     credentials: "include",
     headers: apiHeaders(),
   });
@@ -17,4 +17,14 @@ export async function fetchWorkspaceContext() {
     throw new Error(`API /api/v1/logistics/context/ respondio ${response.status}`);
   }
   return response.json() as Promise<WorkspaceContext>;
+}
+
+export async function setActiveWarehouse(warehouseRef: string) {
+  return requestJson<WorkspaceContext>("/api/v1/logistics/context/active-warehouse/", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ warehouse_ref: warehouseRef }),
+  });
 }

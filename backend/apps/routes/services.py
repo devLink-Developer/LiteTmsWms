@@ -30,7 +30,7 @@ from apps.fulfillment.services import (
     _resolve_line_item_snapshots,
 )
 from apps.inventory.models import InventoryLedgerEntry, StockState
-from apps.inventory.services import InventoryRuleError, LedgerCommand, post_ledger_entry
+from apps.inventory.services import move_prepared_stock_to_state, move_transit_stock_to_state
 from apps.logistics.parquet_master_data import warehouse_origin_snapshot
 from apps.routes.models import RouteOptimizationRun, RouteRendition, RouteRenditionLine, RouteSheet, RouteStop, RouteStopLine
 from apps.vehicles.models import Vehicle
@@ -1056,42 +1056,45 @@ def _move_line_stock(
     if quantity <= ZERO:
         return
     warehouse_ref = line.warehouse_ref or line.delivery.warehouse_ref
-    post_ledger_entry(
-        LedgerCommand(
-            idempotency_key=f"{idempotency_key}:{from_state}:out:{index}",
-            movement_type=InventoryLedgerEntry.MovementType.DISPATCH,
-            direction=InventoryLedgerEntry.Direction.DECREASE,
+    if from_state == StockState.PACKED:
+        move_prepared_stock_to_state(
             warehouse_ref=warehouse_ref,
             item_ref=line.item_ref,
-            stock_state=from_state,
             quantity=quantity,
             uom=line.uom,
+            to_state=to_state,
+            target_location_purpose="transit",
+            source_type="delivery_order",
+            source_ref=str(line.delivery_id),
             document_type=document_type,
             document_ref=document_ref,
             actor=actor,
+            idempotency_key=f"{idempotency_key}:{index}",
             reason=reason,
             legacy_sales_order_number=line.legacy_sales_order_number,
             legacy_line_id=line.legacy_line_id,
-        )
-    )
-    post_ledger_entry(
-        LedgerCommand(
-            idempotency_key=f"{idempotency_key}:{to_state}:in:{index}",
             movement_type=InventoryLedgerEntry.MovementType.DISPATCH,
-            direction=InventoryLedgerEntry.Direction.INCREASE,
-            warehouse_ref=warehouse_ref,
+        )
+        return
+    if from_state == StockState.IN_TRANSIT:
+        move_transit_stock_to_state(
+            source_warehouse_ref=warehouse_ref,
             item_ref=line.item_ref,
-            stock_state=to_state,
             quantity=quantity,
             uom=line.uom,
+            to_state=to_state,
+            target_location_purpose="available" if to_state == StockState.PACKED else "transit",
             document_type=document_type,
             document_ref=document_ref,
             actor=actor,
+            idempotency_key=f"{idempotency_key}:{index}",
             reason=reason,
             legacy_sales_order_number=line.legacy_sales_order_number,
             legacy_line_id=line.legacy_line_id,
+            movement_type=InventoryLedgerEntry.MovementType.DISPATCH,
         )
-    )
+        return
+    raise RouteRuleError("Movimiento de stock de ruta no soportado.")
 
 
 @transaction.atomic

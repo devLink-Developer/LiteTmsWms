@@ -12,7 +12,14 @@ from apps.core.models import AuditTrail, DomainEventOutbox, IdempotencyKey, Stat
 from apps.core.sequences import allocate_sequence_number
 from apps.fulfillment.services import IdempotentResult
 from apps.inventory.models import InventoryLedgerEntry, InventoryReservation, StockState
-from apps.inventory.services import InventoryRuleError, LedgerCommand, pack_reserved_inventory, post_ledger_entry, reserve_inventory
+from apps.inventory.services import (
+    InventoryRuleError,
+    move_prepared_stock_to_state,
+    move_reserved_inventory_to_preparation,
+    move_transit_stock_to_state,
+    pack_reserved_inventory,
+    reserve_inventory,
+)
 from apps.transfers.models import TransferOrder, TransferOrderLine, TransferReceipt, TransferShipment
 
 
@@ -247,6 +254,15 @@ def prepare_transfer(*, transfer_id: str, payload: dict, idempotency_key: str, a
             )
         except InventoryRuleError as exc:
             raise TransferRuleError(str(exc)) from exc
+    try:
+        move_reserved_inventory_to_preparation(
+            source_type="transfer_order",
+            source_ref=str(transfer.id),
+            actor=actor,
+            idempotency_key=f"{idempotency_key}:prepare-location",
+        )
+    except (InventoryRuleError, InventoryReservation.DoesNotExist) as exc:
+        raise TransferRuleError(str(exc)) from exc
     _transition_transfer(transfer, to_status=TransferOrder.TransferStatus.PICKING, actor=actor, reason="Preparacion de transferencia")
     result = IdempotentResult({"result": _serialize_transfer(transfer)})
     return _finish_idempotent_command(idempotency, result)
@@ -283,37 +299,21 @@ def dispatch_transfer(*, transfer_id: str, payload: dict, idempotency_key: str, 
         if line.shipped_qty >= ship_qty:
             continue
         delta = ship_qty - line.shipped_qty
-        post_ledger_entry(
-            LedgerCommand(
-                idempotency_key=f"{idempotency_key}:packed:{index}",
-                movement_type=InventoryLedgerEntry.MovementType.TRANSFER_OUT,
-                direction=InventoryLedgerEntry.Direction.DECREASE,
-                warehouse_ref=transfer.origin_warehouse_ref,
-                item_ref=line.item_ref,
-                stock_state=StockState.PACKED,
-                quantity=delta,
-                uom=line.uom,
-                document_type="transfer_order",
-                document_ref=str(transfer.id),
-                actor=actor,
-                reason="Despacho de transferencia",
-            )
-        )
-        post_ledger_entry(
-            LedgerCommand(
-                idempotency_key=f"{idempotency_key}:transit:{index}",
-                movement_type=InventoryLedgerEntry.MovementType.TRANSFER_OUT,
-                direction=InventoryLedgerEntry.Direction.INCREASE,
-                warehouse_ref=transfer.origin_warehouse_ref,
-                item_ref=line.item_ref,
-                stock_state=StockState.IN_TRANSIT,
-                quantity=delta,
-                uom=line.uom,
-                document_type="transfer_order",
-                document_ref=str(transfer.id),
-                actor=actor,
-                reason="Despacho de transferencia",
-            )
+        move_prepared_stock_to_state(
+            warehouse_ref=transfer.origin_warehouse_ref,
+            item_ref=line.item_ref,
+            quantity=delta,
+            uom=line.uom,
+            to_state=StockState.IN_TRANSIT,
+            target_location_purpose="transit",
+            source_type="transfer_order",
+            source_ref=str(transfer.id),
+            document_type="transfer_order",
+            document_ref=str(transfer.id),
+            actor=actor,
+            idempotency_key=f"{idempotency_key}:dispatch:{index}",
+            reason="Despacho de transferencia",
+            movement_type=InventoryLedgerEntry.MovementType.TRANSFER_OUT,
         )
         line.shipped_qty = ship_qty
         line.updated_by = actor
@@ -356,37 +356,20 @@ def receive_transfer(*, transfer_id: str, payload: dict, idempotency_key: str, a
             raise TransferRuleError("No se puede reducir una cantidad ya recibida.")
         delta = target_received - line.received_qty
         if delta > ZERO:
-            post_ledger_entry(
-                LedgerCommand(
-                    idempotency_key=f"{idempotency_key}:transit:{index}",
-                    movement_type=InventoryLedgerEntry.MovementType.TRANSFER_IN,
-                    direction=InventoryLedgerEntry.Direction.DECREASE,
-                    warehouse_ref=transfer.origin_warehouse_ref,
-                    item_ref=line.item_ref,
-                    stock_state=StockState.IN_TRANSIT,
-                    quantity=delta,
-                    uom=line.uom,
-                    document_type="transfer_order",
-                    document_ref=str(transfer.id),
-                    actor=actor,
-                    reason="Recepcion de transferencia",
-                )
-            )
-            post_ledger_entry(
-                LedgerCommand(
-                    idempotency_key=f"{idempotency_key}:dest:{index}",
-                    movement_type=InventoryLedgerEntry.MovementType.TRANSFER_IN,
-                    direction=InventoryLedgerEntry.Direction.INCREASE,
-                    warehouse_ref=transfer.destination_warehouse_ref,
-                    item_ref=line.item_ref,
-                    stock_state=StockState.ON_HAND,
-                    quantity=delta,
-                    uom=line.uom,
-                    document_type="transfer_order",
-                    document_ref=str(transfer.id),
-                    actor=actor,
-                    reason="Recepcion de transferencia",
-                )
+            move_transit_stock_to_state(
+                source_warehouse_ref=transfer.origin_warehouse_ref,
+                target_warehouse_ref=transfer.destination_warehouse_ref,
+                item_ref=line.item_ref,
+                quantity=delta,
+                uom=line.uom,
+                to_state=StockState.ON_HAND,
+                target_location_purpose="available",
+                document_type="transfer_order",
+                document_ref=str(transfer.id),
+                actor=actor,
+                idempotency_key=f"{idempotency_key}:receive:{index}",
+                reason="Recepcion de transferencia",
+                movement_type=InventoryLedgerEntry.MovementType.TRANSFER_IN,
             )
         line.received_qty = target_received
         line.difference_qty = line.shipped_qty - line.received_qty

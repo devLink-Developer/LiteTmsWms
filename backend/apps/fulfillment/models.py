@@ -54,6 +54,75 @@ class FulfillmentOrderLine(TimestampedModel, LegacyReferenceModel):
         ]
 
 
+class FulfillmentOrderImpact(TimestampedModel, LegacyReferenceModel):
+    class ImpactType(models.TextChoices):
+        ANNULMENT = "annulment", "Anulacion"
+        RETURN = "return", "Devolucion"
+
+    class ImpactStatus(models.TextChoices):
+        PENDING = "pending", "Pendiente"
+        APPLIED = "applied", "Aplicado"
+
+    fulfillment = models.ForeignKey(
+        FulfillmentOrder,
+        related_name="impacts",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+    impact_type = models.CharField(max_length=20, choices=ImpactType.choices)
+    status = models.CharField(max_length=20, choices=ImpactStatus.choices, default=ImpactStatus.PENDING)
+    impact_sales_order_number = models.CharField(max_length=60, blank=True)
+    impact_transaction_number = models.CharField(max_length=60, blank=True)
+    impact_date = models.DateTimeField(null=True, blank=True)
+    payload = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["impact_type", "status"], name="fulfillmen_impact_f2a1c7_idx"),
+            models.Index(fields=["legacy_sales_order_number", "impact_type"], name="fulfillmen_legacy__fb508f_idx"),
+            models.Index(fields=["impact_sales_order_number"], name="fulfillmen_impact_7e826d_idx"),
+        ]
+        constraints = [
+            models.UniqueConstraint(fields=["source_table", "source_pk"], name="ful_order_impact_source_uniq"),
+        ]
+
+
+class FulfillmentOrderImpactLine(TimestampedModel, LegacyReferenceModel):
+    impact = models.ForeignKey(FulfillmentOrderImpact, related_name="lines", on_delete=models.CASCADE)
+    fulfillment_line = models.ForeignKey(
+        FulfillmentOrderLine,
+        related_name="impact_lines",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+    quantity = models.DecimalField(max_digits=18, decimal_places=6)
+    applied_qty = models.DecimalField(max_digits=18, decimal_places=6, default=0)
+    uom = models.CharField(max_length=20)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["legacy_line_id"], name="fulfillmen_legacy__e44782_idx"),
+            models.Index(fields=["item_ref", "warehouse_ref"], name="fulfillmen_item_re_b21e0d_idx"),
+        ]
+        constraints = [
+            models.UniqueConstraint(fields=["impact", "source_pk"], name="ful_order_impact_line_source_uniq"),
+        ]
+
+
+class LegacyOrderSyncCursor(TimestampedModel):
+    name = models.CharField(max_length=120, unique=True)
+    last_modified_datetime = models.DateTimeField(null=True, blank=True)
+    last_source_pk = models.CharField(max_length=120, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["name"], name="fulfillmen_name_6aa941_idx"),
+            models.Index(fields=["last_modified_datetime", "last_source_pk"], name="fulfillmen_last_mo_82c92d_idx"),
+        ]
+
+
 class DeliveryOrder(TimestampedModel, LegacyReferenceModel):
     class DeliveryStatus(models.TextChoices):
         CREATED = "created", "Creada"

@@ -10,3 +10,5 @@ staticfiles/
 .env
 coverage/
 *.log
+atributos_cache.parquet
+materiales_PS003MT.parquet

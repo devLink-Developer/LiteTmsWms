@@ -1,4 +1,4 @@
-import { apiGet, apiHeaders, apiPost, apiUrl } from "./client";
+import { apiGet, apiHeaders, apiPost, trackedFetch, type RequestTrackingOptions } from "./client";
 
 export type ApiFulfillmentLine = {
   id: string;
@@ -14,6 +14,7 @@ export type ApiFulfillmentLine = {
   prepared_qty: string;
   delivered_qty: string;
   cancelled_qty: string;
+  returned_qty?: string;
   pending_qty: string;
   planned_qty?: string;
   stock_available?: string;
@@ -129,6 +130,44 @@ export type ApiDeliveryOrder = {
     planned_weight_kg: string;
     planned_volume_m3: string;
   };
+  movements?: ApiLogisticsMovement[];
+};
+
+export type ApiLogisticsMovement = {
+  key: string;
+  at: string | null;
+  label: string;
+  status?: string;
+  detail?: string;
+  actor?: string;
+  source_type?: string;
+  source_ref?: string;
+  route_number?: string;
+  document_number?: string;
+  delivered_qty?: string;
+  returned_qty?: string;
+  uom?: string;
+};
+
+export type ApiFulfillmentImpact = {
+  id: string;
+  type: "anulacion" | "devolucion";
+  impact_type: "annulment" | "return";
+  status: string;
+  sales_order_number: string;
+  transaction_number: string;
+  original_sales_order_number: string;
+  warehouse_ref: string;
+  impact_date: string | null;
+  lines: Array<{
+    id: string;
+    fulfillment_line_id?: string;
+    item_ref: string;
+    warehouse_ref: string;
+    quantity: string;
+    applied_qty: string;
+    uom: string;
+  }>;
 };
 
 export type ApiRepartoDelivery = {
@@ -213,6 +252,7 @@ export type ApiFulfillmentOrder = {
   updated_at: string;
   fulfillment_number: string;
   status: string;
+  sales_order_type?: string;
   sales_order_number: string;
   transaction_number: string;
   customer_ref: string;
@@ -226,10 +266,17 @@ export type ApiFulfillmentOrder = {
   source_hash: string;
   lines: ApiFulfillmentLine[];
   deliveries: ApiDeliveryOrder[];
+  impacts?: ApiFulfillmentImpact[];
+  movements?: ApiLogisticsMovement[];
 };
 
 type CommandResult<T> = {
   result: T;
+};
+
+export type ExpeditionCommandOptions = {
+  allow_past_reparto_date?: boolean;
+  target_warehouse_ref?: string;
 };
 
 export type ExpeditionQueueSearch = {
@@ -238,7 +285,7 @@ export type ExpeditionQueueSearch = {
 };
 
 function expeditionQueuePath(search: ExpeditionQueueSearch) {
-  const params = new URLSearchParams({ pending_delivery: "true" });
+  const params = new URLSearchParams();
   if (search.mode === "sales_order") {
     params.set("sales_order_number", search.value);
   }
@@ -251,8 +298,8 @@ function expeditionQueuePath(search: ExpeditionQueueSearch) {
   return `/api/v1/fulfillment/expedition-queue/?${params.toString()}`;
 }
 
-export async function fetchExpeditionQueue(search: ExpeditionQueueSearch) {
-  const result = await apiGet<ApiFulfillmentOrder>(expeditionQueuePath(search));
+export async function fetchExpeditionQueue(search: ExpeditionQueueSearch, options?: RequestTrackingOptions) {
+  const result = await apiGet<ApiFulfillmentOrder>(expeditionQueuePath(search), options);
   if (result.error) {
     throw new Error(result.error.message);
   }
@@ -286,7 +333,7 @@ export async function splitFulfillmentDelivery(
     receiver?: string;
     reference?: string;
     lines: Array<{ fulfillment_line_id: string; delivery_unit_qty?: number; split_qty?: number }>;
-  },
+  } & ExpeditionCommandOptions,
 ) {
   const result = await apiPost<CommandResult<ApiDeliveryOrder>>(`/api/v1/fulfillment/${fulfillmentId}/split`, payload);
   return result.result;
@@ -295,45 +342,58 @@ export async function splitFulfillmentDelivery(
 export async function checkFulfillmentStock(
   fulfillmentId: string,
   lines: Array<{ fulfillment_line_id: string; delivery_unit_qty?: number; split_qty?: number }>,
+  options: ExpeditionCommandOptions = {},
 ) {
   const result = await apiPost<CommandResult<ApiStockValidationResult>>(
     `/api/v1/fulfillment/${fulfillmentId}/stock-check`,
-    { lines },
+    { lines, ...options },
   );
   return result.result;
 }
 
-export async function checkDeliveryStock(deliveryId: string) {
+export async function checkDeliveryStock(deliveryId: string, options: ExpeditionCommandOptions = {}) {
   const result = await apiPost<CommandResult<ApiStockValidationResult>>(
     `/api/v1/fulfillment/deliveries/${deliveryId}/stock-check`,
+    options,
   );
   return result.result;
 }
 
-export async function confirmDeliveryStock(deliveryId: string) {
+export async function confirmDeliveryStock(deliveryId: string, options: ExpeditionCommandOptions = {}) {
   const result = await apiPost<CommandResult<ApiDeliveryOrder>>(
     `/api/v1/fulfillment/deliveries/${deliveryId}/validate-stock`,
+    options,
   );
   return result.result;
 }
 
-export async function sendDeliveryToPrepare(deliveryId: string) {
+export async function reassignDeliveryWarehouse(deliveryId: string, payload: Required<ExpeditionCommandOptions>) {
+  const result = await apiPost<CommandResult<ApiDeliveryOrder>>(
+    `/api/v1/fulfillment/deliveries/${deliveryId}/reassign-warehouse`,
+    payload,
+  );
+  return result.result;
+}
+
+export async function sendDeliveryToPrepare(deliveryId: string, options: ExpeditionCommandOptions = {}) {
   const result = await apiPost<CommandResult<ApiDeliveryOrder>>(
     `/api/v1/fulfillment/deliveries/${deliveryId}/send-to-prepare`,
+    options,
   );
   return result.result;
 }
 
-export async function markDeliveryPrepared(deliveryId: string) {
+export async function markDeliveryPrepared(deliveryId: string, options: ExpeditionCommandOptions = {}) {
   const result = await apiPost<CommandResult<ApiDeliveryOrder>>(
     `/api/v1/fulfillment/deliveries/${deliveryId}/mark-prepared`,
+    options,
   );
   return result.result;
 }
 
-export async function fetchPreparationTasks(status = "open") {
+export async function fetchPreparationTasks(status = "open", options?: RequestTrackingOptions) {
   const params = new URLSearchParams({ status });
-  const result = await apiGet<ApiPreparationTaskListItem>(`/api/v1/fulfillment/preparation-tasks/?${params.toString()}`);
+  const result = await apiGet<ApiPreparationTaskListItem>(`/api/v1/fulfillment/preparation-tasks/?${params.toString()}`, options);
   if (result.error) {
     throw new Error(result.error.message);
   }
@@ -347,18 +407,18 @@ export async function markPreparationTaskPrepared(taskId: string) {
   return result.result;
 }
 
-export async function issueDeliveryRemito(deliveryId: string) {
-  const result = await apiPost<CommandResult<ApiDeliveryDocument>>(`/api/v1/fulfillment/deliveries/${deliveryId}/remito`);
+export async function issueDeliveryRemito(deliveryId: string, options: ExpeditionCommandOptions = {}) {
+  const result = await apiPost<CommandResult<ApiDeliveryDocument>>(`/api/v1/fulfillment/deliveries/${deliveryId}/remito`, options);
   return result.result;
 }
 
 export async function downloadDeliveryRemitoPdf(deliveryId: string, documentNumber?: string) {
-  const response = await fetch(apiUrl(`/api/v1/fulfillment/deliveries/${deliveryId}/remito.pdf`), {
+  const response = await trackedFetch(`/api/v1/fulfillment/deliveries/${deliveryId}/remito.pdf`, {
     credentials: "include",
     headers: apiHeaders({ Accept: "application/pdf" }),
-  });
+  }, "Descargando remito...");
   if (!response.ok) {
-    throw new Error(`No se pudo descargar el remito PDF (${response.status}).`);
+    throw new Error(`Remito PDF no descargado (${response.status}).`);
   }
   const blob = await response.blob();
   const url = URL.createObjectURL(blob);

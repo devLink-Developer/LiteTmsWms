@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { fetchInventoryStockReport, type InventoryBalance, type InventoryStockReportRow } from "../../api/inventory";
 import { fetchWarehouseOptionsForStore, type WarehouseOption } from "../../api/routing";
 import { StatusBadge } from "../../shared/components/StatusBadge";
+import { notify } from "../../shared/components/toast";
 import { useWorkspaceStore } from "../../stores/useWorkspaceStore";
 import type { StatusTone } from "../../types/operations";
 
@@ -27,12 +28,8 @@ type KpiTile = {
 };
 
 const quantityColumns: QuantityColumn[] = [
-  { key: "on_hand", label: "Disponible", shortLabel: "Disp.", tone: "success" },
-  { key: "reserved", label: "Reservado", shortLabel: "Res.", tone: "warning" },
-  { key: "picking", label: "En Preparacion", shortLabel: "Prep.", tone: "warning" },
-  { key: "packed", label: "Preparado", shortLabel: "Listo", tone: "info" },
-  { key: "in_transit", label: "Transito", shortLabel: "Trans.", tone: "info" },
-  { key: "scrapped", label: "Roto", shortLabel: "Roto", tone: "danger" },
+  { key: "packed", label: "Disponible entrega", shortLabel: "Entrega", tone: "success" },
+  { key: "on_hand", label: "Disponible fisico", shortLabel: "Fisico", tone: "info" },
 ];
 
 const stateLabels: Record<string, string> = {
@@ -100,6 +97,10 @@ function rowLocation(row: InventoryStockReportRow) {
   return row.warehouse_location_ref || row.location_ref || "";
 }
 
+function rowAvailableQuantity(row: InventoryStockReportRow) {
+  return rowQuantity(row, "packed") + rowQuantity(row, "on_hand");
+}
+
 function rowCategory(row: InventoryStockReportRow) {
   return row.category_ref || row.rubro_ref || row.category || "";
 }
@@ -125,17 +126,11 @@ function rowTotal(row: InventoryStockReportRow) {
   return quantityColumns.reduce((total, column) => total + rowQuantity(row, column.key), 0);
 }
 
-function hasAlert(row: InventoryStockReportRow) {
-  return rowQuantity(row, "reserved") > rowQuantity(row, "on_hand") || rowQuantity(row, "scrapped") > 0;
-}
-
 function buildKpis(rows: InventoryStockReportRow[], visibleRows: InventoryStockReportRow[], allowedWarehouses: string[]): KpiTile[] {
-  const totalAvailable = visibleRows.reduce((total, row) => total + rowQuantity(row, "on_hand"), 0);
-  const totalCommitted = visibleRows.reduce((total, row) => total + rowQuantity(row, "reserved") + rowQuantity(row, "picking") + rowQuantity(row, "packed"), 0);
-  const alertRows = visibleRows.filter(hasAlert).length;
+  const totalAvailable = visibleRows.reduce((total, row) => total + rowAvailableQuantity(row), 0);
   return [
     {
-      label: "Buckets",
+      label: "Posiciones",
       value: String(visibleRows.length),
       hint: `${uniqueSorted(visibleRows.map((row) => row.item_ref)).length} productos`,
       tone: "info",
@@ -153,10 +148,10 @@ function buildKpis(rows: InventoryStockReportRow[], visibleRows: InventoryStockR
       tone: totalAvailable ? "success" : "neutral",
     },
     {
-      label: "Comprometido",
-      value: formatNumber(totalCommitted),
-      hint: alertRows ? `${alertRows} alertas` : "sin alertas",
-      tone: alertRows ? "danger" : totalCommitted ? "warning" : "neutral",
+      label: "Ubicaciones",
+      value: String(uniqueSorted(visibleRows.map(rowLocation)).length),
+      hint: "dispatchables",
+      tone: visibleRows.length ? "success" : "neutral",
     },
   ];
 }
@@ -180,6 +175,12 @@ function applyFilters(rows: InventoryStockReportRow[], filters: StockFilters) {
       row.item_name,
       row.warehouse_ref,
       location,
+      row.location_name,
+      row.zone_ref,
+      row.aisle,
+      row.floor,
+      row.level,
+      row.position,
       row.supplier_ref,
       category,
       row.lot_ref,
@@ -193,6 +194,20 @@ function applyFilters(rows: InventoryStockReportRow[], filters: StockFilters) {
 
 function filterCount(filters: StockFilters) {
   return Object.values(filters).filter(Boolean).length;
+}
+
+function hasReportFilters(filters: StockFilters, serverSearch: string) {
+  return Boolean(
+    filters.warehouse ||
+      filters.location ||
+      filters.item ||
+      filters.supplier ||
+      filters.category ||
+      filters.lot ||
+      filters.pallet ||
+      filters.quality ||
+      serverSearch.trim(),
+  );
 }
 
 function selectOptions(rows: InventoryStockReportRow[], key: "location" | "supplier" | "category" | "lot" | "pallet" | "quality") {
@@ -283,12 +298,18 @@ export function StockBalancesPage() {
   const [selectedId, setSelectedId] = useState("");
   const [detailOpen, setDetailOpen] = useState(true);
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
   const [serverSearch, setServerSearch] = useState("");
+  const hasActiveReportFilters = hasReportFilters(filters, serverSearch);
 
   async function loadReport() {
+    if (!hasActiveReportFilters) {
+      setRows([]);
+      setAllowedWarehouses([]);
+      setSelectedId("");
+      setLoading(false);
+      return;
+    }
     setLoading(true);
-    setError("");
     try {
       const payload = await fetchInventoryStockReport({
         warehouse: filters.warehouse,
@@ -299,6 +320,8 @@ export function StockBalancesPage() {
         lot: filters.lot,
         pallet: filters.pallet,
         quality: filters.quality,
+        state: "packed,on_hand",
+        locationScope: "available",
         search: serverSearch,
         limit: filters.item || filters.location || filters.supplier || filters.category || filters.lot || filters.pallet || filters.quality || serverSearch ? 500 : 300,
       });
@@ -313,15 +336,22 @@ export function StockBalancesPage() {
     } catch (apiError) {
       setRows([]);
       setSelectedId("");
-      setError(apiError instanceof Error ? apiError.message : "No se pudo cargar stock.");
+      notify({ message: apiError instanceof Error ? apiError.message : "Stock no cargado.", tone: "error" });
     } finally {
       setLoading(false);
     }
   }
 
   useEffect(() => {
+    if (!hasActiveReportFilters) {
+      setRows([]);
+      setAllowedWarehouses([]);
+      setSelectedId("");
+      setLoading(false);
+      return;
+    }
     void loadReport();
-  }, [filters.warehouse, filters.location, filters.item, filters.supplier, filters.category, filters.lot, filters.pallet, filters.quality, serverSearch]);
+  }, [filters.warehouse, filters.location, filters.item, filters.supplier, filters.category, filters.lot, filters.pallet, filters.quality, hasActiveReportFilters, serverSearch]);
 
   useEffect(() => {
     const handle = window.setTimeout(() => setServerSearch(filters.search), 350);
@@ -338,7 +368,9 @@ export function StockBalancesPage() {
   const visibleRows = useMemo(() => applyFilters(rows, filters), [rows, filters]);
   const selectedRow = visibleRows.find((row) => row.id === selectedId) ?? visibleRows[0];
   const selectedBalances = selectedRow ? balanceRows(selectedRow) : [];
-  const warehouseCodes = allowedWarehouses.length ? allowedWarehouses : uniqueSorted(rows.map((row) => row.warehouse_ref));
+  const warehouseCodes = allowedWarehouses.length
+    ? allowedWarehouses
+    : uniqueSorted(warehouseOptions.map((warehouse) => warehouse.warehouse_code));
   const kpis = buildKpis(rows, visibleRows, warehouseCodes);
   const activeFilters = filterCount(filters);
 
@@ -356,7 +388,6 @@ export function StockBalancesPage() {
         <header className="flex shrink-0 flex-wrap items-center justify-between gap-2">
           <div className="min-w-0">
             <h1 className="text-[18px] font-semibold text-night">Stock por almacen</h1>
-            <p className="mt-0.5 text-[12px] leading-4 text-secondaryText">Informe operativo por ubicacion, bucket logistico y estado de stock.</p>
           </div>
           <div className="flex items-center gap-2">
             <button
@@ -371,7 +402,7 @@ export function StockBalancesPage() {
             <button
               type="button"
               onClick={() => void loadReport()}
-              disabled={loading}
+              disabled={loading || !hasActiveReportFilters}
               className="inline-flex min-h-9 items-center gap-2 rounded border border-borderSoft bg-white px-3 text-[12px] font-semibold text-night transition hover:border-primary hover:text-primaryHover focus:outline-none focus:ring-2 focus:ring-primary/20 disabled:bg-softStart"
             >
               <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} aria-hidden="true" />
@@ -461,7 +492,7 @@ export function StockBalancesPage() {
                   value={filters.search}
                   onChange={(event) => updateFilter("search", event.target.value)}
                   className="h-8 w-full rounded border border-borderSoft bg-white pl-8 pr-2 text-[12px] font-medium text-night outline-none focus:border-primary focus:ring-2 focus:ring-primary/20"
-                  placeholder="Articulo, ubicacion, proveedor, lote, pallet o calidad"
+                  placeholder="Articulo, ubicacion, zona, pasillo o lote"
                 />
               </span>
             </label>
@@ -484,25 +515,26 @@ export function StockBalancesPage() {
           <div className="flex min-h-9 items-center justify-between border-b border-borderSoft px-3">
             <div className="flex items-center gap-2 text-[12px] font-semibold text-night">
               <PackageSearch className="h-4 w-4 text-primaryHover" aria-hidden="true" />
-              {loading ? "Cargando informe..." : `${visibleRows.length} buckets`}
+              {loading ? "Cargando..." : `${visibleRows.length} buckets`}
             </div>
-            <div className={`text-[11px] ${error ? "font-semibold text-red-700" : "text-secondaryText"}`} role={error ? "alert" : undefined}>
-              {error || `${warehouseCodes.length} almacenes habilitados`}
-            </div>
+            <div className="text-[11px] text-secondaryText">{warehouseCodes.length} almacenes habilitados</div>
           </div>
 
           <div className="min-h-0 flex-1 overflow-auto">
-            <table className="w-full min-w-[1180px] border-collapse text-left text-[12px]">
+            <table className="w-full min-w-[1260px] border-collapse text-left text-[12px]">
               <thead className="sticky top-0 z-10 bg-deep text-white">
                 <tr>
                   <th className="w-[120px] px-2 py-2 font-semibold">Almacen</th>
-                  <th className="w-[115px] px-2 py-2 font-semibold">Ubicacion</th>
+                  <th className="w-[140px] px-2 py-2 font-semibold">Ubicacion</th>
+                  <th className="w-[150px] px-2 py-2 font-semibold">Nombre</th>
+                  <th className="w-[70px] px-2 py-2 font-semibold">Zona</th>
+                  <th className="w-[70px] px-2 py-2 font-semibold">Pasillo</th>
+                  <th className="w-[60px] px-2 py-2 font-semibold">Piso</th>
+                  <th className="w-[60px] px-2 py-2 font-semibold">Nivel</th>
+                  <th className="w-[70px] px-2 py-2 font-semibold">Posicion</th>
                   <th className="w-[240px] px-2 py-2 font-semibold">Producto</th>
-                  <th className="w-[105px] px-2 py-2 font-semibold">Proveedor</th>
                   <th className="w-[105px] px-2 py-2 font-semibold">Rubro</th>
                   <th className="w-[90px] px-2 py-2 font-semibold">Lote</th>
-                  <th className="w-[90px] px-2 py-2 font-semibold">Pallet</th>
-                  <th className="w-[90px] px-2 py-2 font-semibold">Calidad</th>
                   {quantityColumns.map((column) => (
                     <th key={column.key} className="w-[92px] px-2 py-2 text-right font-semibold" title={column.label}>
                       {column.shortLabel}
@@ -514,7 +546,6 @@ export function StockBalancesPage() {
               <tbody>
                 {visibleRows.map((row) => {
                   const selected = row.id === selectedRow?.id;
-                  const alert = hasAlert(row);
                   return (
                     <tr
                       key={row.id}
@@ -523,15 +554,18 @@ export function StockBalancesPage() {
                     >
                       <td className="whitespace-nowrap px-2 py-1.5 font-mono font-semibold text-night">{row.warehouse_ref}</td>
                       <td className="whitespace-nowrap px-2 py-1.5 font-mono text-night">{compactValue(rowLocation(row))}</td>
+                      <td className="whitespace-nowrap px-2 py-1.5 text-secondaryText">{compactValue(row.location_name)}</td>
+                      <td className="whitespace-nowrap px-2 py-1.5 font-mono text-secondaryText">{compactValue(row.zone_ref)}</td>
+                      <td className="whitespace-nowrap px-2 py-1.5 font-mono text-secondaryText">{compactValue(row.aisle)}</td>
+                      <td className="whitespace-nowrap px-2 py-1.5 font-mono text-secondaryText">{compactValue(row.floor)}</td>
+                      <td className="whitespace-nowrap px-2 py-1.5 font-mono text-secondaryText">{compactValue(row.level)}</td>
+                      <td className="whitespace-nowrap px-2 py-1.5 font-mono text-secondaryText">{compactValue(row.position)}</td>
                       <td className="px-2 py-1.5">
                         <div className="font-mono font-semibold text-night">{row.item_ref}</div>
                         {row.item_name ? <div className="max-w-[240px] truncate text-[11px] text-secondaryText" title={row.item_name}>{row.item_name}</div> : null}
                       </td>
-                      <td className="whitespace-nowrap px-2 py-1.5 font-mono text-secondaryText">{compactValue(row.supplier_ref)}</td>
                       <td className="whitespace-nowrap px-2 py-1.5 text-secondaryText">{compactValue(rowCategory(row))}</td>
                       <td className="whitespace-nowrap px-2 py-1.5 font-mono text-secondaryText">{compactValue(row.lot_ref)}</td>
-                      <td className="whitespace-nowrap px-2 py-1.5 font-mono text-secondaryText">{compactValue(row.pallet_ref)}</td>
-                      <td className="whitespace-nowrap px-2 py-1.5">{row.quality_status ? <StatusBadge label={row.quality_status} tone={alert ? "danger" : "neutral"} /> : "-"}</td>
                       {quantityColumns.map((column) => (
                         <td key={column.key} className="px-2 py-1.5 text-right">
                           <QuantityCell value={rowQuantity(row, column.key)} uom={row.uom} tone={column.tone} />
@@ -543,8 +577,8 @@ export function StockBalancesPage() {
                 })}
                 {!visibleRows.length && (
                   <tr>
-                    <td colSpan={15} className="px-3 py-12 text-center text-[12px] text-secondaryText">
-                      {loading ? "Cargando..." : "No hay stock para los filtros seleccionados."}
+                    <td colSpan={14} className="px-3 py-12 text-center text-[12px] text-secondaryText">
+                      {loading ? "Cargando..." : hasActiveReportFilters ? "Sin stock." : "Sin filtros."}
                     </td>
                   </tr>
                 )}
@@ -561,7 +595,6 @@ export function StockBalancesPage() {
               <Layers3 className="h-4 w-4 text-primaryHover" aria-hidden="true" />
               Detalle compacto
             </div>
-            <StatusBadge label="solo lectura" tone="neutral" />
           </div>
           {selectedRow ? (
             <div className="flex h-full min-h-0 flex-col overflow-auto p-3">
@@ -590,19 +623,21 @@ export function StockBalancesPage() {
                 <dl className="grid grid-cols-2 gap-x-3 gap-y-1 text-[12px]">
                   <dt className="font-semibold text-secondaryText">Ubicacion</dt>
                   <dd className="font-mono text-night">{compactValue(rowLocation(selectedRow))}</dd>
-                  <dt className="font-semibold text-secondaryText">Proveedor</dt>
-                  <dd className="font-mono text-night">{compactValue(selectedRow.supplier_ref)}</dd>
+                  <dt className="font-semibold text-secondaryText">Nombre</dt>
+                  <dd className="text-night">{compactValue(selectedRow.location_name)}</dd>
+                  <dt className="font-semibold text-secondaryText">Zona / Pasillo</dt>
+                  <dd className="font-mono text-night">{compactValue(selectedRow.zone_ref)} / {compactValue(selectedRow.aisle)}</dd>
+                  <dt className="font-semibold text-secondaryText">Piso / Nivel / Pos.</dt>
+                  <dd className="font-mono text-night">{compactValue(selectedRow.floor)} / {compactValue(selectedRow.level)} / {compactValue(selectedRow.position)}</dd>
                   <dt className="font-semibold text-secondaryText">Rubro</dt>
                   <dd className="text-night">{compactValue(rowCategory(selectedRow))}</dd>
-                  <dt className="font-semibold text-secondaryText">Lote / Pallet</dt>
-                  <dd className="font-mono text-night">{compactValue(selectedRow.lot_ref)} / {compactValue(selectedRow.pallet_ref)}</dd>
-                  <dt className="font-semibold text-secondaryText">Calidad</dt>
-                  <dd className="text-night">{compactValue(selectedRow.quality_status)}</dd>
+                  <dt className="font-semibold text-secondaryText">Lote</dt>
+                  <dd className="font-mono text-night">{compactValue(selectedRow.lot_ref)}</dd>
                 </dl>
               </section>
 
               <section className="grid gap-2 border-b border-borderSoft py-3">
-                <div className="text-[12px] font-semibold text-night">Cantidades por estado</div>
+                <div className="text-[12px] font-semibold text-night">Saldo disponible</div>
                 <div className="grid grid-cols-2 gap-2">
                   {quantityColumns.map((column) => (
                     <div key={column.key} className="rounded border border-borderSoft bg-white px-2 py-2">
@@ -642,14 +677,14 @@ export function StockBalancesPage() {
                     </table>
                   </div>
                 ) : (
-                  <div className="rounded border border-borderSoft bg-softMid px-3 py-2 text-[12px] text-secondaryText">El endpoint de informe no envio balances base para este bucket.</div>
+                  <div className="rounded border border-borderSoft bg-softMid px-3 py-2 text-[12px] text-secondaryText">Sin balances base.</div>
                 )}
               </section>
             </div>
           ) : (
             <div className="flex h-full min-h-64 flex-col items-center justify-center gap-2 px-6 text-center text-[12px] text-secondaryText">
               <AlertTriangle className="h-6 w-6 text-secondaryText" aria-hidden="true" />
-              No hay un renglon seleccionado.
+              Sin renglon seleccionado.
             </div>
           )}
         </aside>

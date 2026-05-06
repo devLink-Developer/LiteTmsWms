@@ -22,6 +22,7 @@ from apps.fulfillment.services import (
     mark_preparation_task_prepared,
     physical_delivery_lines_from_snapshots,
     physical_fulfillment_lines_from_snapshots,
+    reassign_confirmed_delivery_warehouse,
     send_delivery_to_prepare,
     split_fulfillment_delivery,
     validate_delivery_stock,
@@ -35,6 +36,7 @@ from apps.fulfillment.services import (
     _with_display_uom,
 )
 from apps.integrations.legacy.models import LegacyOrder
+from apps.inventory.models import InventoryReservation
 from apps.logistics.parquet_master_data import MasterDataSourceError, employee_delivery_permissions
 
 
@@ -69,6 +71,60 @@ def _forbidden_without_warehouse(authorized_warehouses: list[str]):
     )
 
 
+def _truthy_payload_flag(payload: dict, key: str) -> bool:
+    value = payload.get(key)
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().casefold() in {"1", "true", "yes", "si", "s"}
+
+
+def _active_warehouse_ref(request, authorized_warehouses: list[str]) -> str:
+    session_active = str(request.session.get("active_warehouse_ref", "") if hasattr(request, "session") else "").strip()
+    if session_active:
+        return session_active
+    return authorized_warehouses[0] if authorized_warehouses else ""
+
+
+def _target_warehouse_from_payload(request, payload: dict, authorized_warehouses: list[str]):
+    target = str(payload.get("target_warehouse_ref") or payload.get("warehouse_ref") or "").strip()
+    if not target and _truthy_payload_flag(payload, "allow_past_reparto_date"):
+        target = _active_warehouse_ref(request, authorized_warehouses)
+    if not target:
+        return "", None
+    if target not in {str(warehouse).strip() for warehouse in authorized_warehouses if str(warehouse).strip()}:
+        return "", error_response("forbidden", "El deposito activo no esta autorizado para el usuario.", status=403)
+    return target, None
+
+
+def _cross_warehouse_conflict_response(delivery: DeliveryOrder, target_warehouse_ref: str):
+    return error_response(
+        "cross_warehouse_confirmed_delivery",
+        f"La entrega {delivery.delivery_number} ya esta confirmada en el deposito {delivery.warehouse_ref}.",
+        status=409,
+        details={
+            "delivery_id": str(delivery.id),
+            "delivery_number": delivery.delivery_number,
+            "fulfillment_id": str(delivery.fulfillment_id),
+            "sales_order_number": delivery.legacy_sales_order_number,
+            "source_warehouse_ref": delivery.warehouse_ref,
+            "target_warehouse_ref": target_warehouse_ref,
+            "status": delivery.status,
+        },
+    )
+
+
+def _confirmed_cross_warehouse_delivery(fulfillment_id, target_warehouse_ref: str, *, exclude_delivery_id=None):
+    if not target_warehouse_ref:
+        return None
+    queryset = DeliveryOrder.objects.filter(
+        fulfillment_id=fulfillment_id,
+        status=DeliveryOrder.DeliveryStatus.CONFIRMED,
+    ).exclude(warehouse_ref=target_warehouse_ref)
+    if exclude_delivery_id:
+        queryset = queryset.exclude(id=exclude_delivery_id)
+    return queryset.order_by("created_at").first()
+
+
 def _queue_filters(request) -> dict[str, str]:
     query = request.GET.get("q", "").strip()
     sales_order_number = (
@@ -101,10 +157,51 @@ def _queue_filters(request) -> dict[str, str]:
 
 @require_GET
 def fulfillment_orders(request):
+    query = request.GET.get("q", "").strip() or request.GET.get("busqueda", "").strip()
+    status = request.GET.get("status", "").strip() or request.GET.get("estado", "").strip()
+    warehouse = request.GET.get("warehouse", "").strip() or request.GET.get("warehouse_ref", "").strip()
+    requested_date = parse_date(str(request.GET.get("requested_date") or request.GET.get("planned_date") or request.GET.get("fecha") or ""))
+
+    def filter_serialized(rows: list[dict]) -> list[dict]:
+        filtered = rows
+        if status:
+            filtered = [row for row in filtered if str(row.get("status") or "").lower() == status.lower()]
+        if warehouse:
+            filtered = [row for row in filtered if warehouse.lower() in str(row.get("warehouse_ref") or "").lower()]
+        if requested_date:
+            filtered = [row for row in filtered if row.get("requested_date") == requested_date.isoformat()]
+        return filtered
+
+    if query:
+        queue_filters = _queue_filters(request)
+        if any(queue_filters.values()):
+            try:
+                queue_rows = filter_serialized(expedition_queue(**queue_filters))
+            except MasterDataSourceError as exc:
+                return error_response("master_data_unavailable", str(exc), status=503)
+            if queue_rows:
+                return json_response({"results": queue_rows})
+
     rows = FulfillmentOrder.objects.annotate(
         lines_total=Count("lines", distinct=True),
         deliveries_total=Count("deliveries", distinct=True),
-    ).order_by("-created_at")[:100]
+    ).order_by("-updated_at", "-created_at")
+    if query:
+        rows = rows.filter(
+            Q(fulfillment_number__icontains=query)
+            | Q(legacy_sales_order_number__icontains=query)
+            | Q(legacy_transaction_number__icontains=query)
+            | Q(customer_ref__icontains=query)
+            | Q(deliveries__delivery_number__icontains=query)
+            | Q(deliveries__documents__document_number__icontains=query)
+        )
+    if status:
+        rows = rows.filter(status=status)
+    if warehouse:
+        rows = rows.filter(warehouse_ref__icontains=warehouse)
+    if requested_date:
+        rows = rows.filter(requested_date=requested_date)
+    rows = rows.distinct()[:100]
     return json_response(
         {
             "results": [
@@ -581,13 +678,22 @@ def check_fulfillment_stock(request, fulfillment_id):
         forbidden = _forbidden_without_warehouse(authorized_warehouses)
         if forbidden:
             return forbidden
-        forbidden = _forbidden_for_fulfillment_id(fulfillment_id)
+        allow_past_reparto_date = _truthy_payload_flag(payload, "allow_past_reparto_date")
+        target_warehouse_ref, forbidden = _target_warehouse_from_payload(request, payload, authorized_warehouses)
         if forbidden:
             return forbidden
+        if not allow_past_reparto_date:
+            forbidden = _forbidden_for_fulfillment_id(fulfillment_id)
+            if forbidden:
+                return forbidden
+        conflict = _confirmed_cross_warehouse_delivery(fulfillment_id, target_warehouse_ref)
+        if conflict:
+            return _cross_warehouse_conflict_response(conflict, target_warehouse_ref)
         result = check_fulfillment_stock_for_split(
             fulfillment_id=fulfillment_id,
             lines=payload.get("lines") or [],
             authorized_warehouses=authorized_warehouses,
+            target_warehouse_ref=target_warehouse_ref,
         )
         return json_response({"result": result})
     except FulfillmentOrder.DoesNotExist:
@@ -610,9 +716,17 @@ def split_fulfillment(request, fulfillment_id):
         if forbidden:
             return forbidden
         planned_date = parse_date(str(payload.get("planned_date") or ""))
-        forbidden = _forbidden_for_fulfillment_id(fulfillment_id, planned_date=planned_date)
+        allow_past_reparto_date = _truthy_payload_flag(payload, "allow_past_reparto_date")
+        target_warehouse_ref, forbidden = _target_warehouse_from_payload(request, payload, authorized_warehouses)
         if forbidden:
             return forbidden
+        if not allow_past_reparto_date:
+            forbidden = _forbidden_for_fulfillment_id(fulfillment_id, planned_date=planned_date)
+            if forbidden:
+                return forbidden
+        conflict = _confirmed_cross_warehouse_delivery(fulfillment_id, target_warehouse_ref)
+        if conflict:
+            return _cross_warehouse_conflict_response(conflict, target_warehouse_ref)
         result = split_fulfillment_delivery(
             fulfillment_id=fulfillment_id,
             lines=payload.get("lines") or [],
@@ -624,6 +738,7 @@ def split_fulfillment(request, fulfillment_id):
             authorized_warehouses=authorized_warehouses,
             receiver=str(payload.get("receiver") or "").strip(),
             reference=str(payload.get("reference") or "").strip(),
+            target_warehouse_ref=target_warehouse_ref,
         )
         return json_response(result.payload, status=result.status)
     except FulfillmentOrder.DoesNotExist:
@@ -640,14 +755,30 @@ def split_fulfillment(request, fulfillment_id):
 @require_POST
 def stock_check(request, delivery_id):
     try:
+        payload = parse_json_body(request)
         authorized_warehouses = _authorized_warehouses(request)
         forbidden = _forbidden_without_warehouse(authorized_warehouses)
         if forbidden:
             return forbidden
-        forbidden = _forbidden_for_delivery_id(delivery_id)
+        allow_past_reparto_date = _truthy_payload_flag(payload, "allow_past_reparto_date")
+        target_warehouse_ref, forbidden = _target_warehouse_from_payload(request, payload, authorized_warehouses)
         if forbidden:
             return forbidden
-        result = check_delivery_stock(delivery_id=delivery_id, authorized_warehouses=authorized_warehouses)
+        delivery = DeliveryOrder.objects.only("id", "fulfillment_id", "status", "warehouse_ref", "delivery_number", "legacy_sales_order_number").get(id=delivery_id)
+        conflict = None
+        if target_warehouse_ref:
+            conflict = _confirmed_cross_warehouse_delivery(delivery.fulfillment_id, target_warehouse_ref, exclude_delivery_id=delivery.id)
+        if conflict:
+            return _cross_warehouse_conflict_response(conflict, target_warehouse_ref)
+        if not allow_past_reparto_date:
+            forbidden = _forbidden_for_delivery_id(delivery_id)
+            if forbidden:
+                return forbidden
+        result = check_delivery_stock(
+            delivery_id=delivery_id,
+            authorized_warehouses=authorized_warehouses,
+            target_warehouse_ref=target_warehouse_ref,
+        )
         return json_response({"result": result})
     except DeliveryOrder.DoesNotExist:
         return error_response("not_found", "Entrega no encontrada.", status=404)
@@ -663,15 +794,66 @@ def stock_check(request, delivery_id):
 @require_POST
 def validate_stock(request, delivery_id):
     try:
+        payload = parse_json_body(request)
         authorized_warehouses = _authorized_warehouses(request)
         forbidden = _forbidden_without_warehouse(authorized_warehouses)
         if forbidden:
             return forbidden
-        forbidden = _forbidden_for_delivery_id(delivery_id)
+        allow_past_reparto_date = _truthy_payload_flag(payload, "allow_past_reparto_date")
+        target_warehouse_ref, forbidden = _target_warehouse_from_payload(request, payload, authorized_warehouses)
         if forbidden:
             return forbidden
+        delivery = DeliveryOrder.objects.only("id", "fulfillment_id", "status", "warehouse_ref", "delivery_number", "legacy_sales_order_number").get(id=delivery_id)
+        conflict = None
+        if target_warehouse_ref and delivery.status == DeliveryOrder.DeliveryStatus.CONFIRMED and delivery.warehouse_ref != target_warehouse_ref:
+            conflict = delivery
+        elif target_warehouse_ref:
+            conflict = _confirmed_cross_warehouse_delivery(delivery.fulfillment_id, target_warehouse_ref, exclude_delivery_id=delivery.id)
+        if conflict:
+            return _cross_warehouse_conflict_response(conflict, target_warehouse_ref)
+        if not allow_past_reparto_date:
+            forbidden = _forbidden_for_delivery_id(delivery_id)
+            if forbidden:
+                return forbidden
         result = validate_delivery_stock(
             delivery_id=delivery_id,
+            idempotency_key=require_idempotency_key(request),
+            actor=_request_actor(request) or "local.tmswms",
+            authorized_warehouses=authorized_warehouses,
+            target_warehouse_ref=target_warehouse_ref,
+        )
+        return json_response(result.payload, status=result.status)
+    except DeliveryOrder.DoesNotExist:
+        return error_response("not_found", "Entrega no encontrada.", status=404)
+    except MasterDataSourceError as exc:
+        return error_response("master_data_unavailable", str(exc), status=503)
+    except FulfillmentAuthorizationError as exc:
+        return error_response("forbidden", str(exc), status=403)
+    except ValueError as exc:
+        return error_response("business_rule_violation", str(exc), status=422)
+
+
+@csrf_exempt
+@require_POST
+def reassign_delivery_warehouse(request, delivery_id):
+    try:
+        payload = parse_json_body(request)
+        authorized_warehouses = _authorized_warehouses(request)
+        forbidden = _forbidden_without_warehouse(authorized_warehouses)
+        if forbidden:
+            return forbidden
+        target_warehouse_ref, forbidden = _target_warehouse_from_payload(request, payload, authorized_warehouses)
+        if forbidden:
+            return forbidden
+        if not target_warehouse_ref:
+            return error_response("validation_error", "target_warehouse_ref es obligatorio.", status=400)
+        if not _truthy_payload_flag(payload, "allow_past_reparto_date"):
+            forbidden = _forbidden_for_delivery_id(delivery_id)
+            if forbidden:
+                return forbidden
+        result = reassign_confirmed_delivery_warehouse(
+            delivery_id=delivery_id,
+            target_warehouse_ref=target_warehouse_ref,
             idempotency_key=require_idempotency_key(request),
             actor=_request_actor(request) or "local.tmswms",
             authorized_warehouses=authorized_warehouses,
@@ -679,6 +861,8 @@ def validate_stock(request, delivery_id):
         return json_response(result.payload, status=result.status)
     except DeliveryOrder.DoesNotExist:
         return error_response("not_found", "Entrega no encontrada.", status=404)
+    except InventoryReservation.DoesNotExist:
+        return error_response("business_rule_violation", "La entrega confirmada no tiene una reserva asignada para reasignar.", status=422)
     except MasterDataSourceError as exc:
         return error_response("master_data_unavailable", str(exc), status=503)
     except FulfillmentAuthorizationError as exc:
@@ -696,9 +880,24 @@ def send_to_prepare(request, delivery_id):
         forbidden = _forbidden_without_warehouse(authorized_warehouses)
         if forbidden:
             return forbidden
-        forbidden = _forbidden_for_delivery_id(delivery_id)
+        target_warehouse_ref, forbidden = _target_warehouse_from_payload(request, payload, authorized_warehouses)
         if forbidden:
             return forbidden
+        if target_warehouse_ref:
+            delivery = DeliveryOrder.objects.only(
+                "id",
+                "fulfillment_id",
+                "status",
+                "warehouse_ref",
+                "delivery_number",
+                "legacy_sales_order_number",
+            ).get(id=delivery_id)
+            if delivery.status == DeliveryOrder.DeliveryStatus.CONFIRMED and delivery.warehouse_ref != target_warehouse_ref:
+                return _cross_warehouse_conflict_response(delivery, target_warehouse_ref)
+        if not _truthy_payload_flag(payload, "allow_past_reparto_date"):
+            forbidden = _forbidden_for_delivery_id(delivery_id)
+            if forbidden:
+                return forbidden
         result = send_delivery_to_prepare(
             delivery_id=delivery_id,
             idempotency_key=require_idempotency_key(request),
@@ -733,9 +932,10 @@ def mark_prepared(request, task_id):
             "delivery__delivery_mode",
             "delivery__planned_date",
         ).get(id=task_id)
-        forbidden = _forbidden_for_past_reparto_delivery(task.delivery)
-        if forbidden:
-            return forbidden
+        if not _truthy_payload_flag(payload, "allow_past_reparto_date"):
+            forbidden = _forbidden_for_past_reparto_delivery(task.delivery)
+            if forbidden:
+                return forbidden
         result = mark_preparation_task_prepared(
             task_id=task_id,
             idempotency_key=require_idempotency_key(request),
@@ -764,9 +964,10 @@ def mark_delivery_prepared(request, delivery_id):
         forbidden = _forbidden_without_warehouse(authorized_warehouses)
         if forbidden:
             return forbidden
-        forbidden = _forbidden_for_delivery_id(delivery_id)
-        if forbidden:
-            return forbidden
+        if not _truthy_payload_flag(payload, "allow_past_reparto_date"):
+            forbidden = _forbidden_for_delivery_id(delivery_id)
+            if forbidden:
+                return forbidden
         result = mark_preparation_task_prepared(
             task_id=str(task.id),
             idempotency_key=require_idempotency_key(request),
@@ -789,13 +990,15 @@ def mark_delivery_prepared(request, delivery_id):
 @require_POST
 def remito(request, delivery_id):
     try:
+        payload = parse_json_body(request)
         authorized_warehouses = _authorized_warehouses(request)
         forbidden = _forbidden_without_warehouse(authorized_warehouses)
         if forbidden:
             return forbidden
-        forbidden = _forbidden_for_delivery_id(delivery_id)
-        if forbidden:
-            return forbidden
+        if not _truthy_payload_flag(payload, "allow_past_reparto_date"):
+            forbidden = _forbidden_for_delivery_id(delivery_id)
+            if forbidden:
+                return forbidden
         result = issue_remito(
             delivery_id=delivery_id,
             idempotency_key=require_idempotency_key(request),

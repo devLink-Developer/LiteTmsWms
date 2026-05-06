@@ -9,7 +9,9 @@ class LegacyOrder(models.Model):
     invoice_date = models.DateTimeField(db_column="InvoiceDate")
     invoice_number = models.CharField(db_column="InvoiceNumber", max_length=80)
     transaction_number = models.CharField(db_column="TransactionNumber", max_length=60)
+    sales_order_number_orig = models.CharField(db_column="SalesOrderNumberOrig", max_length=60, blank=True, null=True)
     sales_order_number = models.CharField(db_column="SalesOrderNumber", max_length=60)
+    sales_order_type = models.CharField(db_column="SalesOrderType", max_length=10, blank=True, null=True)
     sales_order_name = models.CharField(db_column="SalesOrderName", max_length=200)
     customer_account = models.CharField(db_column="CustomerAccount", max_length=60)
     invoice_customer_account_number = models.CharField(

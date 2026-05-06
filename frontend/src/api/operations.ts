@@ -1,9 +1,91 @@
-import { apiGet } from "./client";
+import { apiGet, requestJson } from "./client";
 import { formatAppDateTime } from "../shared/utils/dateFormat";
 import { formatIdentifier } from "../shared/utils/identifierFormat";
 import type { Kpi, OperationModule, OperationRow, StatusTone, TimelineEvent } from "../types/operations";
 
 type ApiRecord = Record<string, unknown>;
+
+export type OperationalDashboardKpi = {
+  key: string;
+  label: string;
+  value: number | string;
+  tone: StatusTone;
+  detail: string;
+};
+
+export type DashboardCountDatum = {
+  key: string;
+  label: string;
+  count: number;
+};
+
+export type DashboardQuantityByUom = {
+  uom: string;
+  quantity: string;
+};
+
+export type DashboardStockState = {
+  key: string;
+  label: string;
+  buckets: number;
+  quantity_by_uom: DashboardQuantityByUom[];
+};
+
+export type DashboardLedgerDay = {
+  date: string;
+  increase_count: number;
+  decrease_count: number;
+  increase_quantity_by_uom: DashboardQuantityByUom[];
+  decrease_quantity_by_uom: DashboardQuantityByUom[];
+};
+
+export type DashboardRouteLoad = {
+  route_number: string;
+  status: string;
+  planned_date: string;
+  stops: number;
+  planned_weight_kg: string;
+  planned_volume_m3: string;
+};
+
+export type OperationalDashboardAlert = {
+  key: string;
+  label: string;
+  value: number;
+  tone: StatusTone;
+  detail: string;
+};
+
+export type OperationalDashboardModule = {
+  key: string;
+  label: string;
+  path: string;
+  count: number;
+  active: number;
+  issues: number;
+  tone: StatusTone;
+};
+
+export type OperationalDashboard = {
+  generated_at: string;
+  scope: {
+    warehouse_ref: string;
+    mode: string;
+    window: string;
+    authorized_warehouses?: string[];
+  };
+  kpis: OperationalDashboardKpi[];
+  charts: {
+    fulfillment_status: DashboardCountDatum[];
+    delivery_pipeline: DashboardCountDatum[];
+    stock_by_state: DashboardStockState[];
+    ledger_by_day: DashboardLedgerDay[];
+    route_load: DashboardRouteLoad[];
+    module_coverage: DashboardCountDatum[];
+  };
+  alerts: OperationalDashboardAlert[];
+  modules: OperationalDashboardModule[];
+};
 
 const statusTones: Record<string, StatusTone> = {
   created: "neutral",
@@ -39,6 +121,12 @@ function objectValue(record: ApiRecord, key: string): ApiRecord {
 }
 
 function quantityFor(record: ApiRecord, moduleKey: string) {
+  if (moduleKey === "orders") {
+    if (Array.isArray(record.lines)) {
+      return `${record.lines.length} lineas`;
+    }
+    return `${first(record, ["lines_count"], "0")} lineas`;
+  }
   if (moduleKey === "stock" || moduleKey === "stock-movements") {
     return `${first(record, ["quantity"], "0")} ${first(record, ["uom"], "")}`.trim();
   }
@@ -115,6 +203,32 @@ function warehouseFor(record: ApiRecord, moduleKey: string) {
 }
 
 function timelineFor(record: ApiRecord): TimelineEvent[] {
+  if (Array.isArray(record.movements)) {
+    return record.movements.map((entry, index) => {
+      const movement = entry && typeof entry === "object" ? (entry as ApiRecord) : {};
+      const routeNumber = first(movement, ["route_number"], "");
+      const documentNumber = first(movement, ["document_number"], "");
+      const deliveredQty = first(movement, ["delivered_qty"], "");
+      const returnedQty = first(movement, ["returned_qty"], "");
+      const details = [
+        first(movement, ["detail"], ""),
+        routeNumber ? `Hoja de ruta ${routeNumber}` : "",
+        documentNumber ? `Remito ${documentNumber}` : "",
+        deliveredQty ? `Entregado ${deliveredQty}` : "",
+        returnedQty ? `Devuelto ${returnedQty}` : "",
+      ]
+        .filter(Boolean)
+        .join(" / ");
+      return {
+        id: first(movement, ["key", "source_ref"], `movement-${index}`),
+        label: first(movement, ["label"], "Movimiento"),
+        actor: first(movement, ["actor", "source_type"], "api"),
+        at: formatAppDateTime(first(movement, ["at"], ""), first(movement, ["at"], "-")),
+        details: details || first(movement, ["status"], "Movimiento informado por backend."),
+      };
+    });
+  }
+
   const events = [
     ["created_at", "Creado"],
     ["updated_at", "Actualizado"],
@@ -163,8 +277,26 @@ export function buildKpis(rows: OperationRow[]): Kpi[] {
   ];
 }
 
-export async function fetchOperationRows(module: OperationModule) {
-  const result = await apiGet<ApiRecord>(module.apiPath);
+function operationPathWithFilters(module: OperationModule, filters?: Record<string, string>) {
+  if (!filters) {
+    return module.apiPath;
+  }
+  const [path, query = ""] = module.apiPath.split("?");
+  const params = new URLSearchParams(query);
+  const search = filters.busqueda?.trim();
+  const status = filters.estado?.trim();
+  const warehouse = filters.warehouse?.trim();
+  const date = filters.fecha?.trim();
+  if (search) params.set("q", search);
+  if (status) params.set("status", status);
+  if (warehouse) params.set("warehouse", warehouse);
+  if (date) params.set(module.key === "orders" ? "requested_date" : "planned_date", date);
+  const nextQuery = params.toString();
+  return nextQuery ? `${path}?${nextQuery}` : path;
+}
+
+export async function fetchOperationRows(module: OperationModule, filters?: Record<string, string>) {
+  const result = await apiGet<ApiRecord>(operationPathWithFilters(module, filters));
   if (result.error) {
     throw new Error(result.error.message);
   }
@@ -177,4 +309,8 @@ export async function fetchOperationalOverview() {
     throw new Error(result.error.message);
   }
   return result;
+}
+
+export async function fetchOperationalDashboard() {
+  return requestJson<OperationalDashboard>("/api/v1/logistics/dashboard/");
 }

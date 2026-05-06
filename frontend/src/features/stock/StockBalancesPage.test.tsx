@@ -40,6 +40,15 @@ describe("StockBalancesPage", () => {
               {
                 warehouse_ref: "WH-A",
                 location_ref: "A-01-01",
+                warehouse_location_ref: "A-01-01",
+                location_name: "Rack A",
+                purpose: "available",
+                zone_ref: "Z01",
+                aisle: "A01",
+                floor: "F01",
+                level: "N01",
+                position: "P001",
+                is_dispatchable: true,
                 lot_ref: "A-01-01",
                 item_ref: "103374",
                 item_name: "Porcelanato gris",
@@ -59,6 +68,15 @@ describe("StockBalancesPage", () => {
               {
                 warehouse_ref: "WH-C",
                 location_ref: "C-03-02",
+                warehouse_location_ref: "C-03-02",
+                location_name: "Rack C",
+                purpose: "available",
+                zone_ref: "Z03",
+                aisle: "A02",
+                floor: "F01",
+                level: "N02",
+                position: "P003",
+                is_dispatchable: true,
                 lot_ref: "L-1",
                 item_ref: "200000",
                 item_name: "Bacha blanca",
@@ -139,31 +157,38 @@ describe("StockBalancesPage", () => {
     render(<StockBalancesPage />);
 
     expect(screen.getByRole("heading", { name: "Stock por almacen" })).toBeInTheDocument();
-    await waitFor(() => expect(screen.getByText("2 buckets")).toBeInTheDocument());
+    expect(screen.getByText("0 buckets")).toBeInTheDocument();
+    expect(screen.getByText("Sin filtros.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Actualizar" })).toBeDisabled();
+
+    await waitFor(() => expect(screen.getByRole("option", { name: "WH-A / Deposito A" })).toBeInTheDocument());
+    const fetchCalls = vi.mocked(fetch).mock.calls.map(([input]) => String(input));
+    expect(fetchCalls.some((url) => url.includes("/api/v1/inventory/advanced-stock/"))).toBe(false);
+
+    fireEvent.change(screen.getByLabelText("Almacen"), { target: { value: "WH-A" } });
+    await waitFor(() => expect(screen.getByText("1 buckets")).toBeInTheDocument());
 
     expect(fetch).toHaveBeenCalledWith(expect.stringContaining("/api/v1/inventory/advanced-stock/"), expect.any(Object));
+    expect(fetch).toHaveBeenCalledWith(expect.stringContaining("location_scope=available"), expect.any(Object));
+    expect(fetch).toHaveBeenCalledWith(expect.stringContaining("state=packed%2Con_hand"), expect.any(Object));
     expect(screen.getByText("scope operativo")).toBeInTheDocument();
-    expect(screen.getByRole("option", { name: "WH-A / Deposito A" })).toBeInTheDocument();
     expect(screen.getByRole("option", { name: "WH-C / Deposito C" })).toBeInTheDocument();
     expect(screen.getAllByText("A-01-01").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Rack A").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Z01").length).toBeGreaterThan(0);
     expect(screen.getAllByText("Porcelanato gris").length).toBeGreaterThan(0);
-    expect(screen.getByText("Bacha blanca")).toBeInTheDocument();
+    expect(screen.queryByText("Bacha blanca")).not.toBeInTheDocument();
     expect(screen.getAllByText("12,5 m2").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("2 m2").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("1 m2").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("1 un").length).toBeGreaterThan(0);
     expect(screen.getByText("Detalle compacto")).toBeInTheDocument();
 
-    fireEvent.change(screen.getByLabelText("Ubicacion"), { target: { value: "C-03-02" } });
-    await waitFor(() => expect(screen.getByText("1 buckets")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Limpiar" }));
+    await waitFor(() => expect(screen.getByText("0 buckets")).toBeInTheDocument());
+    expect(screen.getByText("Sin filtros.")).toBeInTheDocument();
 
     fireEvent.change(screen.getByLabelText("Busqueda rapida"), { target: { value: "200000" } });
     await waitFor(() => expect(screen.getByText("1 buckets")).toBeInTheDocument());
     const table = screen.getAllByRole("table")[0];
     expect(within(table).getByText("200000")).toBeInTheDocument();
     expect(within(table).queryByText("103374")).not.toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole("button", { name: "Limpiar" }));
-    await waitFor(() => expect(screen.getByText("2 buckets")).toBeInTheDocument());
   });
 });

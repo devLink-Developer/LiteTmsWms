@@ -67,7 +67,12 @@ class StockCacheImportTests(TestCase):
 
             result = import_stock_cache(path=path, actor="tester")
 
-        balance = InventoryBalance.objects.get(warehouse_ref="WH-1", item_ref="ITEM-1", stock_state=StockState.PACKED)
+        balance = InventoryBalance.objects.get(
+            warehouse_ref="WH-1",
+            location_ref="WH-1-DSP-GEN",
+            item_ref="ITEM-1",
+            stock_state=StockState.PACKED,
+        )
         self.assertEqual(balance.quantity, Decimal("5.250000"))
         self.assertEqual(balance.uom, "UN")
         self.assertEqual(balance.created_by, "tester")
@@ -100,14 +105,25 @@ class StockCacheImportTests(TestCase):
                 actor="tester",
             )
 
-        on_hand = InventoryBalance.objects.get(warehouse_ref="WH-1", item_ref="ITEM-1", stock_state=StockState.ON_HAND)
-        reserved = InventoryBalance.objects.get(warehouse_ref="WH-1", item_ref="ITEM-1", stock_state=StockState.RESERVED)
+        on_hand = InventoryBalance.objects.get(
+            warehouse_ref="WH-1",
+            location_ref="WH-1-DSP-GEN",
+            item_ref="ITEM-1",
+            stock_state=StockState.ON_HAND,
+        )
+        reserved = InventoryBalance.objects.get(
+            warehouse_ref="WH-1",
+            location_ref="WH-1-RSV-GEN",
+            item_ref="ITEM-1",
+            stock_state=StockState.RESERVED,
+        )
         self.assertEqual(on_hand.quantity, Decimal("6.000000"))
         self.assertEqual(reserved.quantity, Decimal("2.000000"))
 
     def test_import_upserts_existing_balance(self):
         InventoryBalance.objects.create(
             warehouse_ref="WH-1",
+            location_ref="WH-1-DSP-GEN",
             item_ref="ITEM-1",
             lot_ref="",
             stock_state=StockState.PACKED,
@@ -133,7 +149,12 @@ class StockCacheImportTests(TestCase):
 
             import_stock_cache(path=path, actor="tester")
 
-        balance = InventoryBalance.objects.get(warehouse_ref="WH-1", item_ref="ITEM-1", stock_state=StockState.PACKED)
+        balance = InventoryBalance.objects.get(
+            warehouse_ref="WH-1",
+            location_ref="WH-1-DSP-GEN",
+            item_ref="ITEM-1",
+            stock_state=StockState.PACKED,
+        )
         self.assertEqual(balance.quantity, Decimal("7.000000"))
         self.assertEqual(balance.created_by, "seed")
         self.assertEqual(balance.updated_by, "tester")

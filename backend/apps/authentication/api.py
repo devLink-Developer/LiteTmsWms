@@ -75,6 +75,10 @@ def build_session_bootstrap(
             workspace = _workspace_for_actor(actor)
         else:
             workspace = _workspace_from_permissions(actor, delivery_permissions)
+        active_warehouse = request.session.get("active_warehouse_ref")
+        authorized = (workspace or {}).get("authorized_warehouses") or []
+        if active_warehouse in authorized:
+            workspace["warehouse_ref"] = active_warehouse
 
     return {
         "authenticated": authenticated,
@@ -135,6 +139,7 @@ def login_view(request: HttpRequest) -> JsonResponse:
     request.session["usuario_alias"] = username
     request.session["email"] = employee.get("email") or email
     request.session["authorized_warehouses"] = warehouses
+    request.session["active_warehouse_ref"] = warehouses[0]
     request.session["permissions"] = delivery_permissions.get("permissions") or []
     request.session.modified = True
 
@@ -149,8 +154,7 @@ def login_view(request: HttpRequest) -> JsonResponse:
 
 @require_POST
 def logout_view(request: HttpRequest) -> JsonResponse:
-    for key in ["usuario", "usuario_alias", "email", "authorized_warehouses", "permissions"]:
+    for key in ["usuario", "usuario_alias", "email", "authorized_warehouses", "active_warehouse_ref", "permissions"]:
         request.session.pop(key, None)
     django_logout(request)
     return JsonResponse({"success": True, "redirectTo": "/login/"})
-

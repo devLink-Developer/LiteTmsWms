@@ -6,12 +6,22 @@ from django.db.models import Q, Sum
 from django.http import HttpRequest
 from django.utils.dateparse import parse_date
 from django.views.decorators.csrf import csrf_exempt
-from django.views.decorators.http import require_GET, require_POST
+from django.views.decorators.http import require_GET, require_POST, require_http_methods
 
 from apps.common.api import error_response, json_response, parse_json_body, require_idempotency_key
-from apps.inventory.models import InventoryBalance, InventoryLedgerEntry, PurchaseOrderReceipt, StockState
-from apps.inventory.services import InventoryRuleError, reserve_inventory
+from apps.inventory.models import InventoryBalance, InventoryLedgerEntry, InventoryWriteOff, PurchaseOrderReceipt, StockState
+from apps.inventory.services import (
+    InventoryRuleError,
+    create_inventory_write_off,
+    execute_sheet_cutting,
+    post_inventory_write_off,
+    reserve_inventory,
+    reverse_inventory_write_off,
+    serialize_write_off,
+    validate_sheet_cutting_stock,
+)
 from apps.logistics.models import MaterialMasterSnapshot
+from apps.logistics.models import WarehouseLocation
 from apps.logistics.parquet_master_data import (
     MasterDataSourceError,
     employee_delivery_permissions,
@@ -69,6 +79,39 @@ def _request_actor(request: HttpRequest) -> str:
     ).strip()
 
 
+def _session_authorized_warehouses(request: HttpRequest) -> list[str]:
+    warehouses = request.session.get("authorized_warehouses") if hasattr(request, "session") else []
+    return [str(warehouse).strip() for warehouse in (warehouses or []) if str(warehouse).strip()]
+
+
+def _active_warehouse_ref(request: HttpRequest) -> str:
+    active = str(request.session.get("active_warehouse_ref", "") if hasattr(request, "session") else "").strip()
+    if active:
+        return active
+    session_warehouses = _session_authorized_warehouses(request)
+    if session_warehouses:
+        return session_warehouses[0]
+    try:
+        authorized = _stock_authorized_warehouses(request) or []
+    except MasterDataSourceError:
+        authorized = []
+    return authorized[0] if authorized else ""
+
+
+def _ensure_active_warehouse_payload(request: HttpRequest, payload: dict) -> dict:
+    return _ensure_active_warehouse_operation_payload(request, payload, operation_label="baja")
+
+
+def _ensure_active_warehouse_operation_payload(request: HttpRequest, payload: dict, *, operation_label: str) -> dict:
+    active_warehouse = _active_warehouse_ref(request)
+    if not active_warehouse:
+        raise InventoryRuleError("No hay almacen activo para operar stock.")
+    requested = str(payload.get("warehouse_ref") or "").strip()
+    if requested and requested != active_warehouse:
+        raise PermissionError(f"La {operation_label} solo se permite en el almacen activo.")
+    return {**payload, "warehouse_ref": active_warehouse}
+
+
 def _stock_authorized_warehouses(request: HttpRequest) -> list[str] | None:
     actor = _request_actor(request)
     if not actor:
@@ -92,7 +135,8 @@ def _forbidden_stock_response():
 
 
 def _apply_stock_warehouse_scope(request: HttpRequest, qs):
-    authorized_warehouses = _stock_authorized_warehouses(request)
+    session_warehouses = _session_authorized_warehouses(request)
+    authorized_warehouses = session_warehouses if session_warehouses else _stock_authorized_warehouses(request)
     if authorized_warehouses is None:
         return qs, None, []
     if not authorized_warehouses:
@@ -103,6 +147,18 @@ def _apply_stock_warehouse_scope(request: HttpRequest, qs):
     return qs.filter(warehouse_ref__in=authorized_warehouses), None, authorized_warehouses
 
 
+def _inventory_error_response(exc: Exception):
+    if isinstance(exc, InventoryWriteOff.DoesNotExist):
+        return error_response("not_found", "Baja de inventario no encontrada.", status=404)
+    if isinstance(exc, InventoryRuleError):
+        return error_response("business_rule_violation", str(exc), status=422)
+    if isinstance(exc, PermissionError):
+        return error_response("forbidden", str(exc), status=403)
+    if isinstance(exc, ValueError):
+        return error_response("validation_error", str(exc), status=400)
+    return error_response("server_error", str(exc), status=500)
+
+
 ADVANCED_STOCK_STATES = {
     StockState.ON_HAND: ("available", "Disponible"),
     StockState.RESERVED: ("reserved", "Reservado"),
@@ -110,6 +166,20 @@ ADVANCED_STOCK_STATES = {
     StockState.PACKED: ("prepared", "Preparado"),
     StockState.IN_TRANSIT: ("in_transit", "En Transito"),
     StockState.SCRAPPED: ("damaged_waste", "Roto/Merma"),
+}
+
+ADVANCED_STOCK_STATE_ALIASES = {
+    "available": StockState.ON_HAND,
+    "on_hand": StockState.ON_HAND,
+    "reserved": StockState.RESERVED,
+    "in_preparation": StockState.PICKING,
+    "picking": StockState.PICKING,
+    "prepared": StockState.PACKED,
+    "packed": StockState.PACKED,
+    "in_transit": StockState.IN_TRANSIT,
+    "transit": StockState.IN_TRANSIT,
+    "damaged_waste": StockState.SCRAPPED,
+    "scrapped": StockState.SCRAPPED,
 }
 
 
@@ -135,6 +205,36 @@ def _enrich_advanced_stock_rows(rows: list[dict]) -> None:
         row["rubro_ref"] = category
         row["coverage_group"] = _clean(snapshot.get("coverage_group"))
         row["item_uom"] = _clean(snapshot.get("uom") or snapshot.get("uom_code"))
+
+
+def _enrich_location_metadata(rows: list[dict]) -> None:
+    keys = {
+        (row.get("warehouse_ref") or "", row.get("location_ref") or "")
+        for row in rows
+        if row.get("warehouse_ref") and row.get("location_ref")
+    }
+    if not keys:
+        return
+    warehouses = {warehouse for warehouse, _location in keys}
+    locations = {
+        (row.warehouse_ref, row.location_ref): row
+        for row in WarehouseLocation.objects.filter(warehouse_ref__in=warehouses, location_ref__in={location for _warehouse, location in keys})
+    }
+    for row in rows:
+        location = locations.get((row.get("warehouse_ref") or "", row.get("location_ref") or ""))
+        row["location_name"] = location.name if location else row.get("location_name") or ""
+        row["purpose"] = location.purpose if location else row.get("purpose") or ""
+        row["zone_ref"] = location.zone_ref if location else row.get("zone_ref") or ""
+        row["aisle"] = location.aisle if location else row.get("aisle") or ""
+        row["floor"] = location.floor if location else row.get("floor") or ""
+        row["level"] = location.level if location else row.get("level") or ""
+        row["position"] = location.position if location else row.get("position") or ""
+        row["is_dispatchable"] = bool(location.is_dispatchable) if location else bool(row.get("is_dispatchable"))
+        row["is_reservable"] = bool(location.is_reservable) if location else bool(row.get("is_reservable"))
+        row["is_pickable"] = bool(location.is_pickable) if location else bool(row.get("is_pickable"))
+        row["allows_scrap"] = bool(location.allows_scrap) if location else bool(row.get("allows_scrap"))
+        row["system_location"] = bool(location.system_location) if location else bool(row.get("system_location"))
+        row["warehouse_location_ref"] = row.get("warehouse_location_ref") or row.get("location_ref") or ""
 
 
 def _advanced_stock_row_matches(row: dict, request: HttpRequest) -> bool:
@@ -165,6 +265,8 @@ def _advanced_stock_row_matches(row: dict, request: HttpRequest) -> bool:
             "coverage_group",
             "lot_ref",
             "location_ref",
+            "location_name",
+            "warehouse_location_ref",
         ]
     ):
         return False
@@ -233,10 +335,15 @@ def balances(request: HttpRequest):
         qs = qs.filter(item_ref=item)
     if state := _query_alias(request, "state", "stock_state"):
         qs = qs.filter(stock_state=state)
+    if location_ref := _query_alias(request, "location", "location_ref"):
+        qs = qs.filter(Q(location_ref=location_ref) | Q(lot_ref=location_ref))
     data = [
         {
             "id": str(row.id),
             "warehouse_ref": row.warehouse_ref,
+            "warehouse_location_ref": row.location_ref or row.lot_ref,
+            "location_ref": row.location_ref,
+            "location_ref_is_fallback": not bool(row.location_ref) and bool(row.lot_ref),
             "item_ref": row.item_ref,
             "lot_ref": row.lot_ref,
             "stock_state": row.stock_state,
@@ -251,7 +358,13 @@ def balances(request: HttpRequest):
 
 @require_GET
 def advanced_stock(request: HttpRequest):
-    qs = InventoryBalance.objects.filter(stock_state__in=tuple(ADVANCED_STOCK_STATES)).order_by("warehouse_ref", "item_ref", "lot_ref", "uom")
+    qs = InventoryBalance.objects.filter(stock_state__in=tuple(ADVANCED_STOCK_STATES)).order_by(
+        "warehouse_ref",
+        "location_ref",
+        "item_ref",
+        "lot_ref",
+        "uom",
+    )
     try:
         qs, forbidden, authorized_warehouses = _apply_stock_warehouse_scope(request, qs)
     except MasterDataSourceError as exc:
@@ -260,8 +373,28 @@ def advanced_stock(request: HttpRequest):
         return forbidden
     if warehouse := _query_alias(request, "warehouse", "warehouse_ref"):
         qs = qs.filter(warehouse_ref=warehouse)
+    if state := _query_alias(request, "state", "stock_state"):
+        requested_states = [
+            ADVANCED_STOCK_STATE_ALIASES.get(part.strip().casefold(), part.strip())
+            for part in state.split(",")
+            if part.strip()
+        ]
+        requested_states = [state for state in requested_states if state in ADVANCED_STOCK_STATES]
+        qs = qs.filter(stock_state__in=requested_states) if requested_states else qs.none()
+    location_scope = _query_alias(request, "location_scope", "locationScope").strip().casefold()
+    if location_scope == "available":
+        location_qs = WarehouseLocation.objects.filter(active=True, is_dispatchable=True)
+        if warehouse:
+            location_qs = location_qs.filter(warehouse_ref=warehouse)
+        elif authorized_warehouses:
+            location_qs = location_qs.filter(warehouse_ref__in=authorized_warehouses)
+        available_refs = list(location_qs.values_list("location_ref", flat=True).distinct())
+        qs = qs.filter(location_ref__in=available_refs) if available_refs else qs.none()
     if lot_ref := _query_alias(request, "lot", "lot_ref", "location", "location_ref"):
-        qs = qs.filter(lot_ref=lot_ref)
+        if location_scope == "available":
+            qs = qs.filter(location_ref=lot_ref)
+        else:
+            qs = qs.filter(Q(location_ref=lot_ref) | Q(lot_ref=lot_ref))
     item_query = _query_alias(request, "item", "item_ref", "product").strip()
     category_query = _query_alias(request, "category", "category_ref", "rubro", "rubro_ref").strip()
     search_query = _query_alias(request, "search", "q").strip()
@@ -278,20 +411,28 @@ def advanced_stock(request: HttpRequest):
         qs = qs.filter(item_ref__in=category_refs) if category_refs else qs.none()
     if search_query:
         search_refs = _material_refs_for_query(search_query)
-        search_filter = Q(warehouse_ref__icontains=search_query) | Q(item_ref__icontains=search_query) | Q(lot_ref__icontains=search_query)
+        search_filter = (
+            Q(warehouse_ref__icontains=search_query)
+            | Q(item_ref__icontains=search_query)
+            | Q(location_ref__icontains=search_query)
+            | Q(lot_ref__icontains=search_query)
+        )
         if search_refs:
             search_filter |= Q(item_ref__in=search_refs)
         qs = qs.filter(search_filter)
     rows = (
-        qs.values("warehouse_ref", "item_ref", "lot_ref", "uom", "stock_state")
+        qs.values("warehouse_ref", "location_ref", "item_ref", "lot_ref", "uom", "stock_state")
         .annotate(quantity=Sum("quantity"))
-        .order_by("warehouse_ref", "item_ref", "lot_ref", "uom", "stock_state")
+        .order_by("warehouse_ref", "location_ref", "item_ref", "lot_ref", "uom", "stock_state")
     )
 
-    grouped: dict[tuple[str, str, str, str], dict] = {}
+    grouped: dict[tuple[str, str, str, str, str], dict] = {}
     for row in rows:
+        location_ref = row["location_ref"] or ""
+        warehouse_location_ref = location_ref or row["lot_ref"] or ""
         key = (
             row["warehouse_ref"],
+            location_ref,
             row["item_ref"],
             row["lot_ref"] or "",
             row["uom"],
@@ -302,8 +443,21 @@ def advanced_stock(request: HttpRequest):
                 "warehouse_ref": row["warehouse_ref"],
                 "item_ref": row["item_ref"],
                 "lot_ref": row["lot_ref"] or "",
-                "location_ref": row["lot_ref"] or "",
+                "location_ref": location_ref,
+                "warehouse_location_ref": warehouse_location_ref,
+                "location_ref_is_fallback": not bool(location_ref) and bool(row["lot_ref"]),
                 "location_name": "",
+                "purpose": "",
+                "zone_ref": "",
+                "aisle": "",
+                "floor": "",
+                "level": "",
+                "position": "",
+                "is_dispatchable": False,
+                "is_reservable": False,
+                "is_pickable": False,
+                "allows_scrap": False,
+                "system_location": False,
                 "uom": row["uom"],
                 "quantities": _empty_advanced_quantities(),
             },
@@ -317,10 +471,12 @@ def advanced_stock(request: HttpRequest):
     limit = _limit(request.GET.get("limit"), default=500, maximum=500)
     if metadata_filter_active:
         _enrich_advanced_stock_rows(grouped_rows)
+        _enrich_location_metadata(grouped_rows)
         grouped_rows = [row for row in grouped_rows if _advanced_stock_row_matches(row, request)]
     else:
         grouped_rows = grouped_rows[:limit]
         _enrich_advanced_stock_rows(grouped_rows)
+        _enrich_location_metadata(grouped_rows)
 
     data = []
     for row in grouped_rows[:limit]:
@@ -356,6 +512,8 @@ def ledger(request: HttpRequest):
         qs = qs.filter(warehouse_ref=warehouse)
     if item := request.GET.get("item"):
         qs = qs.filter(item_ref=item)
+    if location_ref := _query_alias(request, "location", "location_ref"):
+        qs = qs.filter(location_ref=location_ref)
     if stock_state := _query_alias(request, "stock_state", "state"):
         qs = qs.filter(stock_state=stock_state)
     if document_type := _query_alias(request, "document_type", "reference_type"):
@@ -378,6 +536,7 @@ def ledger(request: HttpRequest):
             "movement_type": row.movement_type,
             "direction": row.direction,
             "warehouse_ref": row.warehouse_ref,
+            "location_ref": row.location_ref,
             "item_ref": row.item_ref,
             "stock_state": row.stock_state,
             "quantity": _decimal(row.quantity),
@@ -416,6 +575,136 @@ def receipts(request: HttpRequest):
         for row in qs[:100]
     ]
     return json_response({"results": data})
+
+
+@csrf_exempt
+@require_POST
+def validate_sheet_cutting(request: HttpRequest):
+    try:
+        actor = _request_actor(request) or "system"
+        payload = _ensure_active_warehouse_operation_payload(
+            request,
+            parse_json_body(request),
+            operation_label="ejecucion de corte",
+        )
+        result = validate_sheet_cutting_stock(payload=payload, actor=actor)
+        return json_response(result.payload, status=result.status)
+    except Exception as exc:
+        return _inventory_error_response(exc)
+
+
+@csrf_exempt
+@require_POST
+def execute_sheet_cutting_view(request: HttpRequest):
+    try:
+        actor = _request_actor(request)
+        if not actor:
+            raise PermissionError("El corte requiere un usuario operativo.")
+        payload = _ensure_active_warehouse_operation_payload(
+            request,
+            parse_json_body(request),
+            operation_label="ejecucion de corte",
+        )
+        result = execute_sheet_cutting(
+            payload=payload,
+            idempotency_key=require_idempotency_key(request),
+            actor=actor,
+        )
+        return json_response(result.payload, status=result.status)
+    except Exception as exc:
+        return _inventory_error_response(exc)
+
+
+@csrf_exempt
+@require_http_methods(["GET", "POST"])
+def write_offs(request: HttpRequest):
+    if request.method == "POST":
+        try:
+            actor = _request_actor(request)
+            if not actor:
+                raise PermissionError("La baja requiere un usuario operativo.")
+            result = create_inventory_write_off(
+                payload=_ensure_active_warehouse_payload(request, parse_json_body(request)),
+                idempotency_key=require_idempotency_key(request),
+                actor=actor,
+            )
+            return json_response(result.payload, status=result.status)
+        except Exception as exc:
+            return _inventory_error_response(exc)
+
+    qs = InventoryWriteOff.objects.prefetch_related("lines").order_by("-created_at")
+    try:
+        qs, forbidden, authorized_warehouses = _apply_stock_warehouse_scope(request, qs)
+    except MasterDataSourceError as exc:
+        return error_response("master_data_unavailable", str(exc), status=503)
+    if forbidden is not None:
+        return forbidden
+    if warehouse := _query_alias(request, "warehouse", "warehouse_ref"):
+        qs = qs.filter(warehouse_ref=warehouse)
+    if location_ref := _query_alias(request, "location", "location_ref"):
+        qs = qs.filter(Q(location_ref=location_ref) | Q(lines__location_ref=location_ref)).distinct()
+    if status := request.GET.get("status"):
+        qs = qs.filter(status=status)
+    if write_off_number := request.GET.get("write_off_number"):
+        qs = qs.filter(write_off_number=write_off_number)
+    rows = qs[: _limit(request.GET.get("limit"), default=100, maximum=500)]
+    return json_response(
+        {
+            "results": [serialize_write_off(row) for row in rows],
+            "allowed_warehouses": authorized_warehouses,
+        }
+    )
+
+
+@csrf_exempt
+@require_http_methods(["GET"])
+def write_off_detail(request: HttpRequest, write_off_id):
+    try:
+        write_off = InventoryWriteOff.objects.get(id=write_off_id)
+    except InventoryWriteOff.DoesNotExist as exc:
+        return _inventory_error_response(exc)
+    return json_response({"result": serialize_write_off(write_off)})
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def post_write_off(request: HttpRequest, write_off_id):
+    try:
+        write_off = InventoryWriteOff.objects.get(id=write_off_id)
+        active_warehouse = _active_warehouse_ref(request)
+        if active_warehouse and write_off.warehouse_ref != active_warehouse:
+            raise PermissionError("El posteo solo se permite en el almacen activo.")
+        result = post_inventory_write_off(
+            write_off_id=str(write_off_id),
+            payload=parse_json_body(request),
+            idempotency_key=require_idempotency_key(request),
+            actor=_request_actor(request) or "system",
+        )
+        return json_response(result.payload, status=result.status)
+    except Exception as exc:
+        return _inventory_error_response(exc)
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def reverse_write_off(request: HttpRequest, write_off_id):
+    try:
+        actor = _request_actor(request)
+        if not actor:
+            raise PermissionError("La reversa requiere un usuario operativo.")
+        write_off = InventoryWriteOff.objects.get(id=write_off_id)
+        active_warehouse = _active_warehouse_ref(request)
+        if active_warehouse and write_off.warehouse_ref != active_warehouse:
+            raise PermissionError("La reversa solo se permite en el almacen activo.")
+        result = reverse_inventory_write_off(
+            write_off_id=str(write_off_id),
+            payload=parse_json_body(request),
+            idempotency_key=require_idempotency_key(request),
+            actor=actor,
+        )
+        return json_response(result.payload, status=result.status)
+    except Exception as exc:
+        return _inventory_error_response(exc)
 
 
 @csrf_exempt

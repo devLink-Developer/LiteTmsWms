@@ -6,6 +6,7 @@ import { DrawerPanel } from "../../shared/components/DrawerPanel";
 import { FilterBar } from "../../shared/components/FilterBar";
 import { KpiStrip } from "../../shared/components/KpiStrip";
 import { StatusBadge } from "../../shared/components/StatusBadge";
+import { notify } from "../../shared/components/toast";
 import { storeForModule } from "../../stores/domainStores";
 import type { OperationModule, OperationRow } from "../../types/operations";
 
@@ -24,42 +25,58 @@ export function OperationalPage({ module }: OperationalPageProps) {
   const selectRecord = useStore((state) => state.selectRecord);
   const toggleSelection = useStore((state) => state.toggleSelection);
   const loading = useStore((state) => state.loading);
-  const error = useStore((state) => state.error);
   const setLoading = useStore((state) => state.setLoading);
   const setError = useStore((state) => state.setError);
   const [rows, setRows] = useState<OperationRow[]>([]);
+  const requiresSearchBeforeLoad = module.key === "orders";
+  const hasSearchFilter = filters.busqueda.trim().length > 0;
 
   useEffect(() => {
+    if (requiresSearchBeforeLoad && !hasSearchFilter) {
+      setRows([]);
+      setLoading(false);
+      setError(null);
+      return undefined;
+    }
     let cancelled = false;
     setLoading(true);
     setError(null);
-    fetchOperationRows(module)
-      .then((apiRows) => {
-        if (!cancelled) {
-          setRows(apiRows);
-        }
-      })
-      .catch((apiError: unknown) => {
-        if (!cancelled) {
-          setRows([]);
-          setError(apiError instanceof Error ? apiError.message : "No se pudieron cargar datos reales.");
-        }
-      })
-      .finally(() => {
-        if (!cancelled) {
-          setLoading(false);
-        }
-      });
+    const debounce = window.setTimeout(
+      () => {
+        fetchOperationRows(module, filters)
+          .then((apiRows) => {
+            if (!cancelled) {
+              setRows(apiRows);
+            }
+          })
+          .catch((apiError: unknown) => {
+            if (!cancelled) {
+              setRows([]);
+              const message = apiError instanceof Error ? apiError.message : "Datos no cargados.";
+              setError(message);
+              notify({ message, tone: "error" });
+            }
+          })
+          .finally(() => {
+            if (!cancelled) {
+              setLoading(false);
+            }
+          });
+      },
+      filters.busqueda.trim() ? 250 : 0,
+    );
 
     return () => {
       cancelled = true;
+      window.clearTimeout(debounce);
     };
-  }, [module, setError, setLoading]);
+  }, [filters, hasSearchFilter, module, requiresSearchBeforeLoad, setError, setLoading]);
 
   const filteredRows = useMemo(() => {
     return rows.filter((row) => {
       const search = filters.busqueda.trim().toLowerCase();
-      const matchesSearch = !search || `${row.ref} ${row.owner} ${row.warehouse}`.toLowerCase().includes(search);
+      const rawText = JSON.stringify(row.raw ?? {});
+      const matchesSearch = !search || `${row.ref} ${row.owner} ${row.warehouse} ${rawText}`.toLowerCase().includes(search);
       const matchesStatus = !filters.estado || row.status === filters.estado;
       const matchesWarehouse = !filters.warehouse || row.warehouse.toLowerCase().includes(filters.warehouse.toLowerCase());
       return matchesSearch && matchesStatus && matchesWarehouse;
@@ -75,11 +92,9 @@ export function OperationalPage({ module }: OperationalPageProps) {
         <header className="flex shrink-0 flex-wrap items-start justify-between gap-3">
           <div className="min-w-0">
             <h1 className="text-[20px] font-semibold text-night">{module.label}</h1>
-            <p className="mt-1 max-w-4xl text-[12px] leading-5 text-secondaryText">{module.description}</p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <StatusBadge label={module.permissions[0]} tone="info" />
-            {module.readOnly && <StatusBadge label="solo lectura" tone="neutral" />}
             {!module.readOnly && module.primaryAction && (
               <button
                 type="button"
@@ -94,9 +109,9 @@ export function OperationalPage({ module }: OperationalPageProps) {
         <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded border border-borderSoft bg-surface shadow-panel">
           <div className="flex min-h-11 items-center justify-between border-b border-borderSoft px-3">
             <div className="text-[12px] font-semibold text-night">
-              {loading ? "Cargando desde API..." : `${filteredRows.length} registros`}
+              {loading ? "Cargando..." : `${filteredRows.length} registros`}
             </div>
-            <div className="text-[11px] text-secondaryText">{error ?? `${selectedIds.length} seleccionados`}</div>
+            <div className="text-[11px] text-secondaryText">{selectedIds.length} seleccionados</div>
           </div>
           <FilterBar filters={filters} onFilter={setFilter} onReset={resetFilters} />
           <DataTable

@@ -1,4 +1,10 @@
-import { apiGet, apiHeaders, apiPost, apiUrl } from "./client";
+import { apiGet, apiHeaders, apiPost, trackedFetch } from "./client";
+import {
+  fetchWarehouseOptions as fetchLogisticsWarehouseOptions,
+  fetchWarehouseOptionsForStore as fetchLogisticsWarehouseOptionsForStore,
+} from "./logistics";
+
+export type { WarehouseOption } from "./logistics";
 
 export type RoutingDelivery = {
   id: string;
@@ -108,17 +114,6 @@ export type VehicleOption = {
   max_volume_m3: string;
 };
 
-export type WarehouseOption = {
-  warehouse_id?: string;
-  warehouse_code: string;
-  warehouse_name?: string;
-  warehouse_type?: string;
-  store_code?: string;
-  store_name?: string;
-  is_pickup_allowed?: boolean;
-  is_shipping_allowed?: boolean;
-};
-
 type CommandResult<T> = {
   result: T;
   rendition_id?: string;
@@ -140,17 +135,11 @@ export async function fetchVehicles() {
 }
 
 export async function fetchWarehouseOptions() {
-  const response = await apiGet<WarehouseOption>("/api/v1/logistics/master-data/warehouses/");
-  if (response.error) throw new Error(response.error.message);
-  return response.results ?? [];
+  return fetchLogisticsWarehouseOptions();
 }
 
 export async function fetchWarehouseOptionsForStore(store?: string) {
-  const params = new URLSearchParams();
-  if (store) params.set("store", store);
-  const response = await apiGet<WarehouseOption>(`/api/v1/logistics/master-data/warehouses/${params.toString() ? `?${params.toString()}` : ""}`);
-  if (response.error) throw new Error(response.error.message);
-  return response.results ?? [];
+  return fetchLogisticsWarehouseOptionsForStore(store);
 }
 
 export async function fetchRouteSheets(filters: { warehouse?: string; plannedDate?: string; status?: string[]; driverRef?: string }) {
@@ -165,7 +154,7 @@ export async function fetchRouteSheets(filters: { warehouse?: string; plannedDat
 }
 
 export async function fetchRouteSheet(routeId: string) {
-  const response = await fetch(apiUrl(`/api/v1/routesheets/${routeId}/`), {
+  const response = await trackedFetch(`/api/v1/routesheets/${routeId}/`, {
     credentials: "include",
     headers: apiHeaders(),
   });
@@ -194,7 +183,7 @@ export async function updateRouteStopOrder(
   stops: Array<{ id: string; sequence: number; lat?: string | null; lng?: string | null }>,
   removeStopIds: string[] = [],
 ) {
-  const response = await fetch(apiUrl(`/api/v1/routesheets/${routeId}/stops`), {
+  const response = await trackedFetch(`/api/v1/routesheets/${routeId}/stops`, {
     method: "PATCH",
     credentials: "include",
     headers: apiHeaders({
@@ -211,7 +200,7 @@ export async function updateRouteStopOrder(
 }
 
 export async function confirmRoute(routeId: string, payload: { vehicle_id?: string; driver_ref?: string; reviewed?: boolean }) {
-  const response = await fetch(apiUrl(`/api/v1/routesheets/${routeId}/confirm`), {
+  const response = await trackedFetch(`/api/v1/routesheets/${routeId}/confirm`, {
     method: "PUT",
     credentials: "include",
     headers: apiHeaders({
@@ -238,7 +227,7 @@ export async function executeStop(payload: {
   timestamp?: string;
   lines?: Array<{ source_line_ref: string; delivered_qty: string; rejected_qty?: string }>;
 }, idempotencyKey?: string) {
-  const response = await fetch(apiUrl("/api/v1/deliveries/execute"), {
+  const response = await trackedFetch("/api/v1/deliveries/execute", {
     method: "POST",
     credentials: "include",
     headers: apiHeaders({

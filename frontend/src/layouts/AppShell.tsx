@@ -2,8 +2,10 @@ import { LogOut } from "lucide-react";
 import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import { useEffect, useRef, useState } from "react";
 
-import { fetchWorkspaceContext } from "../api/workspace";
+import { fetchWorkspaceContext, setActiveWarehouse } from "../api/workspace";
+import { notify } from "../shared/components/toast";
 import { navigationEntries, navigationLinks } from "../shared/data/modules";
+import { useLiveStatusEvents } from "../shared/hooks/useLiveStatusEvents";
 import { useSessionStore } from "../stores/useSessionStore";
 import { useWorkspaceStore } from "../stores/useWorkspaceStore";
 import type { NavigationLink } from "../types/operations";
@@ -33,13 +35,16 @@ export function AppShell() {
   const [contextError, setContextError] = useState<string | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [isLoggingOut, setIsLoggingOut] = useState(false);
+  const [switchingWarehouse, setSwitchingWarehouse] = useState(false);
   const sidebarTimerRef = useRef<number | null>(null);
   const warehouseLabel =
     authorizedWarehouses.length === 1
       ? authorizedWarehouses[0]
       : authorizedWarehouses.length
         ? `${authorizedWarehouses.length} depositos`
-        : warehouseRef || "sin warehouse";
+      : warehouseRef || "sin warehouse";
+
+  useLiveStatusEvents({ enabled: Boolean(warehouseRef) });
 
   function clearSidebarTimer() {
     if (sidebarTimerRef.current !== null) {
@@ -71,6 +76,30 @@ export function AppShell() {
     }
   }
 
+  async function handleWarehouseChange(nextWarehouseRef: string) {
+    if (!nextWarehouseRef || nextWarehouseRef === warehouseRef) {
+      return;
+    }
+    setSwitchingWarehouse(true);
+    try {
+      const context = await setActiveWarehouse(nextWarehouseRef);
+      setContext({
+        warehouseRef: context.warehouse_ref,
+        branchRef: context.branch_ref,
+        role: context.role,
+        permissions: context.permissions,
+        authorizedWarehouses: context.authorized_warehouses ?? [],
+      });
+      setContextError(null);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Almacen no cambiado.";
+      setContextError(message);
+      notify({ message, tone: "error" });
+    } finally {
+      setSwitchingWarehouse(false);
+    }
+  }
+
   useEffect(() => {
     let cancelled = false;
     fetchWorkspaceContext()
@@ -89,7 +118,9 @@ export function AppShell() {
       })
       .catch((error: unknown) => {
         if (!cancelled) {
-          setContextError(error instanceof Error ? error.message : "No se pudo cargar contexto operativo.");
+          const message = error instanceof Error ? error.message : "Contexto no cargado.";
+          setContextError(message);
+          notify({ message, tone: "error" });
         }
       });
     return () => {
@@ -152,9 +183,28 @@ export function AppShell() {
             </div>
           </div>
           <div className="flex items-center gap-2">
-            <div className="hidden rounded border border-borderSoft bg-white px-3 py-1 font-mono text-[12px] font-semibold text-night md:block">
-              {warehouseLabel}
-            </div>
+            {authorizedWarehouses.length > 1 ? (
+              <label className="hidden items-center gap-2 rounded border border-borderSoft bg-white px-2 py-1 text-[11px] font-semibold text-secondaryText md:flex">
+                Almacen
+                <select
+                  value={warehouseRef}
+                  disabled={switchingWarehouse}
+                  onChange={(event) => void handleWarehouseChange(event.target.value)}
+                  className="h-7 rounded border border-borderSoft bg-white px-2 font-mono text-[12px] font-semibold text-night outline-none focus:border-primary focus:ring-2 focus:ring-primary/20"
+                  aria-label="Almacen activo"
+                >
+                  {authorizedWarehouses.map((warehouse) => (
+                    <option key={warehouse} value={warehouse}>
+                      {warehouse}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            ) : (
+              <div className="hidden rounded border border-borderSoft bg-white px-3 py-1 font-mono text-[12px] font-semibold text-night md:block">
+                {warehouseLabel}
+              </div>
+            )}
             <div className="hidden rounded border border-borderSoft bg-white px-3 py-1 text-[12px] font-semibold text-night sm:block">{role}</div>
             <button
               aria-label="Cerrar sesion"

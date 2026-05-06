@@ -11,6 +11,7 @@ import {
   type ApiRepartoDelivery,
 } from "../../api/fulfillment";
 import { StatusBadge } from "../../shared/components/StatusBadge";
+import { notify, useToastError } from "../../shared/components/toast";
 import { formatAppDateTime } from "../../shared/utils/dateFormat";
 import { formatIdentifier } from "../../shared/utils/identifierFormat";
 import type { StatusTone } from "../../types/operations";
@@ -68,7 +69,6 @@ export function RepartoPreparationPage() {
   const queryClient = useQueryClient();
   const today = localDateInputValue();
   const [plannedDate, setPlannedDate] = useState(today);
-  const [message, setMessage] = useState<string | null>(null);
 
   const deliveriesQuery = useQuery({
     queryKey: ["reparto-preparation-deliveries", plannedDate],
@@ -96,12 +96,12 @@ export function RepartoPreparationPage() {
   const sendToPrepareMutation = useMutation({
     mutationFn: async (delivery: ApiRepartoDelivery) => {
       if (!delivery.delivery_id) {
-        throw new Error("La entrega debe estar confirmada antes de enviarse a preparar.");
+        throw new Error("Entrega no confirmada.");
       }
       return sendDeliveryToPrepare(delivery.delivery_id);
     },
     onSuccess: (delivery) => {
-      setMessage(`${delivery.delivery_number} enviada a preparacion.`);
+      notify({ message: `${delivery.delivery_number} enviada a preparacion.`, tone: "success" });
       void queryClient.invalidateQueries({ queryKey: ["reparto-preparation-deliveries"] });
       void queryClient.invalidateQueries({ queryKey: ["reparto-preparation-tasks"] });
       void queryClient.invalidateQueries({ queryKey: ["routing-deliveries"] });
@@ -111,7 +111,7 @@ export function RepartoPreparationPage() {
   const markPreparedMutation = useMutation({
     mutationFn: (task: ApiPreparationTaskListItem) => markPreparationTaskPrepared(task.id),
     onSuccess: (delivery) => {
-      setMessage(`${delivery.delivery_number} marcada como preparada.`);
+      notify({ message: `${delivery.delivery_number} marcada como preparada.`, tone: "success" });
       void queryClient.invalidateQueries({ queryKey: ["reparto-preparation-tasks"] });
       void queryClient.invalidateQueries({ queryKey: ["routing-deliveries"] });
     },
@@ -121,12 +121,15 @@ export function RepartoPreparationPage() {
     mutationFn: (rows: ApiRepartoDelivery[]) =>
       mapWithConcurrency(rows, 4, async (delivery) => {
         if (!delivery.delivery_id) {
-          throw new Error("La entrega debe estar confirmada antes de enviarse a preparar.");
+          throw new Error("Entrega no confirmada.");
         }
         return sendDeliveryToPrepare(delivery.delivery_id);
-      }),
+    }),
     onSuccess: (rows) => {
-      setMessage(`${rows.length} entrega${rows.length === 1 ? "" : "s"} enviada${rows.length === 1 ? "" : "s"} a preparacion.`);
+      notify({
+        message: `${rows.length} entrega${rows.length === 1 ? "" : "s"} enviada${rows.length === 1 ? "" : "s"} a preparacion.`,
+        tone: "success",
+      });
       void queryClient.invalidateQueries({ queryKey: ["reparto-preparation-deliveries"] });
       void queryClient.invalidateQueries({ queryKey: ["reparto-preparation-tasks"] });
       void queryClient.invalidateQueries({ queryKey: ["routing-deliveries"] });
@@ -136,7 +139,10 @@ export function RepartoPreparationPage() {
   const markAllPreparedMutation = useMutation({
     mutationFn: (rows: ApiPreparationTaskListItem[]) => mapWithConcurrency(rows, 3, (task) => markPreparationTaskPrepared(task.id)),
     onSuccess: (rows) => {
-      setMessage(`${rows.length} entrega${rows.length === 1 ? "" : "s"} marcada${rows.length === 1 ? "" : "s"} como preparada${rows.length === 1 ? "" : "s"}.`);
+      notify({
+        message: `${rows.length} entrega${rows.length === 1 ? "" : "s"} marcada${rows.length === 1 ? "" : "s"} como preparada${rows.length === 1 ? "" : "s"}.`,
+        tone: "success",
+      });
       void queryClient.invalidateQueries({ queryKey: ["reparto-preparation-tasks"] });
       void queryClient.invalidateQueries({ queryKey: ["routing-deliveries"] });
     },
@@ -149,6 +155,7 @@ export function RepartoPreparationPage() {
     markPreparedMutation.error ||
     sendAllToPrepareMutation.error ||
     markAllPreparedMutation.error;
+  useToastError(error);
   const busy =
     deliveriesQuery.isLoading ||
     sendToPrepareMutation.isPending ||
@@ -200,17 +207,6 @@ export function RepartoPreparationPage() {
           </button>
         </div>
       </header>
-
-      {(error || message) && (
-        <div
-          className={`shrink-0 rounded border px-3 py-2 text-[12px] ${
-            error ? "border-red-200 bg-red-50 text-red-700" : "border-emerald-200 bg-emerald-50 text-emerald-800"
-          }`}
-          role="status"
-        >
-          {error instanceof Error ? error.message : message}
-        </div>
-      )}
 
       <section className="grid shrink-0 grid-cols-1 gap-2 rounded border border-borderSoft bg-white p-3 md:grid-cols-[180px]">
         <label className="grid gap-1 text-[11px] font-semibold text-secondaryText">
@@ -269,7 +265,7 @@ export function RepartoPreparationPage() {
               {!deliveries.length && (
                 <tr>
                   <td colSpan={6} className="px-3 py-6 text-[12px] text-secondaryText">
-                    {deliveriesQuery.isLoading ? "Cargando entregas..." : "No hay entregas confirmadas para enviar a preparacion."}
+                    {deliveriesQuery.isLoading ? "Cargando..." : "Sin entregas."}
                   </td>
                 </tr>
               )}
@@ -311,7 +307,7 @@ export function RepartoPreparationPage() {
             ))}
             {!tasks.length && (
               <div className="px-3 py-6 text-[12px] text-secondaryText">
-                {tasksQuery.isLoading ? "Cargando tareas..." : "No hay tareas abiertas de reparto."}
+                {tasksQuery.isLoading ? "Cargando..." : "Sin tareas."}
               </div>
             )}
           </div>

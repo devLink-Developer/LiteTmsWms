@@ -1,73 +1,20 @@
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
-import { useEffect, useMemo, useState } from "react";
 
-import { fetchOperationRows, fetchOperationalOverview } from "../../api/operations";
+import {
+  fetchOperationalDashboard,
+  type DashboardCountDatum,
+  type DashboardLedgerDay,
+  type DashboardQuantityByUom,
+  type DashboardRouteLoad,
+  type DashboardStockState,
+  type OperationalDashboard,
+  type OperationalDashboardKpi,
+  type OperationalDashboardModule,
+} from "../../api/operations";
 import { StatusBadge } from "../../shared/components/StatusBadge";
-import { dashboardOperationModules } from "../../shared/data/modules";
-import type { OperationModule, OperationRow, StatusTone } from "../../types/operations";
-
-type ModuleErrorMap = Record<string, string>;
-
-type OperationalMetric = {
-  label: string;
-  value: string;
-  detail: string;
-  tone: StatusTone;
-};
-
-type ModuleSummary = {
-  module: OperationModule;
-  loaded: boolean;
-  error?: string;
-  total: number;
-  active: number;
-  issues: number;
-  focus: string;
-  badgeLabel: string;
-  badgeTone: StatusTone;
-};
-
-type AlertRow = {
-  module: OperationModule;
-  row: OperationRow;
-  tone: StatusTone;
-};
-
-const TERMINAL_STATUSES = new Set([
-  "cancelled",
-  "closed",
-  "delivered",
-  "delivered_complete",
-  "received",
-  "returned",
-]);
-
-const DANGER_STATUSES = new Set(["blocked", "cancelled", "discrepant", "failed", "scrapped", "with_incident"]);
-const WARNING_STATUSES = new Set([
-  "adjustment",
-  "attempted",
-  "delivered_partial",
-  "partial",
-  "partial_received",
-  "partially_delivered",
-  "rescheduled",
-  "returned",
-  "reversal",
-]);
-
-const ROUTED_DELIVERY_STATUSES = new Set([
-  "assigned",
-  "cancelled",
-  "delivered",
-  "delivered_complete",
-  "in_route",
-  "loaded",
-  "planned",
-  "returned",
-]);
-
-const ACTIVE_ROUTE_STATUSES = new Set(["assigned", "capacity_checked", "in_transit", "loading", "planned"]);
-const RESERVED_STOCK_STATES = new Set(["in_transit", "packed", "picking", "reserved"]);
+import { notify } from "../../shared/components/toast";
+import type { StatusTone } from "../../types/operations";
 
 const metricToneClasses: Record<StatusTone, string> = {
   neutral: "border-borderSoft bg-white text-night",
@@ -86,239 +33,294 @@ const barToneClasses: Record<StatusTone, string> = {
 };
 
 function messageFor(error: unknown) {
-  return error instanceof Error ? error.message : "No se pudo cargar el modulo.";
+  return error instanceof Error ? error.message : "Dashboard no cargado.";
 }
 
-function hasLoadedRows(rowsByModule: Record<string, OperationRow[]>, key: string) {
-  return Object.prototype.hasOwnProperty.call(rowsByModule, key);
-}
-
-function statusOf(row: OperationRow) {
-  return row.status.trim().toLowerCase();
-}
-
-function rawText(row: OperationRow, key: string) {
-  const value = row.raw?.[key];
-  return value === null || value === undefined ? "" : String(value).trim();
-}
-
-function rawNumber(row: OperationRow, key: string) {
-  const value = rawText(row, key).replace(",", ".");
-  const parsed = Number.parseFloat(value);
+function numberValue(value: number | string) {
+  const parsed = typeof value === "number" ? value : Number.parseFloat(value);
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
-function countStatus(rows: OperationRow[], statuses: Iterable<string>) {
-  const lookup = new Set(Array.from(statuses, (status) => status.toLowerCase()));
-  return rows.filter((row) => lookup.has(statusOf(row))).length;
-}
-
-function sumRawNumber(rows: OperationRow[], key: string) {
-  return rows.reduce((total, row) => total + rawNumber(row, key), 0);
-}
-
-function isOpen(row: OperationRow) {
-  return !TERMINAL_STATUSES.has(statusOf(row));
-}
-
-function issueToneFor(row: OperationRow): StatusTone | null {
-  const status = statusOf(row);
-  if (row.statusTone === "danger" || DANGER_STATUSES.has(status)) {
-    return "danger";
+function formatCount(value: number | string) {
+  if (typeof value === "string" && Number.isNaN(Number(value))) {
+    return value;
   }
-  if (row.statusTone === "warning" || WARNING_STATUSES.has(status)) {
-    return "warning";
-  }
-  return null;
+  return new Intl.NumberFormat("es-AR", { maximumFractionDigits: 0 }).format(numberValue(value));
 }
 
-function isPastDue(row: OperationRow) {
-  if (!isOpen(row)) {
-    return false;
-  }
-  const dateText = rawText(row, "planned_date") || rawText(row, "requested_date") || rawText(row, "posted_at") || row.sla;
-  const dateKey = dateText.slice(0, 10);
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateKey)) {
-    return false;
-  }
-  return dateKey < new Date().toISOString().slice(0, 10);
+function formatQuantity(value: string | number) {
+  return new Intl.NumberFormat("es-AR", { maximumFractionDigits: 3 }).format(numberValue(value));
 }
 
-function formatCount(value: number) {
-  return new Intl.NumberFormat("es-AR", { maximumFractionDigits: 0 }).format(value);
+function formatDate(value: string) {
+  if (!value) return "-";
+  const date = new Date(`${value.slice(0, 10)}T00:00:00`);
+  return Number.isNaN(date.getTime())
+    ? value
+    : new Intl.DateTimeFormat("es-AR", { day: "2-digit", month: "2-digit" }).format(date);
 }
 
-function formatQuantity(value: number) {
-  return new Intl.NumberFormat("es-AR", { maximumFractionDigits: Number.isInteger(value) ? 0 : 1 }).format(value);
+function formatDateTime(value: string) {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime())
+    ? "-"
+    : new Intl.DateTimeFormat("es-AR", { dateStyle: "short", timeStyle: "short" }).format(date);
 }
 
-function plural(value: number, singular: string, pluralLabel: string) {
-  return value === 1 ? singular : pluralLabel;
-}
-
-function moduleIssueTone(rows: OperationRow[]) {
-  if (rows.some((row) => issueToneFor(row) === "danger")) {
-    return "danger";
-  }
-  if (rows.some((row) => issueToneFor(row) === "warning")) {
-    return "warning";
-  }
-  return "success";
-}
-
-function activeCountFor(moduleKey: string, rows: OperationRow[]) {
-  if (moduleKey === "stock") {
-    return rows.filter((row) => rawNumber(row, "quantity") > 0).length;
-  }
-  if (moduleKey === "stock-movements") {
-    return rows.length;
-  }
-  return rows.filter(isOpen).length;
-}
-
-function focusFor(moduleKey: string, rows: OperationRow[]) {
+function quantityText(rows: DashboardQuantityByUom[]) {
   if (!rows.length) {
-    return "Sin registros cargados";
+    return "-";
   }
-
-  if (moduleKey === "orders") {
-    return `${formatCount(countStatus(rows, ["pending", "allocated", "preparing"]))} en flujo / ${formatCount(
-      countStatus(rows, ["ready_for_dispatch"]),
-    )} listas despacho`;
-  }
-  if (moduleKey === "deliveries") {
-    return `${formatCount(countStatus(rows, ["preparing", "prepared", "loaded"]))} prep/carga / ${formatCount(
-      rows.filter(isPastDue).length,
-    )} vencidas`;
-  }
-  if (moduleKey === "tasks") {
-    return `${formatCount(countStatus(rows, ["assigned"]))} asignadas / ${formatCount(
-      countStatus(rows, ["preparing"]),
-    )} en preparacion`;
-  }
-  if (moduleKey === "distribution") {
-    const pendingRoute = rows.filter((row) => !ROUTED_DELIVERY_STATUSES.has(statusOf(row))).length;
-    return `${formatCount(pendingRoute)} por rutear / ${formatCount(countStatus(rows, ["in_route", "loaded"]))} en ruta`;
-  }
-  if (moduleKey === "receipts") {
-    return `${formatCount(countStatus(rows, ["expected", "partial_received", "receiving"]))} por recibir / ${formatCount(
-      countStatus(rows, ["with_incident"]),
-    )} incidencias`;
-  }
-  if (moduleKey === "transfers") {
-    return `${formatCount(countStatus(rows, ["dispatched", "in_transit", "picking"]))} en transito / ${formatCount(
-      countStatus(rows, ["discrepant", "partial_received"]),
-    )} diferencias`;
-  }
-  if (moduleKey === "returns") {
-    return `${formatCount(countStatus(rows, ["returned"]))} devueltas / ${formatCount(rows.filter(isOpen).length)} abiertas`;
-  }
-  if (moduleKey === "routes") {
-    const activeRoutes = rows.filter((row) => ACTIVE_ROUTE_STATUSES.has(statusOf(row))).length;
-    return `${formatCount(activeRoutes)} activas / ${formatQuantity(sumRawNumber(rows, "planned_weight_kg"))} kg`;
-  }
-  if (moduleKey === "stock") {
-    const onHand = rows.filter((row) => statusOf(row) === "on_hand");
-    const reserved = rows.filter((row) => RESERVED_STOCK_STATES.has(statusOf(row)));
-    return `${formatQuantity(sumRawNumber(onHand, "quantity"))} disp. / ${formatQuantity(
-      sumRawNumber(reserved, "quantity"),
-    )} reservado`;
-  }
-  if (moduleKey === "stock-movements") {
-    return `${formatCount(rows.filter((row) => rawText(row, "direction") === "increase").length)} entradas / ${formatCount(
-      rows.filter((row) => rawText(row, "direction") === "decrease").length,
-    )} salidas`;
-  }
-  return `${formatCount(rows.filter(isOpen).length)} activos`;
+  return rows.slice(0, 3).map((row) => `${formatQuantity(row.quantity)} ${row.uom}`).join(" / ");
 }
 
-function buildModuleSummary(
-  module: OperationModule,
-  rowsByModule: Record<string, OperationRow[]>,
-  moduleErrors: ModuleErrorMap,
-  loading: boolean,
-): ModuleSummary {
-  const rows = rowsByModule[module.key] ?? [];
-  const error = moduleErrors[module.key];
-  const loaded = hasLoadedRows(rowsByModule, module.key);
-  const issues = rows.filter(issueToneFor).length;
-  const issueTone = moduleIssueTone(rows);
-  const badgeTone = error ? "danger" : loading && !loaded ? "neutral" : issueTone;
-
-  return {
-    module,
-    loaded,
-    error,
-    total: rows.length,
-    active: activeCountFor(module.key, rows),
-    issues,
-    focus: error ? "Sin datos por error de API" : focusFor(module.key, rows),
-    badgeLabel: error ? "Error" : loading && !loaded ? "Cargando" : issues > 0 ? "Atencion" : "OK",
-    badgeTone,
-  };
+function chartRows(data: DashboardCountDatum[], showZeros = false) {
+  const visible = showZeros ? data : data.filter((row) => row.count > 0);
+  return visible.length ? visible : data.slice(0, 5);
 }
 
-function MetricCard({ metric }: { metric: OperationalMetric }) {
+function MetricCard({ metric }: { metric: OperationalDashboardKpi }) {
   return (
-    <article className={`min-h-[78px] rounded border px-2.5 py-2 shadow-panel ${metricToneClasses[metric.tone]}`}>
+    <article className={`min-h-[82px] rounded border px-2.5 py-2 shadow-panel ${metricToneClasses[metric.tone]}`}>
       <div className="text-[11px] font-semibold uppercase leading-4 text-secondaryText">{metric.label}</div>
-      <div className="mt-1 font-mono text-[22px] font-semibold leading-7 text-night">{metric.value}</div>
-      <div className="mt-1 text-[11px] leading-4 text-secondaryText">{metric.detail}</div>
+      <div className="mt-1 font-mono text-[22px] font-semibold leading-7 text-night">{formatCount(metric.value)}</div>
     </article>
   );
 }
 
+function ChartPanel({ title, aside, children }: { title: string; aside?: ReactNode; children: ReactNode }) {
+  return (
+    <section className="min-h-[220px] rounded border border-borderSoft bg-surface shadow-panel">
+      <div className="flex min-h-11 items-center justify-between gap-3 border-b border-borderSoft px-3">
+        <h2 className="text-[13px] font-semibold text-night">{title}</h2>
+        {aside && <div className="text-[11px] text-secondaryText">{aside}</div>}
+      </div>
+      <div className="p-3">{children}</div>
+    </section>
+  );
+}
+
+function HorizontalBarChart({
+  data,
+  ariaLabel,
+  showZeros = false,
+  tone = "info",
+}: {
+  data: DashboardCountDatum[];
+  ariaLabel: string;
+  showZeros?: boolean;
+  tone?: StatusTone;
+}) {
+  const rows = chartRows(data, showZeros);
+  const max = Math.max(1, ...rows.map((row) => row.count));
+
+  return (
+    <div className="space-y-2" aria-label={ariaLabel}>
+      {rows.map((row) => {
+        const width = Math.round((row.count / max) * 100);
+        return (
+          <div key={row.key} className="grid grid-cols-[minmax(112px,0.55fr)_minmax(120px,1fr)_56px] items-center gap-2">
+            <div className="min-w-0 text-[12px] font-semibold leading-4 text-night">{row.label}</div>
+            <div className="h-3 overflow-hidden rounded bg-softMid" aria-hidden="true">
+              <div className={`h-full ${barToneClasses[row.count ? tone : "neutral"]}`} style={{ width: `${width}%` }} />
+            </div>
+            <div className="text-right font-mono text-[12px] font-semibold text-night">{formatCount(row.count)}</div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function StockStateChart({ data }: { data: DashboardStockState[] }) {
+  const rows = data.filter((row) => row.buckets > 0);
+  const visibleRows = rows.length ? rows : data.slice(0, 5);
+  const max = Math.max(1, ...visibleRows.map((row) => row.buckets));
+
+  return (
+    <div className="space-y-2" aria-label="Stock positivo por estado">
+      {visibleRows.map((row) => {
+        const width = Math.round((row.buckets / max) * 100);
+        return (
+          <div key={row.key} className="grid grid-cols-[minmax(120px,0.5fr)_minmax(120px,1fr)_72px] items-center gap-2">
+            <div className="min-w-0">
+              <div className="text-[12px] font-semibold leading-4 text-night">{row.label}</div>
+              <div className="text-[11px] leading-4 text-secondaryText">{quantityText(row.quantity_by_uom)}</div>
+            </div>
+            <div className="h-3 overflow-hidden rounded bg-softMid" aria-hidden="true">
+              <div className={`h-full ${row.key === "scrapped" ? "bg-red-600" : "bg-emerald-600"}`} style={{ width: `${width}%` }} />
+            </div>
+            <div className="text-right font-mono text-[12px] font-semibold text-night">{formatCount(row.buckets)}</div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function LedgerChart({ data }: { data: DashboardLedgerDay[] }) {
+  const max = Math.max(1, ...data.map((row) => row.increase_count + row.decrease_count));
+  const plotHeight = 92;
+  const baseline = 118;
+  const step = 84;
+  const firstX = 46;
+  const totalPoint = (row: DashboardLedgerDay, index: number) => {
+    const total = row.increase_count + row.decrease_count;
+    const x = firstX + index * step + 18;
+    const y = baseline - Math.round((total / max) * plotHeight);
+    return `${x},${y}`;
+  };
+
+  return (
+    <div aria-label="Movimientos de ledger por dia">
+      <svg className="h-[168px] w-full" viewBox="0 0 620 168" role="img" aria-label="Entradas y salidas de ledger en los ultimos 7 dias">
+        <title>Ledger ultimos 7 dias</title>
+        <line x1="34" x2="590" y1={baseline} y2={baseline} className="stroke-borderSoft" strokeWidth="1" />
+        <polyline
+          points={data.map(totalPoint).join(" ")}
+          className="fill-none stroke-night"
+          strokeWidth="2"
+          strokeLinejoin="round"
+          strokeLinecap="round"
+        />
+        {data.map((row, index) => {
+          const x = firstX + index * step;
+          const increaseHeight = Math.round((row.increase_count / max) * plotHeight);
+          const decreaseHeight = Math.round((row.decrease_count / max) * plotHeight);
+          return (
+            <g key={row.date}>
+              <rect x={x} y={baseline - increaseHeight} width="16" height={increaseHeight} rx="2" className="fill-primary" />
+              <rect x={x + 20} y={baseline - decreaseHeight} width="16" height={decreaseHeight} rx="2" className="fill-amber-500" />
+              <circle cx={x + 18} cy={baseline - Math.round(((row.increase_count + row.decrease_count) / max) * plotHeight)} r="3" className="fill-night" />
+              <text x={x + 18} y="144" textAnchor="middle" className="fill-secondaryText text-[10px]">
+                {formatDate(row.date)}
+              </text>
+              <text x={x + 18} y="158" textAnchor="middle" className="fill-night text-[10px] font-semibold">
+                {formatCount(row.increase_count + row.decrease_count)}
+              </text>
+            </g>
+          );
+        })}
+      </svg>
+      <div className="grid grid-cols-2 gap-2 text-[11px] leading-4 text-secondaryText">
+        <div><span className="font-semibold text-primaryHover">Entradas</span></div>
+        <div><span className="font-semibold text-amber-700">Salidas</span></div>
+      </div>
+    </div>
+  );
+}
+
+function RouteLoadPanel({ routes }: { routes: DashboardRouteLoad[] }) {
+  if (!routes.length) {
+    return <div className="rounded border border-borderSoft bg-white px-3 py-2 text-[12px] text-secondaryText">Sin hojas activas.</div>;
+  }
+
+  return (
+    <div className="overflow-auto">
+      <table className="w-full border-collapse text-left text-[12px]">
+        <thead className="bg-deep text-white">
+          <tr>
+            <th className="px-3 py-2 font-semibold">Hoja</th>
+            <th className="px-3 py-2 font-semibold">Estado</th>
+            <th className="px-3 py-2 text-right font-semibold">Paradas</th>
+            <th className="px-3 py-2 text-right font-semibold">Kg</th>
+            <th className="px-3 py-2 text-right font-semibold">m3</th>
+          </tr>
+        </thead>
+        <tbody>
+          {routes.map((route) => (
+            <tr key={route.route_number} className="border-b border-borderSoft bg-white">
+              <td className="px-3 py-2 font-mono font-semibold text-night">{route.route_number}</td>
+              <td className="px-3 py-2 text-secondaryText">{route.status}</td>
+              <td className="px-3 py-2 text-right font-mono text-night">{formatCount(route.stops)}</td>
+              <td className="px-3 py-2 text-right font-mono text-night">{formatQuantity(route.planned_weight_kg)}</td>
+              <td className="px-3 py-2 text-right font-mono text-night">{formatQuantity(route.planned_volume_m3)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function ModuleTable({ modules }: { modules: OperationalDashboardModule[] }) {
+  return (
+    <div className="overflow-auto">
+      <table className="w-full border-collapse text-left text-[12px]">
+        <thead className="sticky top-0 bg-deep text-white">
+          <tr>
+            <th className="min-w-[180px] px-3 py-2 font-semibold">Modulo</th>
+            <th className="px-3 py-2 text-right font-semibold">Reg.</th>
+            <th className="px-3 py-2 text-right font-semibold">Activos</th>
+            <th className="px-3 py-2 text-right font-semibold">Alertas</th>
+            <th className="px-3 py-2 font-semibold">Estado</th>
+          </tr>
+        </thead>
+        <tbody>
+          {modules.map((module) => (
+            <tr key={module.key} className="border-b border-borderSoft bg-white hover:bg-softStart">
+              <td className="px-3 py-2">
+                <Link className="font-semibold text-primaryHover hover:text-primary" to={module.path}>
+                  {module.label}
+                </Link>
+              </td>
+              <td className="px-3 py-2 text-right font-mono text-night">{formatCount(module.count)}</td>
+              <td className="px-3 py-2 text-right font-mono text-night">{formatCount(module.active)}</td>
+              <td className="px-3 py-2 text-right font-mono text-night">{formatCount(module.issues)}</td>
+              <td className="px-3 py-2">
+                <StatusBadge label={module.issues ? "Atencion" : module.count ? "OK" : "Cero"} tone={module.issues ? "warning" : module.count ? "success" : "neutral"} />
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function AlertsPanel({ dashboard }: { dashboard: OperationalDashboard }) {
+  return (
+    <div className="space-y-2">
+      {dashboard.alerts.length ? (
+        dashboard.alerts.map((alert) => (
+          <div key={alert.key} className={`rounded border px-2.5 py-2 text-[12px] leading-5 ${metricToneClasses[alert.tone]}`}>
+            <div className="flex items-center justify-between gap-2">
+              <span className="font-semibold text-night">{alert.label}</span>
+              <span className="font-mono font-semibold text-night">{formatCount(alert.value)}</span>
+            </div>
+          </div>
+        ))
+      ) : (
+        <div className="rounded border border-borderSoft bg-white px-2.5 py-2 text-[12px] leading-5 text-secondaryText">
+          Sin alertas.
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function DashboardPage() {
-  const [rowsByModule, setRowsByModule] = useState<Record<string, OperationRow[]>>({});
-  const [moduleErrors, setModuleErrors] = useState<ModuleErrorMap>({});
-  const [principles, setPrinciples] = useState<string[]>([]);
-  const [overviewError, setOverviewError] = useState<string | null>(null);
+  const [dashboard, setDashboard] = useState<OperationalDashboard | null>(null);
+  const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
-    setOverviewError(null);
-    setModuleErrors({});
+    setError(null);
 
-    const overviewRequest = fetchOperationalOverview()
-      .then((overview) => {
+    fetchOperationalDashboard()
+      .then((payload) => {
         if (!cancelled) {
-          setPrinciples(overview.principles ?? []);
+          setDashboard(payload);
         }
       })
       .catch((apiError: unknown) => {
         if (!cancelled) {
-          setPrinciples([]);
-          setOverviewError(messageFor(apiError));
+          const message = messageFor(apiError);
+          setError(message);
+          notify({ message, tone: "error" });
         }
-      });
-
-    const moduleRequests = dashboardOperationModules.map((module) =>
-      fetchOperationRows(module)
-        .then((rows) => ({ module, rows, error: null }))
-        .catch((apiError: unknown) => ({ module, rows: [], error: messageFor(apiError) })),
-    );
-
-    Promise.all([overviewRequest, Promise.all(moduleRequests)])
-      .then(([, moduleResults]) => {
-        if (cancelled) {
-          return;
-        }
-
-        const nextRowsByModule: Record<string, OperationRow[]> = {};
-        const nextErrors: ModuleErrorMap = {};
-
-        moduleResults.forEach((result) => {
-          if (result.error) {
-            nextErrors[result.module.key] = result.error;
-            return;
-          }
-          nextRowsByModule[result.module.key] = result.rows;
-        });
-
-        setRowsByModule(nextRowsByModule);
-        setModuleErrors(nextErrors);
       })
       .finally(() => {
         if (!cancelled) {
@@ -331,280 +333,94 @@ export function DashboardPage() {
     };
   }, []);
 
-  const summaries = useMemo(
-    () => dashboardOperationModules.map((module) => buildModuleSummary(module, rowsByModule, moduleErrors, loading)),
-    [loading, moduleErrors, rowsByModule],
+  const moduleTotal = useMemo(
+    () => dashboard?.modules.reduce((total, module) => total + module.count, 0) ?? 0,
+    [dashboard],
+  );
+  const moduleIssues = useMemo(
+    () => dashboard?.modules.reduce((total, module) => total + module.issues, 0) ?? 0,
+    [dashboard],
   );
 
-  const operationalMetrics: OperationalMetric[] = useMemo(() => {
-    const rowsFor = (key: string) => rowsByModule[key] ?? [];
-    const orders = rowsFor("orders");
-    const deliveries = rowsFor("deliveries");
-    const tasks = rowsFor("tasks");
-    const distribution = rowsFor("distribution");
-    const receipts = rowsFor("receipts");
-    const transfers = rowsFor("transfers");
-    const returns = rowsFor("returns");
-    const routes = rowsFor("routes");
-    const stock = rowsFor("stock");
-    const movements = rowsFor("stock-movements");
+  if (!dashboard && loading) {
+    return (
+      <div className="flex h-full items-center justify-center p-4">
+        <div className="rounded border border-borderSoft bg-surface px-4 py-3 text-[13px] font-semibold text-secondaryText shadow-panel">
+          Cargando...
+        </div>
+      </div>
+    );
+  }
 
-    const ordersOpen = orders.filter(isOpen).length;
-    const deliveryIssues = deliveries.filter(issueToneFor).length;
-    const taskIssues = tasks.filter((row) => issueToneFor(row) || isPastDue(row)).length;
-    const pendingRoute = distribution.filter((row) => !ROUTED_DELIVERY_STATUSES.has(statusOf(row))).length;
-    const inboundRows = [...receipts, ...transfers];
-    const inboundIssues = inboundRows.filter(issueToneFor).length + returns.length;
-    const activeRoutes = routes.filter((row) => ACTIVE_ROUTE_STATUSES.has(statusOf(row))).length;
-    const onHandRows = stock.filter((row) => statusOf(row) === "on_hand");
-    const reservedRows = stock.filter((row) => RESERVED_STOCK_STATES.has(statusOf(row)));
-    const loadedModules = dashboardOperationModules.filter((module) => hasLoadedRows(rowsByModule, module.key)).length;
-    const failedModules = Object.keys(moduleErrors).length;
-
-    return [
-      {
-        label: "Pedidos abiertos",
-        value: formatCount(ordersOpen),
-        detail: `${formatCount(orders.length)} cargados / ${formatCount(
-          countStatus(orders, ["ready_for_dispatch"]),
-        )} listos despacho`,
-        tone: orders.some((row) => issueToneFor(row) === "danger") ? "danger" : "info",
-      },
-      {
-        label: "Entregas activas",
-        value: formatCount(deliveries.filter(isOpen).length),
-        detail: `${formatCount(deliveries.filter(isPastDue).length)} vencidas / ${formatCount(
-          deliveryIssues,
-        )} con atencion`,
-        tone: deliveryIssues > 0 ? "warning" : "success",
-      },
-      {
-        label: "Tareas preparacion",
-        value: formatCount(tasks.filter(isOpen).length),
-        detail: `${formatQuantity(sumRawNumber(tasks, "total_qty"))} unidades / ${formatCount(taskIssues)} alertas`,
-        tone: taskIssues > 0 ? "warning" : tasks.length ? "info" : "neutral",
-      },
-      {
-        label: "Reparto para ruteo",
-        value: formatCount(pendingRoute),
-        detail: `${formatCount(distribution.length)} reparto / ${formatCount(
-          countStatus(distribution, ["in_route", "loaded"]),
-        )} en ruta`,
-        tone: pendingRoute > 0 ? "warning" : "success",
-      },
-      {
-        label: "Ingresos abiertos",
-        value: formatCount(inboundRows.filter(isOpen).length),
-        detail: `${formatCount(receipts.length)} OC / ${formatCount(transfers.length)} TR / ${formatCount(
-          inboundIssues,
-        )} alertas`,
-        tone: inboundIssues > 0 ? "warning" : "success",
-      },
-      {
-        label: "Hojas activas",
-        value: formatCount(activeRoutes),
-        detail: `${formatQuantity(sumRawNumber(routes, "planned_weight_kg"))} kg / ${formatQuantity(
-          sumRawNumber(routes, "planned_volume_m3"),
-        )} m3 plan`,
-        tone: activeRoutes > 0 ? "info" : "neutral",
-      },
-      {
-        label: "Stock disponible",
-        value: formatQuantity(sumRawNumber(onHandRows, "quantity")),
-        detail: `${formatQuantity(sumRawNumber(reservedRows, "quantity"))} reservado/prep / ${formatCount(
-          stock.length,
-        )} buckets`,
-        tone: stock.some((row) => issueToneFor(row) === "danger") ? "danger" : "success",
-      },
-      {
-        label: "Movimientos ledger",
-        value: formatCount(movements.length),
-        detail: `${formatCount(movements.filter((row) => rawText(row, "direction") === "increase").length)} entradas / ${formatCount(
-          movements.filter((row) => rawText(row, "direction") === "decrease").length,
-        )} salidas`,
-        tone: movements.some((row) => issueToneFor(row)) ? "warning" : "info",
-      },
-      {
-        label: "Modulos API",
-        value: `${formatCount(loadedModules)}/${formatCount(dashboardOperationModules.length)}`,
-        detail: `${formatCount(failedModules)} con error / ${loading ? "cargando" : "actualizado"}`,
-        tone: failedModules > 0 ? "danger" : loading ? "info" : "success",
-      },
-    ];
-  }, [moduleErrors, rowsByModule, loading]);
-
-  const alerts: AlertRow[] = useMemo(() => {
-    return dashboardOperationModules
-      .flatMap((module) =>
-        (rowsByModule[module.key] ?? []).flatMap((row) => {
-          const tone = issueToneFor(row);
-          return tone ? [{ module, row, tone }] : [];
-        }),
-      )
-      .sort((left, right) => (left.tone === right.tone ? 0 : left.tone === "danger" ? -1 : 1))
-      .slice(0, 8);
-  }, [rowsByModule]);
-
-  const loadedModules = summaries.filter((summary) => summary.loaded).length;
-  const failedModules = summaries.filter((summary) => summary.error).length;
-  const totalRows = summaries.reduce((total, summary) => total + summary.total, 0);
+  if (!dashboard) {
+    return (
+      <div className="flex h-full items-center justify-center p-4">
+        <div className="max-w-lg rounded border border-red-200 bg-red-50 px-4 py-3 text-[13px] leading-5 text-red-800 shadow-panel">
+          <div className="font-semibold">Dashboard no cargado.</div>
+          <div className="mt-1">{error}</div>
+        </div>
+      </div>
+    );
+  }
 
   return (
-    <div className="flex h-full min-h-0 flex-col gap-3 overflow-hidden p-3">
-      <section className="flex shrink-0 flex-wrap items-start justify-between gap-3">
-        <div className="min-w-0">
-          <h1 className="text-[20px] font-semibold text-night">Dashboard operativo</h1>
-          <p className="mt-1 max-w-4xl text-[12px] leading-5 text-secondaryText">
-            KPIs TMS/WMS derivados de pedidos, entrega, reparto, ingresos, hojas de ruta, stock y ledger.
-          </p>
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <StatusBadge label={loading ? "cargando API" : `${loadedModules}/${dashboardOperationModules.length} modulos`} tone={loading ? "info" : failedModules ? "warning" : "success"} />
-          <StatusBadge label={`${formatCount(totalRows)} registros`} tone="info" />
-          <StatusBadge label="legacy read-only" tone="neutral" />
-        </div>
-      </section>
-
-      {(failedModules > 0 || overviewError) && (
-        <div className="grid shrink-0 grid-cols-1 gap-2 text-[12px] leading-5 md:grid-cols-2">
-          {failedModules > 0 && (
-            <div className="rounded border border-amber-300 bg-amber-50 px-3 py-2 text-amber-900">
-              Carga parcial: {formatCount(failedModules)} {plural(failedModules, "modulo con error", "modulos con error")}.
-              Los KPIs usan los datos disponibles.
-            </div>
-          )}
-          {overviewError && (
-            <div className="rounded border border-red-200 bg-red-50 px-3 py-2 text-red-700">
-              Principios operativos no disponibles: {overviewError}
-            </div>
-          )}
-        </div>
-      )}
-
-      <section className="grid shrink-0 grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-4 2xl:grid-cols-8" aria-label="KPIs TMS/WMS">
-        {operationalMetrics.map((metric) => (
-          <MetricCard key={metric.label} metric={metric} />
-        ))}
-      </section>
-
-      <section className="grid min-h-0 flex-1 grid-cols-1 gap-3 overflow-hidden xl:grid-cols-[minmax(0,1.45fr)_minmax(320px,0.55fr)]">
-        <div className="flex min-h-0 flex-col overflow-hidden rounded border border-borderSoft bg-surface shadow-panel">
-          <div className="flex min-h-11 items-center justify-between border-b border-borderSoft px-3">
-            <h2 className="text-[13px] font-semibold text-night">Pulso por modulo</h2>
-            <div className="text-[11px] text-secondaryText">
-              {loading ? "Sincronizando..." : `${formatCount(loadedModules)} cargados / ${formatCount(failedModules)} con error`}
-            </div>
+    <div className="h-full min-h-0 overflow-auto p-3">
+      <div className="flex min-h-full flex-col gap-3">
+        <section className="flex shrink-0 flex-wrap items-start justify-between gap-3">
+          <div className="min-w-0">
+            <h1 className="text-[20px] font-semibold text-night">Dashboard operativo</h1>
           </div>
-          <div className="min-h-0 flex-1 overflow-auto">
-            <table className="w-full border-collapse text-left text-[12px]">
-              <thead className="sticky top-0 z-10 bg-deep text-white">
-                <tr>
-                  <th className="min-w-[220px] px-3 py-2 font-semibold">Modulo</th>
-                  <th className="px-3 py-2 font-semibold">Estado</th>
-                  <th className="px-3 py-2 text-right font-semibold">Reg.</th>
-                  <th className="min-w-[150px] px-3 py-2 font-semibold">Activos</th>
-                  <th className="px-3 py-2 text-right font-semibold">Alertas</th>
-                  <th className="min-w-[220px] px-3 py-2 font-semibold">Foco operativo</th>
-                  <th className="px-3 py-2 font-semibold">Accion</th>
-                </tr>
-              </thead>
-              <tbody>
-                {summaries.map((summary) => {
-                  const activeWidth = summary.total ? Math.round((summary.active / summary.total) * 100) : 0;
-                  return (
-                    <tr key={summary.module.key} className="border-b border-borderSoft bg-white hover:bg-softStart">
-                      <td className="px-3 py-2">
-                        <div className="font-semibold text-night">{summary.module.label}</div>
-                        <div className="mt-0.5 max-w-[460px] text-[11px] leading-4 text-secondaryText">
-                          {summary.module.description}
-                        </div>
-                      </td>
-                      <td className="px-3 py-2">
-                        <StatusBadge label={summary.badgeLabel} tone={summary.badgeTone} />
-                      </td>
-                      <td className="px-3 py-2 text-right font-mono text-night">{formatCount(summary.total)}</td>
-                      <td className="px-3 py-2">
-                        <div className="flex items-center gap-2">
-                          <span className="w-9 shrink-0 text-right font-mono text-night">{formatCount(summary.active)}</span>
-                          <div className="h-1.5 w-24 overflow-hidden rounded bg-softMid" aria-hidden="true">
-                            <div
-                              className={`h-full ${barToneClasses[summary.badgeTone]}`}
-                              style={{ width: `${activeWidth}%` }}
-                            />
-                          </div>
-                        </div>
-                      </td>
-                      <td className="px-3 py-2 text-right font-mono text-night">{formatCount(summary.issues)}</td>
-                      <td className="px-3 py-2 text-secondaryText">
-                        <div>{summary.focus}</div>
-                        {summary.error && <div className="mt-1 text-[11px] text-red-700">{summary.error}</div>}
-                      </td>
-                      <td className="px-3 py-2">
-                        <Link className="font-semibold text-primaryHover hover:text-primary" to={summary.module.path}>
-                          Abrir
-                        </Link>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+          <div className="flex flex-wrap items-center gap-2">
+            <StatusBadge label={loading ? "actualizando" : dashboard.scope.warehouse_ref} tone={loading ? "info" : "success"} />
+            <StatusBadge label={`${formatCount(moduleTotal)} registros`} tone="info" />
+            <StatusBadge label={`${formatCount(moduleIssues)} alertas`} tone={moduleIssues ? "warning" : "success"} />
           </div>
-        </div>
+        </section>
 
-        <aside className="grid min-h-0 grid-rows-[minmax(0,1fr)_auto] overflow-hidden rounded border border-borderSoft bg-surface shadow-panel">
-          <div className="min-h-0 overflow-auto p-3">
-            <div className="flex items-center justify-between gap-2">
-              <h2 className="text-[13px] font-semibold text-night">Alertas operativas</h2>
-              <StatusBadge label={`${formatCount(alerts.length)} foco`} tone={alerts.length ? "warning" : "success"} />
-            </div>
-            <div className="mt-3 space-y-2">
-              {Object.entries(moduleErrors).map(([moduleKey, error]) => {
-                const module = dashboardOperationModules.find((entry) => entry.key === moduleKey);
-                return (
-                  <div key={moduleKey} className="rounded border border-red-200 bg-red-50 px-2.5 py-2 text-[12px] leading-5 text-red-800">
-                    <div className="font-semibold">{module?.label ?? moduleKey}</div>
-                    <div>{error}</div>
-                  </div>
-                );
-              })}
+        <section className="grid shrink-0 grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-9" aria-label="KPIs TMS/WMS">
+          {dashboard.kpis.map((metric) => (
+            <MetricCard key={metric.key} metric={metric} />
+          ))}
+        </section>
 
-              {alerts.length ? (
-                alerts.map(({ module, row, tone }) => (
-                  <Link
-                    key={`${module.key}-${row.id}`}
-                    to={module.path}
-                    className="block rounded border border-borderSoft bg-white px-2.5 py-2 transition hover:border-primary hover:bg-softStart focus:outline-none focus:ring-2 focus:ring-primary/20"
-                  >
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="font-mono text-[12px] font-semibold text-night">{row.ref}</span>
-                      <StatusBadge label={row.status} tone={tone} />
-                    </div>
-                    <div className="mt-1 text-[11px] leading-4 text-secondaryText">
-                      {module.label} / {row.warehouse} / {row.owner}
-                    </div>
-                  </Link>
-                ))
-              ) : (
-                <div className="rounded border border-borderSoft bg-white px-2.5 py-2 text-[12px] leading-5 text-secondaryText">
-                  Sin alertas con los datos cargados.
-                </div>
-              )}
-            </div>
-          </div>
+        <section className="grid grid-cols-1 gap-3 xl:grid-cols-2 2xl:grid-cols-4">
+          <ChartPanel title="Pedidos por estado" aside={formatDateTime(dashboard.generated_at)}>
+            <HorizontalBarChart data={dashboard.charts.fulfillment_status} ariaLabel="Pedidos por estado" tone="info" />
+          </ChartPanel>
 
-          <div className="border-t border-borderSoft p-3">
-            <h2 className="text-[13px] font-semibold text-night">Principios activos</h2>
-            <ul className="mt-2 space-y-1.5 text-[12px] leading-5 text-secondaryText">
-              {principles.length ? (
-                principles.map((principle) => <li key={principle}>{principle}</li>)
-              ) : (
-                <li>Sin datos de principios operativos desde API.</li>
-              )}
-            </ul>
-          </div>
-        </aside>
-      </section>
+          <ChartPanel title="Entregas por estado">
+            <HorizontalBarChart data={dashboard.charts.delivery_pipeline} ariaLabel="Entregas por estado" tone="success" />
+          </ChartPanel>
+
+          <ChartPanel title="Stock por estado">
+            <StockStateChart data={dashboard.charts.stock_by_state} />
+          </ChartPanel>
+
+          <ChartPanel title="Ledger 7 dias">
+            <LedgerChart data={dashboard.charts.ledger_by_day} />
+          </ChartPanel>
+        </section>
+
+        <section className="grid min-h-[360px] grid-cols-1 gap-3 xl:grid-cols-[minmax(0,1.3fr)_minmax(320px,0.7fr)]">
+          <ChartPanel title="Hojas activas">
+            <RouteLoadPanel routes={dashboard.charts.route_load} />
+          </ChartPanel>
+
+          <ChartPanel title="Alertas operativas" aside={`${formatCount(dashboard.alerts.length)} foco`}>
+            <AlertsPanel dashboard={dashboard} />
+          </ChartPanel>
+        </section>
+
+        <section className="grid min-h-[380px] grid-cols-1 gap-3 xl:grid-cols-[minmax(0,1.35fr)_minmax(320px,0.65fr)]">
+          <ChartPanel title="Cobertura por modulo">
+            <ModuleTable modules={dashboard.modules} />
+          </ChartPanel>
+
+          <ChartPanel title="Modulos con cero">
+            <HorizontalBarChart data={dashboard.charts.module_coverage} ariaLabel="Cobertura de modulos" showZeros tone="neutral" />
+          </ChartPanel>
+        </section>
+      </div>
     </div>
   );
 }

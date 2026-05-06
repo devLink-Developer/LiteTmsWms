@@ -15,6 +15,7 @@ urlpatterns = [
     path("deliveries/<uuid:delivery_id>/stock-check", api.stock_check, name="delivery-stock-check"),
     path("deliveries/<uuid:delivery_id>/confirm", api.validate_stock, name="delivery-confirm"),
     path("deliveries/<uuid:delivery_id>/validate-stock", api.validate_stock, name="delivery-validate-stock"),
+    path("deliveries/<uuid:delivery_id>/reassign-warehouse", api.reassign_delivery_warehouse, name="delivery-reassign-warehouse"),
     path("deliveries/<uuid:delivery_id>/send-to-prepare", api.send_to_prepare, name="delivery-send-to-prepare"),
     path("deliveries/<uuid:delivery_id>/mark-prepared", api.mark_delivery_prepared, name="delivery-mark-prepared"),
     path("preparation-tasks/<uuid:task_id>/mark-prepared", api.mark_prepared, name="preparation-task-mark-prepared"),

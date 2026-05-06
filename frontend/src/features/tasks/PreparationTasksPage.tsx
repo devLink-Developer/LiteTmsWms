@@ -6,6 +6,8 @@ import {
   type ApiPreparationTaskListItem,
 } from "../../api/fulfillment";
 import { StatusBadge } from "../../shared/components/StatusBadge";
+import { notify } from "../../shared/components/toast";
+import { eventsAffectOperationalStatuses, useLiveStatusRefresh } from "../../shared/hooks/useLiveStatusEvents";
 import { formatAppDateTime } from "../../shared/utils/dateFormat";
 import type { StatusTone } from "../../types/operations";
 
@@ -48,17 +50,14 @@ export function PreparationTasksPage() {
   const [filter, setFilter] = useState<TaskFilter>("open");
   const [loading, setLoading] = useState(false);
   const [processingTaskId, setProcessingTaskId] = useState("");
-  const [error, setError] = useState<string | null>(null);
-  const [message, setMessage] = useState<string | null>(null);
 
   async function loadTasks(nextFilter = filter, { silent = false } = {}) {
     if (!silent) {
       setLoading(true);
     }
     try {
-      const results = await fetchPreparationTasks(nextFilter);
+      const results = await fetchPreparationTasks(nextFilter, { globalLoading: !silent });
       setTasks(results);
-      setError(null);
       setActiveTaskId((current) => {
         if (current && results.some((task) => task.id === current)) {
           return current;
@@ -66,7 +65,10 @@ export function PreparationTasksPage() {
         return results[0]?.id ?? "";
       });
     } catch (apiError) {
-      setError(apiError instanceof Error ? apiError.message : "No se pudieron cargar las tareas de preparacion.");
+      const text = apiError instanceof Error ? apiError.message : "Tareas no cargadas.";
+      if (!silent) {
+        notify({ message: text, tone: "error" });
+      }
       setTasks([]);
       setActiveTaskId("");
     } finally {
@@ -84,6 +86,12 @@ export function PreparationTasksPage() {
     return () => window.clearInterval(interval);
   }, [filter]);
 
+  useLiveStatusRefresh((events) => {
+    if (eventsAffectOperationalStatuses(events)) {
+      void loadTasks(filter, { silent: true });
+    }
+  });
+
   const activeTask = useMemo(
     () => tasks.find((task) => task.id === activeTaskId) ?? tasks[0],
     [activeTaskId, tasks],
@@ -91,13 +99,13 @@ export function PreparationTasksPage() {
 
   async function markPrepared(task: ApiPreparationTaskListItem) {
     setProcessingTaskId(task.id);
-    setMessage(null);
     try {
       await markPreparationTaskPrepared(task.id);
       await loadTasks(filter, { silent: true });
-      setMessage(`${task.delivery.delivery_number} marcada como preparada.`);
+      notify({ message: `${task.delivery.delivery_number} marcada como preparada.`, tone: "success" });
     } catch (apiError) {
-      setError(apiError instanceof Error ? apiError.message : "No se pudo marcar la tarea como preparada.");
+      const text = apiError instanceof Error ? apiError.message : "Tarea no marcada.";
+      notify({ message: text, tone: "error" });
     } finally {
       setProcessingTaskId("");
     }
@@ -119,9 +127,6 @@ export function PreparationTasksPage() {
         </button>
       </header>
 
-      {error && <div className="shrink-0 rounded border border-red-200 bg-red-50 px-3 py-2 text-[12px] text-red-700">{error}</div>}
-      {message && <div className="shrink-0 rounded border border-emerald-200 bg-emerald-50 px-3 py-2 text-[12px] text-emerald-800">{message}</div>}
-
       <section className="flex shrink-0 flex-wrap gap-1 overflow-x-auto rounded border border-borderSoft bg-white p-1" aria-label="Filtro de tareas">
         {(Object.keys(filterLabels) as TaskFilter[]).map((option) => (
           <button
@@ -129,7 +134,6 @@ export function PreparationTasksPage() {
             type="button"
             onClick={() => {
               setFilter(option);
-              setMessage(null);
             }}
             className={`min-h-9 rounded px-3 text-[12px] font-semibold transition focus:outline-none focus:ring-2 focus:ring-primary/20 ${
               filter === option ? "bg-primary text-white" : "text-secondaryText hover:bg-softStart hover:text-night"
@@ -194,7 +198,7 @@ export function PreparationTasksPage() {
               {!tasks.length && (
                 <tr>
                   <td colSpan={8} className="px-3 py-6 text-[12px] text-secondaryText">
-                    {loading ? "Cargando tareas de preparacion..." : "No hay tareas de preparacion para el filtro seleccionado."}
+                    {loading ? "Cargando..." : "Sin tareas."}
                   </td>
                 </tr>
               )}
@@ -249,7 +253,7 @@ export function PreparationTasksPage() {
               </div>
             </>
           ) : (
-            <div className="px-3 py-6 text-[12px] text-secondaryText">Selecciona una tarea para revisar sus articulos.</div>
+            <div className="px-3 py-6 text-[12px] text-secondaryText">Sin tarea seleccionada.</div>
           )}
         </aside>
       </section>

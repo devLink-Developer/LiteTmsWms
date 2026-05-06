@@ -286,7 +286,7 @@ describe("RoutePlanningPage", () => {
     await waitFor(() => expect(removeButton).not.toBeDisabled());
     fireEvent.click(removeButton);
 
-    await waitFor(() => expect(screen.getByText(/Parada quitada de la hoja/i)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("Parada quitada.")).toBeInTheDocument());
     expect(fetch).toHaveBeenCalledWith(
       expect.stringContaining("/api/v1/routesheets/route-1/stops"),
       expect.objectContaining({

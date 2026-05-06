@@ -10,6 +10,7 @@ from django.conf import settings
 from django.utils import timezone
 
 from apps.inventory.models import InventoryBalance, StockState
+from apps.logistics.services import default_location_ref, generate_default_locations
 
 
 STOCK_CACHE_FILE_NAME = "stock_cache.parquet"
@@ -118,7 +119,7 @@ def _quantity(value) -> Decimal:
         raise StockCacheImportError("Cantidad invalida.") from exc
 
 
-def _flush_balances(balances_by_key: dict[tuple[str, str, str, str, str], InventoryBalance], *, batch_size: int, dry_run: bool) -> int:
+def _flush_balances(balances_by_key: dict[tuple[str, str, str, str, str, str], InventoryBalance], *, batch_size: int, dry_run: bool) -> int:
     if not balances_by_key:
         return 0
     balances = list(balances_by_key.values())
@@ -130,7 +131,7 @@ def _flush_balances(balances_by_key: dict[tuple[str, str, str, str, str], Invent
         batch_size=batch_size,
         update_conflicts=True,
         update_fields=["quantity", "updated_by", "updated_at"],
-        unique_fields=["warehouse_ref", "item_ref", "lot_ref", "stock_state", "uom"],
+        unique_fields=["warehouse_ref", "location_ref", "item_ref", "lot_ref", "stock_state", "uom"],
     )
     balances_by_key.clear()
     return len(balances)
@@ -169,10 +170,11 @@ def import_stock_cache(
     skipped_zero_quantity = 0
     invalid_quantities = 0
     clamped_negative_quantities = 0
-    balances_by_key: dict[tuple[str, str, str, str, str], InventoryBalance] = {}
+    balances_by_key: dict[tuple[str, str, str, str, str, str], InventoryBalance] = {}
     now = timezone.now()
     actor = actor.strip() or "stock-cache-import"
     uom = uom.strip() or "UN"
+    generated_warehouses: set[str] = set()
 
     deleted_balances = 0
     if reset_state:
@@ -205,9 +207,26 @@ def import_stock_cache(
                 skipped_zero_quantity += 1
                 continue
 
-            key = (warehouse_ref, item_ref, "", mapping.stock_state, uom)
+            if mapping.stock_state in {StockState.ON_HAND, StockState.PACKED}:
+                location_ref = default_location_ref(warehouse_ref, "available")
+            elif mapping.stock_state == StockState.RESERVED:
+                location_ref = default_location_ref(warehouse_ref, "reserved")
+            elif mapping.stock_state == StockState.PICKING:
+                location_ref = default_location_ref(warehouse_ref, "preparation")
+            elif mapping.stock_state == StockState.IN_TRANSIT:
+                location_ref = default_location_ref(warehouse_ref, "transit")
+            elif mapping.stock_state == StockState.SCRAPPED:
+                location_ref = default_location_ref(warehouse_ref, "loss")
+            else:
+                location_ref = default_location_ref(warehouse_ref, "available")
+            if not dry_run and warehouse_ref not in generated_warehouses:
+                generate_default_locations(warehouse_ref=warehouse_ref, actor=actor)
+                generated_warehouses.add(warehouse_ref)
+
+            key = (warehouse_ref, location_ref, item_ref, "", mapping.stock_state, uom)
             balances_by_key[key] = InventoryBalance(
                 warehouse_ref=warehouse_ref,
+                location_ref=location_ref,
                 item_ref=item_ref,
                 lot_ref="",
                 stock_state=mapping.stock_state,

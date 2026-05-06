@@ -200,7 +200,9 @@ class ApiFilterTests(TestCase):
         self.assertEqual(row["warehouse_ref"], "WH-A")
         self.assertEqual(row["item_ref"], "ITEM-1")
         self.assertEqual(row["lot_ref"], "LOC-01")
-        self.assertEqual(row["location_ref"], "LOC-01")
+        self.assertEqual(row["location_ref"], "")
+        self.assertEqual(row["warehouse_location_ref"], "LOC-01")
+        self.assertTrue(row["location_ref_is_fallback"])
         self.assertEqual(row["location_name"], "")
         self.assertEqual(row["quantities"]["available"], "10")
         self.assertEqual(row["quantities"]["reserved"], "2")
@@ -743,6 +745,168 @@ class ApiFilterTests(TestCase):
         self.assertEqual(response.status_code, 422)
 
     @patch("apps.fulfillment.api.employee_delivery_permissions")
+    def test_expedition_stock_check_allows_past_delivery_date_with_flag(self, employee_delivery_permissions):
+        employee_delivery_permissions.return_value = {"authorized_warehouses": ["WH-A"]}
+        session = self.client.session
+        session["active_warehouse_ref"] = "WH-A"
+        session.save()
+        fulfillment = FulfillmentOrder.objects.create(
+            fulfillment_number="FUL-PAST-EXP",
+            customer_ref="CUST-1",
+            delivery_mode="Repart Prg",
+            warehouse_ref="WH-A",
+            legacy_sales_order_number="VENT8-PAST-EXP",
+        )
+        fulfillment_line = fulfillment.lines.create(
+            ordered_qty=Decimal("1"),
+            uom="UN",
+            item_ref="ITEM-PAST-EXP",
+            warehouse_ref="WH-A",
+            legacy_sales_order_number="VENT8-PAST-EXP",
+            legacy_line_id="10",
+        )
+        delivery = DeliveryOrder.objects.create(
+            delivery_number="DEL-PAST-EXP",
+            fulfillment=fulfillment,
+            status=DeliveryOrder.DeliveryStatus.CREATED,
+            delivery_mode="Repart Prg",
+            warehouse_ref="WH-A",
+            planned_date=timezone.localdate() - timedelta(days=1),
+        )
+        delivery.lines.create(
+            fulfillment_line=fulfillment_line,
+            planned_qty=Decimal("1"),
+            uom="UN",
+            item_ref="ITEM-PAST-EXP",
+            warehouse_ref="WH-A",
+            legacy_sales_order_number="VENT8-PAST-EXP",
+            legacy_line_id="10",
+        )
+        InventoryBalance.objects.create(
+            warehouse_ref="WH-A",
+            item_ref="ITEM-PAST-EXP",
+            stock_state=StockState.PACKED,
+            uom="UN",
+            quantity=Decimal("2"),
+        )
+
+        response = self.client.post(
+            f"/api/v1/fulfillment/deliveries/{delivery.id}/stock-check",
+            data=json.dumps({"allow_past_reparto_date": True, "target_warehouse_ref": "WH-A"}),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertTrue(json.loads(response.content)["result"]["can_confirm"])
+
+    @patch("apps.fulfillment.api.employee_delivery_permissions")
+    def test_expedition_stock_check_returns_cross_warehouse_conflict(self, employee_delivery_permissions):
+        employee_delivery_permissions.return_value = {"authorized_warehouses": ["WH-B"]}
+        session = self.client.session
+        session["active_warehouse_ref"] = "WH-B"
+        session.save()
+        fulfillment = FulfillmentOrder.objects.create(
+            fulfillment_number="FUL-CROSS-WH",
+            customer_ref="CUST-1",
+            delivery_mode="Repart Prg",
+            warehouse_ref="WH-A",
+            legacy_sales_order_number="VENT8-CROSS-WH",
+        )
+        fulfillment_line = fulfillment.lines.create(
+            ordered_qty=Decimal("1"),
+            uom="UN",
+            item_ref="ITEM-CROSS-WH",
+            warehouse_ref="WH-A",
+            legacy_sales_order_number="VENT8-CROSS-WH",
+            legacy_line_id="10",
+        )
+        DeliveryOrder.objects.create(
+            delivery_number="DEL-CROSS-WH",
+            fulfillment=fulfillment,
+            status=DeliveryOrder.DeliveryStatus.CONFIRMED,
+            delivery_mode="Repart Prg",
+            warehouse_ref="WH-A",
+            planned_date=timezone.localdate() - timedelta(days=1),
+            legacy_sales_order_number="VENT8-CROSS-WH",
+        )
+
+        response = self.client.post(
+            f"/api/v1/fulfillment/{fulfillment.id}/stock-check",
+            data=json.dumps(
+                {
+                    "allow_past_reparto_date": True,
+                    "target_warehouse_ref": "WH-B",
+                    "lines": [{"fulfillment_line_id": str(fulfillment_line.id), "delivery_unit_qty": "1"}],
+                }
+            ),
+            content_type="application/json",
+        )
+
+        payload = json.loads(response.content)
+        self.assertEqual(response.status_code, 409, response.content)
+        self.assertEqual(payload["error"]["code"], "cross_warehouse_confirmed_delivery")
+        self.assertEqual(payload["error"]["details"]["source_warehouse_ref"], "WH-A")
+        self.assertEqual(payload["error"]["details"]["target_warehouse_ref"], "WH-B")
+
+    @patch("apps.fulfillment.api.employee_delivery_permissions")
+    def test_delivery_stock_check_validates_same_confirmed_delivery_in_target_warehouse(self, employee_delivery_permissions):
+        employee_delivery_permissions.return_value = {"authorized_warehouses": ["WH-B"]}
+        session = self.client.session
+        session["active_warehouse_ref"] = "WH-B"
+        session.save()
+        fulfillment = FulfillmentOrder.objects.create(
+            fulfillment_number="FUL-CROSS-DELIVERY",
+            customer_ref="CUST-1",
+            delivery_mode="Repart Prg",
+            warehouse_ref="WH-A",
+            legacy_sales_order_number="VENT8-CROSS-DELIVERY",
+        )
+        fulfillment_line = fulfillment.lines.create(
+            ordered_qty=Decimal("1"),
+            uom="UN",
+            item_ref="ITEM-CROSS-DELIVERY",
+            warehouse_ref="WH-A",
+            legacy_sales_order_number="VENT8-CROSS-DELIVERY",
+            legacy_line_id="10",
+        )
+        delivery = DeliveryOrder.objects.create(
+            delivery_number="DEL-CROSS-DELIVERY",
+            fulfillment=fulfillment,
+            status=DeliveryOrder.DeliveryStatus.CONFIRMED,
+            delivery_mode="Repart Prg",
+            warehouse_ref="WH-A",
+            planned_date=timezone.localdate(),
+            legacy_sales_order_number="VENT8-CROSS-DELIVERY",
+        )
+        delivery.lines.create(
+            fulfillment_line=fulfillment_line,
+            planned_qty=Decimal("1"),
+            uom="UN",
+            item_ref="ITEM-CROSS-DELIVERY",
+            warehouse_ref="WH-A",
+            legacy_sales_order_number="VENT8-CROSS-DELIVERY",
+            legacy_line_id="10",
+        )
+        InventoryBalance.objects.create(
+            warehouse_ref="WH-B",
+            item_ref="ITEM-CROSS-DELIVERY",
+            stock_state=StockState.PACKED,
+            uom="UN",
+            quantity=Decimal("1"),
+        )
+
+        response = self.client.post(
+            f"/api/v1/fulfillment/deliveries/{delivery.id}/stock-check",
+            data=json.dumps({"allow_past_reparto_date": True, "target_warehouse_ref": "WH-B"}),
+            content_type="application/json",
+        )
+
+        payload = json.loads(response.content)
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertTrue(payload["result"]["can_confirm"])
+        self.assertEqual(payload["result"]["lines"][0]["warehouse_ref"], "WH-B")
+
+    @patch("apps.fulfillment.api.employee_delivery_permissions")
     def test_expedition_queue_is_not_filtered_by_authorized_warehouse(self, employee_delivery_permissions):
         employee_delivery_permissions.return_value = {"authorized_warehouses": ["WH-A"]}
         fulfillment = FulfillmentOrder.objects.create(
@@ -773,6 +937,64 @@ class ApiFilterTests(TestCase):
 
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["warehouse_ref"], "WH-B")
+
+    def test_fulfillment_orders_searches_backend_and_returns_movements(self):
+        for index in range(105):
+            FulfillmentOrder.objects.create(
+                fulfillment_number=f"FUL-RECENT-{index}",
+                customer_ref=f"CUST-{index}",
+                delivery_mode="Retiro",
+                warehouse_ref="WH-A",
+                legacy_sales_order_number=f"VENT8-RECENT-{index}",
+            )
+        fulfillment = FulfillmentOrder.objects.create(
+            fulfillment_number="FUL-VENT8-100001719",
+            status=FulfillmentOrder.FulfillmentStatus.READY_FOR_DISPATCH,
+            customer_ref="20000070",
+            delivery_mode="Repart Prg",
+            warehouse_ref="PS03DP",
+            requested_date=date(2026, 4, 26),
+            legacy_sales_order_number="VENT8-100001719",
+            legacy_transaction_number="PS003MT-693-12107-000002800",
+        )
+        fulfillment_line = fulfillment.lines.create(
+            ordered_qty=Decimal("1"),
+            uom="UN",
+            item_ref="100402",
+            warehouse_ref="PS03DP",
+            legacy_sales_order_number="VENT8-100001719",
+            legacy_line_id="10",
+        )
+        delivery = DeliveryOrder.objects.create(
+            delivery_number="E-000000005",
+            fulfillment=fulfillment,
+            status=DeliveryOrder.DeliveryStatus.IN_ROUTE,
+            delivery_mode="Repart Prg",
+            warehouse_ref="PS03DP",
+            legacy_sales_order_number="VENT8-100001719",
+        )
+        delivery.lines.create(
+            fulfillment_line=fulfillment_line,
+            planned_qty=Decimal("1"),
+            delivery_unit_qty=Decimal("1"),
+            uom="UN",
+            item_ref="100402",
+            warehouse_ref="PS03DP",
+            legacy_sales_order_number="VENT8-100001719",
+            legacy_line_id="10",
+        )
+
+        with patch(
+            "apps.fulfillment.services._resolve_customer_snapshots",
+            return_value={"20000070": {"name": "Ricardo Ortigoza", "document_number": "34449838", "address": {}}},
+        ):
+            results = self._results("/api/v1/fulfillment/", {"q": "VENT8-100001719"})
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["sales_order_number"], "VENT8-100001719")
+        self.assertEqual(results[0]["warehouse_ref"], "PS03DP")
+        self.assertEqual(results[0]["deliveries"][0]["delivery_number"], "E-000000005")
+        self.assertTrue(results[0]["movements"])
 
     @patch("apps.fulfillment.api.employee_delivery_permissions")
     def test_preparation_tasks_filter_authorized_warehouse_not_date(self, employee_delivery_permissions):

@@ -41,6 +41,7 @@ import {
 } from "../../api/routing";
 import { fetchDrivers } from "../../api/fleet";
 import { StatusBadge } from "../../shared/components/StatusBadge";
+import { notify, useToastError } from "../../shared/components/toast";
 import { useWorkspaceStore } from "../../stores/useWorkspaceStore";
 import type { StatusTone } from "../../types/operations";
 
@@ -288,7 +289,6 @@ export function RoutePlanningPage() {
   const [activeStopId, setActiveStopId] = useState("");
   const [vehicleId, setVehicleId] = useState("");
   const [driverRef, setDriverRef] = useState("");
-  const [message, setMessage] = useState<string | null>(null);
   const [openStopLabelIds, setOpenStopLabelIds] = useState<string[]>([]);
   const [originLabelOpen, setOriginLabelOpen] = useState(false);
   const sensors = useSensors(
@@ -350,7 +350,7 @@ export function RoutePlanningPage() {
     setActiveStopId(nextRoute.stops[0]?.id ?? "");
     setOpenStopLabelIds([]);
     setOriginLabelOpen(false);
-    setMessage(nextRoute.status === "draft" ? "Hoja draft recuperada. Revisa el mapa antes de confirmar." : null);
+    setMessage(nextRoute.status === "draft" ? "Hoja draft recuperada." : null);
   }, [routeDetailQuery.data]);
 
   const hasDraftRoute = useMemo(
@@ -414,7 +414,7 @@ export function RoutePlanningPage() {
       setActiveStopId(nextRoute.stops[0]?.id ?? "");
       setOpenStopLabelIds([]);
       setOriginLabelOpen(false);
-      setMessage("Preview de ruta generado. Revisa el mapa y orden antes de confirmar.");
+      setMessage("Preview generado.");
       void queryClient.invalidateQueries({ queryKey: ["routing-open-routes"] });
       void queryClient.invalidateQueries({ queryKey: ["routing-deliveries"] });
     },
@@ -451,7 +451,7 @@ export function RoutePlanningPage() {
       setRoute(nextRoute);
       setActiveStopId(nextRoute.stops[0]?.id ?? "");
       setOpenStopLabelIds((current) => current.filter((stopId) => nextRoute.stops.some((stop) => stop.id === stopId)));
-      setMessage("Parada quitada de la hoja. La entrega vuelve al pool de ruteo.");
+      setMessage("Parada quitada.");
       void queryClient.invalidateQueries({ queryKey: ["routing-deliveries"] });
       void queryClient.invalidateQueries({ queryKey: ["routing-open-routes"] });
     },
@@ -562,6 +562,13 @@ export function RoutePlanningPage() {
     confirmMutation.error ||
     routeCommandMutation.error ||
     executeMutation.error;
+  useToastError(error);
+
+  function setMessage(nextMessage: string | null) {
+    if (nextMessage) {
+      notify({ message: nextMessage, tone: "info" });
+    }
+  }
 
   return (
     <div className="flex h-full min-h-0 flex-col gap-3 overflow-hidden p-3">
@@ -596,17 +603,6 @@ export function RoutePlanningPage() {
           </button>
         </div>
       </header>
-
-      {(error || message) && (
-        <div
-          className={`shrink-0 rounded border px-3 py-2 text-[12px] ${
-            error ? "border-red-200 bg-red-50 text-red-700" : "border-blue-200 bg-blue-50 text-blue-800"
-          }`}
-          role="status"
-        >
-          {error instanceof Error ? error.message : message}
-        </div>
-      )}
 
       <section className="grid min-h-0 flex-1 grid-cols-1 grid-rows-[minmax(0,0.8fr)_minmax(0,1.4fr)_minmax(0,1fr)] gap-3 overflow-hidden xl:grid-cols-[340px_minmax(0,1fr)_380px] xl:grid-rows-1">
         <aside className="flex min-h-0 flex-col overflow-hidden rounded border border-borderSoft bg-surface shadow-panel">
@@ -710,7 +706,7 @@ export function RoutePlanningPage() {
                 onClick={() => setSelectedIds((deliveriesQuery.data ?? []).filter((delivery) => delivery.lat && delivery.lng).map((delivery) => delivery.id))}
                 className="text-[11px] font-semibold text-primaryHover hover:text-primary"
               >
-                Seleccionar con coordenadas
+                Con coordenadas
               </button>
             </div>
             <div className="min-h-0 flex-1 overflow-auto">
@@ -744,10 +740,10 @@ export function RoutePlanningPage() {
               {!deliveriesQuery.data?.length && (
                 <div className="px-3 py-6 text-[12px] text-secondaryText">
                   {deliveriesQuery.isLoading
-                    ? "Cargando entregas..."
+                    ? "Cargando..."
                     : (routeSheetsQuery.data ?? []).length
-                      ? "Las entregas preparadas ya estan en una hoja abierta."
-                      : "No hay entregas de reparto preparadas o confirmadas para rutear."}
+                      ? "En hoja abierta."
+                      : "Sin entregas."}
                 </div>
               )}
             </div>
@@ -823,7 +819,7 @@ export function RoutePlanningPage() {
           </MapContainer>
           <div className="absolute right-3 top-3 z-[400] flex flex-col items-end gap-2">
             <div className="rounded border border-borderSoft bg-white px-3 py-2 text-[12px] font-semibold text-night shadow-panel">
-              {route ? `${route.route_number} / ${route.routing_provider}` : "Sin preview activo"}
+              {route ? `${route.route_number} / ${route.routing_provider}` : "Sin preview"}
             </div>
             {route?.preview_payload.routing_status && (
               <div className="rounded border border-borderSoft bg-white px-3 py-2 text-[12px] text-secondaryText shadow-panel">
@@ -839,7 +835,7 @@ export function RoutePlanningPage() {
               <div>
                 <h2 className="text-[13px] font-semibold text-night">Hoja de ruta</h2>
                 <p className="mt-1 text-[11px] text-secondaryText">
-                  {route ? `${route.stops.length} paradas / ${formatNumber(route.planned_weight_kg)} kg` : "Genera un preview para revisar."}
+                  {route ? `${route.stops.length} paradas / ${formatNumber(route.planned_weight_kg)} kg` : "Sin preview."}
                 </p>
               </div>
               <Truck className="text-primary" size={18} />
@@ -879,7 +875,7 @@ export function RoutePlanningPage() {
                     )}
                   </div>
                 ) : (
-                  <div className="mt-2 text-[11px] text-secondaryText">Selecciona un vehiculo para validar peso y volumen.</div>
+                  <div className="mt-2 text-[11px] text-secondaryText">Sin vehiculo.</div>
                 )}
               </div>
             )}
@@ -926,7 +922,7 @@ export function RoutePlanningPage() {
                 </SortableContext>
               </DndContext>
             ) : (
-              <div className="px-3 py-6 text-[12px] text-secondaryText">Selecciona entregas y genera una ruta.</div>
+              <div className="px-3 py-6 text-[12px] text-secondaryText">Sin ruta.</div>
             )}
           </div>
 
@@ -1000,7 +996,7 @@ export function RoutePlanningPage() {
                 </div>
               </>
             ) : (
-              <div className="text-[12px] text-secondaryText">Selecciona una parada.</div>
+              <div className="text-[12px] text-secondaryText">Sin parada.</div>
             )}
           </div>
         </aside>

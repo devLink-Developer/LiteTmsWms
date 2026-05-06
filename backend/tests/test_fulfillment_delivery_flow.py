@@ -7,28 +7,38 @@ from django.db import connection
 from django.test import TestCase
 from django.utils import timezone
 
+from apps.core.models import StatusHistory
 from apps.core.sequences import SequenceConfigError, allocate_sequence_number
 from apps.fulfillment.models import (
     DeliveryDocument,
+    DeliveryExecution,
     DeliveryOrder,
     DeliveryOrderLine,
     DeliveryPreparationTask,
+    DeliverySplit,
     FulfillmentOrder,
+    FulfillmentOrderImpact,
+    FulfillmentOrderImpactLine,
     FulfillmentOrderLine,
 )
 from apps.fulfillment.services import (
     FulfillmentRuleError,
+    _apply_order_impact,
     check_delivery_stock,
     check_fulfillment_stock_for_split,
     expedition_queue,
+    ingest_legacy_order,
     issue_remito,
     mark_preparation_task_prepared,
+    reassign_confirmed_delivery_warehouse,
     _line_delivery_date,
     send_delivery_to_prepare,
     split_fulfillment_delivery,
     validate_delivery_stock,
 )
-from apps.inventory.models import InventoryBalance, InventoryReservation, StockState
+from apps.integrations.legacy.models import LegacyOrder
+from apps.inventory.models import InventoryBalance, InventoryLedgerEntry, InventoryReservation, StockState
+from apps.routes.models import RouteSheet, RouteStop
 
 
 def _sequence_table_ref() -> str:
@@ -134,6 +144,26 @@ def _current_sequence_number(name: str) -> int:
         return int(cursor.fetchone()[0])
 
 
+class LegacyOrderMappingTests(TestCase):
+    def test_sales_order_type_and_origin_fields_are_mapped(self):
+        self.assertEqual(LegacyOrder._meta.get_field("sales_order_type").db_column, "SalesOrderType")
+        self.assertEqual(LegacyOrder._meta.get_field("sales_order_number_orig").db_column, "SalesOrderNumberOrig")
+
+    def test_non_p_legacy_order_is_not_ingested_as_fulfillment(self):
+        class FakeLegacyOrderManager:
+            def get(self, **_kwargs):
+                return SimpleNamespace(sales_order_type="A")
+
+        with patch("apps.fulfillment.services.LegacyOrder.objects.using", return_value=FakeLegacyOrderManager()):
+            with self.assertRaisesRegex(FulfillmentRuleError, "no es un pedido entregable"):
+                ingest_legacy_order(
+                    sales_order_number="ANU-1",
+                    idempotency_key="legacy-non-p",
+                    actor="tester",
+                )
+        self.assertFalse(FulfillmentOrder.objects.exists())
+
+
 class SequenceConfigTests(TestCase):
     def test_sequence_number_is_allocated_from_sequence_config(self):
         _reset_sequence("Entregas", prefix="E-")
@@ -213,14 +243,259 @@ class DeliveryPreparationFlowTests(TestCase):
         self.delivery.refresh_from_db()
         self.fulfillment_line.refresh_from_db()
         reservation = InventoryReservation.objects.get(source_type="delivery_order", source_ref=str(self.delivery.id))
-        packed = InventoryBalance.objects.get(warehouse_ref="W001", item_ref="ITEM-1", stock_state=StockState.PACKED)
-        reserved = InventoryBalance.objects.get(warehouse_ref="W001", item_ref="ITEM-1", stock_state=StockState.RESERVED)
+        packed = InventoryBalance.objects.get(
+            warehouse_ref="W001",
+            location_ref="W001-DSP-GEN",
+            item_ref="ITEM-1",
+            stock_state=StockState.PACKED,
+        )
+        reserved = InventoryBalance.objects.get(
+            warehouse_ref="W001",
+            location_ref="W001-RSV-GEN",
+            item_ref="ITEM-1",
+            stock_state=StockState.RESERVED,
+        )
 
         self.assertEqual(self.delivery.status, DeliveryOrder.DeliveryStatus.CONFIRMED)
         self.assertEqual(self.fulfillment_line.reserved_qty, Decimal("3"))
-        self.assertEqual(reservation.lines.get().reserved_qty, Decimal("3"))
+        reservation_line = reservation.lines.get()
+        self.assertEqual(reservation_line.reserved_qty, Decimal("3"))
+        self.assertEqual(reservation_line.source_location_ref, "W001-DSP-GEN")
+        self.assertEqual(reservation_line.location_ref, "W001-RSV-GEN")
         self.assertEqual(packed.quantity, Decimal("2"))
         self.assertEqual(reserved.quantity, Decimal("3"))
+
+    def test_annulment_impact_cancels_non_remitted_qty_and_releases_reservation(self):
+        validate_delivery_stock(
+            delivery_id=str(self.delivery.id),
+            idempotency_key="confirm-before-annulment",
+            actor="tester",
+            authorized_warehouses=["W001"],
+        )
+        impact = FulfillmentOrderImpact.objects.create(
+            fulfillment=self.fulfillment,
+            impact_type=FulfillmentOrderImpact.ImpactType.ANNULMENT,
+            status=FulfillmentOrderImpact.ImpactStatus.PENDING,
+            impact_sales_order_number="ANU-SO-1",
+            impact_transaction_number="TX-ANU-1",
+            legacy_sales_order_number="SO-1",
+            warehouse_ref="W001",
+            source_table="transactions_orders_transaction",
+            source_pk="ANU-SO-1",
+            created_by="tester",
+        )
+        FulfillmentOrderImpactLine.objects.create(
+            impact=impact,
+            fulfillment_line=self.fulfillment_line,
+            item_ref="ITEM-1",
+            warehouse_ref="W001",
+            legacy_sales_order_number="SO-1",
+            legacy_line_id="10",
+            source_table="transactions_orders_retailLineItem",
+            source_pk="ANU-SO-1-L1",
+            quantity=Decimal("2"),
+            uom="UN",
+        )
+
+        _apply_order_impact(impact, actor="tester")
+
+        self.fulfillment_line.refresh_from_db()
+        self.delivery_line.refresh_from_db()
+        reservation = InventoryReservation.objects.get(source_type="delivery_order", source_ref=str(self.delivery.id))
+        reservation_line = reservation.lines.get()
+        packed = InventoryBalance.objects.get(
+            warehouse_ref="W001",
+            location_ref="W001-DSP-GEN",
+            item_ref="ITEM-1",
+            stock_state=StockState.PACKED,
+        )
+        reserved = InventoryBalance.objects.get(
+            warehouse_ref="W001",
+            location_ref="W001-RSV-GEN",
+            item_ref="ITEM-1",
+            stock_state=StockState.RESERVED,
+        )
+
+        self.assertEqual(self.fulfillment_line.cancelled_qty, Decimal("2"))
+        self.assertEqual(self.fulfillment_line.reserved_qty, Decimal("1"))
+        self.assertEqual(self.delivery_line.planned_qty, Decimal("1"))
+        self.assertEqual(reservation_line.reserved_qty, Decimal("1"))
+        self.assertEqual(packed.quantity, Decimal("2"))
+        self.assertEqual(reserved.quantity, Decimal("1"))
+
+    def test_return_impact_posts_packed_stock_in_received_warehouse(self):
+        impact = FulfillmentOrderImpact.objects.create(
+            fulfillment=self.fulfillment,
+            impact_type=FulfillmentOrderImpact.ImpactType.RETURN,
+            status=FulfillmentOrderImpact.ImpactStatus.PENDING,
+            impact_sales_order_number="DEV-SO-1",
+            impact_transaction_number="TX-DEV-1",
+            legacy_sales_order_number="SO-1",
+            warehouse_ref="W001",
+            source_table="transactions_orders_transaction",
+            source_pk="DEV-SO-1",
+            created_by="tester",
+        )
+        line = FulfillmentOrderImpactLine.objects.create(
+            impact=impact,
+            fulfillment_line=self.fulfillment_line,
+            item_ref="ITEM-1",
+            warehouse_ref="W001",
+            legacy_sales_order_number="SO-1",
+            legacy_line_id="10",
+            source_table="transactions_orders_retailLineItem",
+            source_pk="DEV-SO-1-L1",
+            quantity=Decimal("2"),
+            uom="UN",
+        )
+
+        _apply_order_impact(impact, actor="tester")
+
+        impact.refresh_from_db()
+        line.refresh_from_db()
+        balance = InventoryBalance.objects.get(
+            warehouse_ref="W001",
+            location_ref="W001-DSP-GEN",
+            item_ref="ITEM-1",
+            stock_state=StockState.PACKED,
+        )
+        ledger = InventoryLedgerEntry.objects.get(document_type="legacy_return", document_ref="DEV-SO-1")
+        self.assertEqual(impact.status, FulfillmentOrderImpact.ImpactStatus.APPLIED)
+        self.assertEqual(line.applied_qty, Decimal("2"))
+        self.assertEqual(balance.quantity, Decimal("2"))
+        self.assertEqual(ledger.movement_type, InventoryLedgerEntry.MovementType.INBOUND_RECEIPT)
+
+    def test_expedition_queue_serializes_impacts_and_traceability(self):
+        impact = FulfillmentOrderImpact.objects.create(
+            fulfillment=self.fulfillment,
+            impact_type=FulfillmentOrderImpact.ImpactType.RETURN,
+            status=FulfillmentOrderImpact.ImpactStatus.PENDING,
+            impact_sales_order_number="DEV-SO-1",
+            impact_transaction_number="TX-DEV-1",
+            legacy_sales_order_number="SO-1",
+            warehouse_ref="W001",
+            source_table="transactions_orders_transaction",
+            source_pk="DEV-SO-1-TRACE",
+            created_by="tester",
+        )
+        FulfillmentOrderImpactLine.objects.create(
+            impact=impact,
+            fulfillment_line=self.fulfillment_line,
+            item_ref="ITEM-1",
+            warehouse_ref="W001",
+            legacy_sales_order_number="SO-1",
+            legacy_line_id="10",
+            source_table="transactions_orders_retailLineItem",
+            source_pk="DEV-SO-1-TRACE-L1",
+            quantity=Decimal("1"),
+            uom="UN",
+        )
+        _apply_order_impact(impact, actor="tester")
+
+        with patch("apps.fulfillment.services._resolve_customer_snapshots", return_value={}):
+            result = expedition_queue(sales_order_number="SO-1", authorized_warehouses=["W001"])
+
+        self.assertEqual(result[0]["sales_order_type"], "P")
+        self.assertEqual(result[0]["impacts"][0]["type"], "devolucion")
+        self.assertEqual(result[0]["lines"][0]["returned_qty"], "1")
+        labels = {movement["label"] for movement in result[0]["movements"]}
+        self.assertIn("Devolucion recibida", labels)
+        self.assertIn("Stock ingresado", labels)
+
+    def test_reassign_confirmed_delivery_moves_reservation_to_target_warehouse(self):
+        validate_delivery_stock(
+            delivery_id=str(self.delivery.id),
+            idempotency_key="confirm-before-reassign",
+            actor="tester",
+            authorized_warehouses=["W001"],
+        )
+        DeliverySplit.objects.create(
+            fulfillment_line=self.fulfillment_line,
+            delivery_line=self.delivery_line,
+            split_qty=Decimal("3"),
+            remaining_after_split=Decimal("2"),
+            reason="test",
+            warehouse_ref="W001",
+        )
+        InventoryBalance.objects.create(
+            warehouse_ref="W002",
+            item_ref="ITEM-1",
+            lot_ref="",
+            stock_state=StockState.PACKED,
+            uom="UN",
+            quantity=Decimal("5"),
+        )
+
+        result = reassign_confirmed_delivery_warehouse(
+            delivery_id=str(self.delivery.id),
+            target_warehouse_ref="W002",
+            idempotency_key="reassign-delivery",
+            actor="tester",
+            authorized_warehouses=["W002"],
+        )
+
+        self.delivery.refresh_from_db()
+        self.delivery_line.refresh_from_db()
+        self.fulfillment_line.refresh_from_db()
+        active_reservation = InventoryReservation.objects.get(
+            source_type="delivery_order",
+            source_ref=str(self.delivery.id),
+            status=InventoryReservation.ReservationStatus.ALLOCATED,
+        )
+        released_reservation = InventoryReservation.objects.get(
+            source_type="delivery_order",
+            source_ref=str(self.delivery.id),
+            status=InventoryReservation.ReservationStatus.RELEASED,
+        )
+        old_packed = InventoryBalance.objects.get(
+            warehouse_ref="W001",
+            location_ref="W001-DSP-GEN",
+            item_ref="ITEM-1",
+            stock_state=StockState.PACKED,
+        )
+        old_reserved = InventoryBalance.objects.get(
+            warehouse_ref="W001",
+            location_ref="W001-RSV-GEN",
+            item_ref="ITEM-1",
+            stock_state=StockState.RESERVED,
+        )
+        new_packed = InventoryBalance.objects.get(
+            warehouse_ref="W002",
+            location_ref="W002-DSP-GEN",
+            item_ref="ITEM-1",
+            stock_state=StockState.PACKED,
+        )
+        new_reserved = InventoryBalance.objects.get(
+            warehouse_ref="W002",
+            location_ref="W002-RSV-GEN",
+            item_ref="ITEM-1",
+            stock_state=StockState.RESERVED,
+        )
+
+        self.assertEqual(result.payload["result"]["warehouse_ref"], "W002")
+        self.assertEqual(self.delivery.warehouse_ref, "W002")
+        self.assertEqual(self.delivery_line.warehouse_ref, "W002")
+        self.assertEqual(DeliverySplit.objects.get(delivery_line=self.delivery_line).warehouse_ref, "W002")
+        self.assertEqual(released_reservation.lines.get().warehouse_ref, "W001")
+        self.assertEqual(active_reservation.lines.get().warehouse_ref, "W002")
+        self.assertEqual(self.fulfillment_line.reserved_qty, Decimal("3"))
+        self.assertEqual(old_packed.quantity, Decimal("5"))
+        self.assertEqual(old_reserved.quantity, Decimal("0"))
+        self.assertEqual(new_packed.quantity, Decimal("2"))
+        self.assertEqual(new_reserved.quantity, Decimal("3"))
+
+    def test_reassign_delivery_blocks_after_preparation_started(self):
+        self.delivery.status = DeliveryOrder.DeliveryStatus.PREPARING
+        self.delivery.save(update_fields=["status", "updated_at"])
+
+        with self.assertRaisesRegex(FulfillmentRuleError, "Solo se puede reasignar"):
+            reassign_confirmed_delivery_warehouse(
+                delivery_id=str(self.delivery.id),
+                target_warehouse_ref="W002",
+                idempotency_key="reassign-preparing",
+                actor="tester",
+                authorized_warehouses=["W002"],
+            )
 
     def test_legacy_delivery_date_uses_line_delivery_date_before_requested_shipping_date(self):
         requested_shipping_date = timezone.datetime(2026, 4, 20, tzinfo=timezone.get_current_timezone())
@@ -414,6 +689,150 @@ class DeliveryPreparationFlowTests(TestCase):
         self.assertEqual(line["delivery_uom"], "Un")
         self.assertEqual(line["item_snapshot"]["sap_uom"], "ST")
 
+    def test_expedition_queue_returns_fully_delivered_orders(self):
+        self.fulfillment.status = FulfillmentOrder.FulfillmentStatus.DELIVERED
+        self.fulfillment.save(update_fields=["status"])
+        self.fulfillment_line.delivered_qty = self.fulfillment_line.ordered_qty
+        self.fulfillment_line.save(update_fields=["delivered_qty"])
+        self.delivery.status = DeliveryOrder.DeliveryStatus.DELIVERED_COMPLETE
+        self.delivery.save(update_fields=["status"])
+        customer = {"customer_ref": "CUST-1", "name": "Cliente Test", "address": {}, "source": "test"}
+
+        with patch("apps.fulfillment.services._resolve_customer_snapshots", return_value={"CUST-1": customer}):
+            result = expedition_queue(sales_order_number="SO-1", authorized_warehouses=["W001"])
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["status"], FulfillmentOrder.FulfillmentStatus.DELIVERED)
+        self.assertEqual(result[0]["deliveries"][0]["status"], DeliveryOrder.DeliveryStatus.DELIVERED_COMPLETE)
+
+    def test_expedition_queue_ingests_invoiced_legacy_order_when_missing_locally(self):
+        legacy_order = SimpleNamespace(
+            sales_order_number="SO-LEGACY",
+            modified_datetime=timezone.now(),
+            invoice_date=timezone.now(),
+        )
+
+        def fake_ingest(**kwargs):
+            fulfillment = FulfillmentOrder.objects.create(
+                fulfillment_number="FUL-SO-LEGACY",
+                status=FulfillmentOrder.FulfillmentStatus.PENDING,
+                customer_ref="CUST-2",
+                delivery_mode="home",
+                warehouse_ref="W002",
+                legacy_sales_order_number=kwargs["sales_order_number"],
+                created_by=kwargs["actor"],
+            )
+            FulfillmentOrderLine.objects.create(
+                fulfillment=fulfillment,
+                ordered_qty=Decimal("2"),
+                uom="UN",
+                item_ref="ITEM-2",
+                warehouse_ref="W002",
+                legacy_sales_order_number=kwargs["sales_order_number"],
+                legacy_line_id="20",
+            )
+
+        def snapshots(lines):
+            return {
+                line.id: {
+                    "item_ref": line.item_ref,
+                    "name": "Producto legacy",
+                    "sales_uom": "UN",
+                    "delivery_uom": "UN",
+                    "conversion_factor": "1.000000",
+                }
+                for line in lines
+            }
+
+        with (
+            patch("apps.fulfillment.services._legacy_orders_for_expedition_search", return_value=[legacy_order]),
+            patch("apps.fulfillment.services.ingest_legacy_order", side_effect=fake_ingest),
+            patch("apps.fulfillment.services._resolve_line_item_snapshots", side_effect=snapshots),
+            patch("apps.fulfillment.services._resolve_customer_snapshots", return_value={"CUST-2": {"name": "Cliente Legacy", "address": {}}}),
+        ):
+            result = expedition_queue(sales_order_number="INV-LEGACY", authorized_warehouses=["W002"])
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["sales_order_number"], "SO-LEGACY")
+        self.assertEqual(result[0]["warehouse_ref"], "W002")
+
+    def test_expedition_queue_serializes_delivery_route_and_document_movements(self):
+        now = timezone.now()
+        DeliveryDocument.objects.create(
+            delivery=self.delivery,
+            document_number="R-MOV-1",
+            status=DeliveryDocument.DocumentStatus.CLOSED,
+            issued_at=now,
+            customer_ref=self.fulfillment.customer_ref,
+            legacy_sales_order_number="SO-1",
+            warehouse_ref="W001",
+            created_by="remitos",
+        )
+        StatusHistory.objects.create(
+            entity_type="delivery_order",
+            entity_id=str(self.delivery.id),
+            from_status=DeliveryOrder.DeliveryStatus.CREATED,
+            to_status=DeliveryOrder.DeliveryStatus.CONFIRMED,
+            actor="tester",
+            reason="Confirmacion manual",
+        )
+        route = RouteSheet.objects.create(
+            route_number="HR-MOV-1",
+            status=RouteSheet.RouteStatus.IN_TRANSIT,
+            branch_ref="BR-1",
+            warehouse_ref="W001",
+            planned_date=timezone.localdate(),
+            created_by="planner",
+        )
+        stop = RouteStop.objects.create(
+            route=route,
+            sequence=1,
+            status=RouteStop.StopStatus.DELIVERED,
+            source_type="delivery_order",
+            source_ref=str(self.delivery.id),
+            customer_ref=self.fulfillment.customer_ref,
+            completed_at=now,
+            outcome_status=DeliveryExecution.ExecutionStatus.DELIVERED_PARTIAL,
+            outcome_reason="Entrega parcial",
+            created_by="planner",
+            updated_by="driver",
+        )
+        StatusHistory.objects.create(
+            entity_type="route_stop",
+            entity_id=str(stop.id),
+            from_status=RouteStop.StopStatus.EN_ROUTE,
+            to_status=RouteStop.StopStatus.DELIVERED,
+            actor="driver",
+            reason="Ejecucion de parada",
+        )
+        DeliveryExecution.objects.create(
+            delivery=self.delivery,
+            route_stop_ref=str(stop.id),
+            status=DeliveryExecution.ExecutionStatus.DELIVERED_PARTIAL,
+            delivered_qty=Decimal("1"),
+            returned_qty=Decimal("2"),
+            executed_at=now,
+            observations="Cliente recibio parcial",
+            warehouse_ref="W001",
+            created_by="driver",
+        )
+        customer = {"customer_ref": "CUST-1", "name": "Cliente Test", "address": {}, "source": "test"}
+
+        with patch("apps.fulfillment.services._resolve_customer_snapshots", return_value={"CUST-1": customer}):
+            result = expedition_queue(sales_order_number="SO-1", authorized_warehouses=["W001"])
+
+        delivery_movements = result[0]["deliveries"][0]["movements"]
+        labels = {movement["label"] for movement in delivery_movements}
+        self.assertIn("Confirmacion manual", labels)
+        self.assertIn("Remito emitido", labels)
+        self.assertIn("Asignada a hoja de ruta", labels)
+        self.assertIn("Ejecucion de reparto", labels)
+        route_movements = [movement for movement in delivery_movements if movement["route_number"] == "HR-MOV-1"]
+        self.assertTrue(route_movements)
+        order_labels = {movement["label"] for movement in result[0]["movements"]}
+        self.assertIn("Pedido ingresado a TMS/WMS", order_labels)
+        self.assertIn("Ejecucion de reparto", order_labels)
+
     def test_preparation_task_flow_marks_delivery_prepared_and_allows_remito(self):
         validate_delivery_stock(
             delivery_id=str(self.delivery.id),
@@ -450,14 +869,38 @@ class DeliveryPreparationFlowTests(TestCase):
         self.delivery.refresh_from_db()
         self.fulfillment_line.refresh_from_db()
         task.refresh_from_db()
-        reserved = InventoryBalance.objects.get(warehouse_ref="W001", item_ref="ITEM-1", stock_state=StockState.RESERVED)
-        packed = InventoryBalance.objects.get(warehouse_ref="W001", item_ref="ITEM-1", stock_state=StockState.PACKED)
+        reserved = InventoryBalance.objects.get(
+            warehouse_ref="W001",
+            location_ref="W001-RSV-GEN",
+            item_ref="ITEM-1",
+            stock_state=StockState.RESERVED,
+        )
+        picking = InventoryBalance.objects.get(
+            warehouse_ref="W001",
+            location_ref="W001-PRE-GEN",
+            item_ref="ITEM-1",
+            stock_state=StockState.PICKING,
+        )
+        packed_dispatch = InventoryBalance.objects.get(
+            warehouse_ref="W001",
+            location_ref="W001-DSP-GEN",
+            item_ref="ITEM-1",
+            stock_state=StockState.PACKED,
+        )
+        packed_prepared = InventoryBalance.objects.get(
+            warehouse_ref="W001",
+            location_ref="W001-PRE-GEN",
+            item_ref="ITEM-1",
+            stock_state=StockState.PACKED,
+        )
 
         self.assertEqual(task.status, DeliveryPreparationTask.TaskStatus.PREPARED)
         self.assertEqual(self.delivery.status, DeliveryOrder.DeliveryStatus.PREPARED)
         self.assertEqual(self.fulfillment_line.prepared_qty, Decimal("3"))
         self.assertEqual(reserved.quantity, Decimal("0"))
-        self.assertEqual(packed.quantity, Decimal("5"))
+        self.assertEqual(picking.quantity, Decimal("0.000000"))
+        self.assertEqual(packed_dispatch.quantity, Decimal("2.000000"))
+        self.assertEqual(packed_prepared.quantity, Decimal("3.000000"))
 
         result = issue_remito(
             delivery_id=str(self.delivery.id),
@@ -469,8 +912,13 @@ class DeliveryPreparationFlowTests(TestCase):
         self.delivery.refresh_from_db()
         self.fulfillment.refresh_from_db()
         self.fulfillment_line.refresh_from_db()
-        packed.refresh_from_db()
-        delivered = InventoryBalance.objects.get(warehouse_ref="W001", item_ref="ITEM-1", stock_state=StockState.DELIVERED)
+        packed_prepared.refresh_from_db()
+        delivered = InventoryBalance.objects.get(
+            warehouse_ref="W001",
+            location_ref="W001-TRN-GEN",
+            item_ref="ITEM-1",
+            stock_state=StockState.DELIVERED,
+        )
 
         self.assertEqual(document.document_number, "R-000000001")
         self.assertEqual(document.lines.get().quantity, Decimal("3"))
@@ -478,8 +926,8 @@ class DeliveryPreparationFlowTests(TestCase):
         self.assertEqual(self.fulfillment.status, FulfillmentOrder.FulfillmentStatus.PARTIALLY_DELIVERED)
         self.assertEqual(self.fulfillment_line.delivered_qty, Decimal("3"))
         self.assertEqual(self.fulfillment_line.prepared_qty, Decimal("0"))
-        self.assertEqual(packed.quantity, Decimal("2"))
-        self.assertEqual(delivered.quantity, Decimal("3"))
+        self.assertEqual(packed_prepared.quantity, Decimal("0.000000"))
+        self.assertEqual(delivered.quantity, Decimal("3.000000"))
 
         next_delivery = split_fulfillment_delivery(
             fulfillment_id=str(self.fulfillment.id),

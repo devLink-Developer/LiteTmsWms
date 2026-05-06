@@ -427,8 +427,18 @@ class RouteExecutionFlowTests(TestCase):
 
         document = DeliveryDocument.objects.get(delivery=self.delivery)
         self.delivery.refresh_from_db()
-        packed = InventoryBalance.objects.get(warehouse_ref="W001", item_ref="ITEM-R", stock_state=StockState.PACKED)
-        transit = InventoryBalance.objects.get(warehouse_ref="W001", item_ref="ITEM-R", stock_state=StockState.IN_TRANSIT)
+        packed = InventoryBalance.objects.get(
+            warehouse_ref="W001",
+            location_ref="W001-DSP-GEN",
+            item_ref="ITEM-R",
+            stock_state=StockState.PACKED,
+        )
+        transit = InventoryBalance.objects.get(
+            warehouse_ref="W001",
+            location_ref="W001-TRN-GEN",
+            item_ref="ITEM-R",
+            stock_state=StockState.IN_TRANSIT,
+        )
         self.assertEqual(document.status, DeliveryDocument.DocumentStatus.OPEN)
         self.assertEqual(self.delivery.status, DeliveryOrder.DeliveryStatus.LOADED)
         self.assertEqual(packed.quantity, Decimal("0"))
@@ -446,7 +456,12 @@ class RouteExecutionFlowTests(TestCase):
         document.refresh_from_db()
         self.delivery.refresh_from_db()
         self.fulfillment_line.refresh_from_db()
-        delivered = InventoryBalance.objects.get(warehouse_ref="W001", item_ref="ITEM-R", stock_state=StockState.DELIVERED)
+        delivered = InventoryBalance.objects.get(
+            warehouse_ref="W001",
+            location_ref="W001-TRN-GEN",
+            item_ref="ITEM-R",
+            stock_state=StockState.DELIVERED,
+        )
         transit.refresh_from_db()
         self.assertEqual(document.status, DeliveryDocument.DocumentStatus.CLOSED)
         self.assertEqual(self.delivery.status, DeliveryOrder.DeliveryStatus.DELIVERED_COMPLETE)
@@ -500,8 +515,18 @@ class TransferFlowTests(TestCase):
         prepare_transfer(transfer_id=transfer_id, payload={}, idempotency_key="transfer-prepare", actor="origin")
         dispatch_transfer(transfer_id=transfer_id, payload={}, idempotency_key="transfer-dispatch", actor="origin")
 
-        origin_on_hand = InventoryBalance.objects.get(warehouse_ref="WH-A", item_ref="ITEM-T", stock_state=StockState.ON_HAND)
-        transit = InventoryBalance.objects.get(warehouse_ref="WH-A", item_ref="ITEM-T", stock_state=StockState.IN_TRANSIT)
+        origin_on_hand = InventoryBalance.objects.get(
+            warehouse_ref="WH-A",
+            location_ref="WH-A-DSP-GEN",
+            item_ref="ITEM-T",
+            stock_state=StockState.ON_HAND,
+        )
+        transit = InventoryBalance.objects.get(
+            warehouse_ref="WH-A",
+            location_ref="WH-A-TRN-GEN",
+            item_ref="ITEM-T",
+            stock_state=StockState.IN_TRANSIT,
+        )
         self.assertEqual(origin_on_hand.quantity, Decimal("3"))
         self.assertEqual(transit.quantity, Decimal("2"))
 
@@ -513,7 +538,12 @@ class TransferFlowTests(TestCase):
             actor="dest",
         )
         line.refresh_from_db()
-        destination_on_hand = InventoryBalance.objects.get(warehouse_ref="WH-B", item_ref="ITEM-T", stock_state=StockState.ON_HAND)
+        destination_on_hand = InventoryBalance.objects.get(
+            warehouse_ref="WH-B",
+            location_ref="WH-B-DSP-GEN",
+            item_ref="ITEM-T",
+            stock_state=StockState.ON_HAND,
+        )
         transit.refresh_from_db()
         self.assertEqual(line.received_qty, Decimal("1"))
         self.assertEqual(line.difference_qty, Decimal("1"))

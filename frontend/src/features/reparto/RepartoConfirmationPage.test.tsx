@@ -4,14 +4,25 @@ import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { RepartoConfirmationPage } from "./RepartoConfirmationPage";
+import { formatAppDate } from "../../shared/utils/dateFormat";
 
 function renderWithQuery(children: ReactNode) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
   return render(<QueryClientProvider client={client}>{children}</QueryClientProvider>);
 }
 
+function futureDateInputValue(days = 7) {
+  const date = new Date();
+  date.setDate(date.getDate() + days);
+  const localDate = new Date(date.getTime() - date.getTimezoneOffset() * 60000);
+  return localDate.toISOString().slice(0, 10);
+}
+
 describe("RepartoConfirmationPage", () => {
+  let plannedDate: string;
+
   beforeEach(() => {
+    plannedDate = futureDateInputValue();
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -51,7 +62,7 @@ describe("RepartoConfirmationPage", () => {
                 delivery_number: "ENT-100",
                 status: "created",
                 delivery_mode: "Repart Prg",
-                planned_date: "2026-04-27",
+                planned_date: plannedDate,
                 fulfillment_id: "fulfillment-1",
                 sales_order_number: "VENT8-100",
                 documents: [],
@@ -69,7 +80,7 @@ describe("RepartoConfirmationPage", () => {
                 delivery_number: "ENT-100",
                 status: "confirmed",
                 delivery_mode: "Repart Prg",
-                planned_date: "2026-04-27",
+                planned_date: plannedDate,
                 fulfillment_id: "fulfillment-1",
                 sales_order_number: "VENT8-100",
                 documents: [],
@@ -91,7 +102,7 @@ describe("RepartoConfirmationPage", () => {
                 status: "pending",
                 delivery_mode: "Repart Prg",
                 warehouse_ref: "PS003MT",
-                planned_date: "2026-04-27",
+                planned_date: plannedDate,
                 fulfillment_id: "fulfillment-1",
                 fulfillment_number: "FUL-100",
                 sales_order_number: "VENT8-100",
@@ -127,12 +138,12 @@ describe("RepartoConfirmationPage", () => {
   it("filters reparto deliveries by delivery date and confirms a pending delivery", async () => {
     renderWithQuery(<RepartoConfirmationPage />);
 
-    fireEvent.change(screen.getByLabelText("Fecha entrega"), { target: { value: "2026-04-27" } });
+    fireEvent.change(screen.getByLabelText("Fecha entrega"), { target: { value: plannedDate } });
 
     await waitFor(() => expect(screen.getByText("VENT8-100")).toBeInTheDocument());
     expect(screen.queryByLabelText("Deposito")).not.toBeInTheDocument();
     expect(screen.queryByRole("columnheader", { name: "Deposito" })).not.toBeInTheDocument();
-    expect(screen.getByText("27/04/2026")).toBeInTheDocument();
+    expect(screen.getByText(formatAppDate(plannedDate))).toBeInTheDocument();
     expect(screen.queryByText("100")).not.toBeInTheDocument();
     expect(screen.getByText("sin entrega generada")).toBeInTheDocument();
     expect(screen.getByText("CLI-1")).toBeInTheDocument();
@@ -140,11 +151,11 @@ describe("RepartoConfirmationPage", () => {
     const row = screen.getByRole("row", { name: /VENT8-100/i });
     expect(within(row).getByRole("button", { name: "Crear y confirmar" })).toBeDisabled();
     fireEvent.click(within(row).getByRole("button", { name: "Validar Stock" }));
-    await waitFor(() => expect(screen.getByText(/1 pedido con stock validado/)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("1 pedido con stock.")).toBeInTheDocument());
     expect(within(row).getByRole("button", { name: "Crear y confirmar" })).not.toBeDisabled();
     fireEvent.click(within(row).getByRole("button", { name: "Crear y confirmar" }));
 
-    await waitFor(() => expect(screen.getByText("1 entrega confirmada para reparto.")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("1 entrega confirmada.")).toBeInTheDocument());
     expect(fetch).toHaveBeenCalledWith(expect.stringContaining("/api/v1/fulfillment/fulfillment-1/stock-check"), expect.any(Object));
     expect(fetch).toHaveBeenCalledWith(expect.stringContaining("/api/v1/fulfillment/fulfillment-1/split"), expect.any(Object));
     expect(fetch).toHaveBeenCalledWith(expect.stringContaining("/api/v1/fulfillment/deliveries/delivery-1/validate-stock"), expect.any(Object));
@@ -153,7 +164,7 @@ describe("RepartoConfirmationPage", () => {
   it("selects all pending rows from the toolbar", async () => {
     renderWithQuery(<RepartoConfirmationPage />);
 
-    fireEvent.change(screen.getByLabelText("Fecha entrega"), { target: { value: "2026-04-27" } });
+    fireEvent.change(screen.getByLabelText("Fecha entrega"), { target: { value: plannedDate } });
 
     await waitFor(() => expect(screen.getByText("VENT8-100")).toBeInTheDocument());
     const validateSelected = screen.getByRole("button", { name: "Validar Stock seleccionadas" });

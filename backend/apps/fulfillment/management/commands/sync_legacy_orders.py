@@ -4,10 +4,12 @@ import time
 
 from django.core.management.base import BaseCommand
 from django.db import close_old_connections
+from django.db.models import Q
 from django.utils import timezone
 from django.utils.dateparse import parse_date
 
-from apps.fulfillment.services import FulfillmentRuleError, ingest_legacy_order
+from apps.fulfillment.models import LegacyOrderSyncCursor
+from apps.fulfillment.services import FulfillmentRuleError, ingest_legacy_order, legacy_sales_order_type, process_legacy_order_impact
 from apps.integrations.legacy.models import LegacyOrder
 
 
@@ -22,7 +24,12 @@ class Command(BaseCommand):
         parser.add_argument("--limit", type=int, default=100, help="Use 0 to process every matching order.")
         parser.add_argument("--actor", default="local.sync")
         parser.add_argument("--watch", action="store_true", help="Run forever and sync every --poll-interval seconds.")
-        parser.add_argument("--poll-interval", type=int, default=60, help="Seconds between sync cycles in --watch mode.")
+        parser.add_argument("--poll-interval", type=int, default=10, help="Seconds between sync cycles in --watch mode.")
+        parser.add_argument(
+            "--backfill",
+            action="store_true",
+            help="Process matching historical rows instead of only rows newer than the sync cursor.",
+        )
         parser.add_argument(
             "--oldest-first",
             action="store_true",
@@ -59,8 +66,17 @@ class Command(BaseCommand):
         limit = options["limit"]
         actor = options["actor"]
         oldest_first = options["oldest_first"]
+        backfill = options["backfill"]
 
-        queryset = LegacyOrder.objects.using("litecore").filter(invoice_number__gt="", sales_order_number__gt="")
+        queryset = (
+            LegacyOrder.objects.using("litecore")
+            .filter(invoice_number__gt="", sales_order_number__gt="")
+            .filter(
+                Q(sales_order_type__iexact="P")
+                | Q(sales_order_type__iexact="A")
+                | Q(sales_order_type__iexact="D")
+            )
+        )
         if sales_order_number:
             queryset = queryset.filter(sales_order_number=sales_order_number)
         if from_date:
@@ -69,8 +85,37 @@ class Command(BaseCommand):
             queryset = queryset.filter(invoice_date__date__lte=to_date)
         if status:
             queryset = queryset.filter(order_status=status)
-        if oldest_first:
-            queryset = queryset.order_by("invoice_date", "sales_order_number")
+
+        use_cursor = not backfill and not sales_order_number and not from_date and not to_date
+        cursor = None
+        if use_cursor:
+            cursor_name = f"litecore.orders:{status or 'all'}"
+            cursor, _ = LegacyOrderSyncCursor.objects.get_or_create(
+                name=cursor_name,
+                defaults={"created_by": actor},
+            )
+            if cursor.last_modified_datetime:
+                queryset = queryset.filter(
+                    Q(modified_datetime__gt=cursor.last_modified_datetime)
+                    | Q(modified_datetime=cursor.last_modified_datetime, transaction_id__gt=cursor.last_source_pk)
+                )
+            else:
+                latest = queryset.order_by("-modified_datetime", "-transaction_id").first()
+                if latest is not None:
+                    cursor.last_modified_datetime = latest.modified_datetime
+                    cursor.last_source_pk = latest.transaction_id
+                    cursor.updated_by = actor
+                    cursor.save(update_fields=["last_modified_datetime", "last_source_pk", "updated_by", "updated_at"])
+                    self.stdout.write(
+                        self.style.SUCCESS(
+                            f"Cursor {cursor.name} inicializado en {latest.modified_datetime.isoformat()} / {latest.transaction_id}.",
+                        )
+                    )
+                    self.stdout.write(self.style.SUCCESS("Procesados=0 omitidos=0"))
+                    return
+
+        if use_cursor or oldest_first:
+            queryset = queryset.order_by("modified_datetime", "transaction_id")
         else:
             queryset = queryset.order_by("-modified_datetime", "-invoice_date", "sales_order_number")
         if limit > 0:
@@ -78,20 +123,33 @@ class Command(BaseCommand):
 
         processed = 0
         skipped = 0
-        self.stdout.write(f"[{timezone.now().isoformat()}] Buscando pedidos Litecore facturados...")
+        self.stdout.write(f"[{timezone.now().isoformat()}] Buscando novedades Litecore...")
         for order in queryset:
-            key = f"sync:litecore:{order.sales_order_number}:{order.modified_datetime.isoformat()}"
+            order_type = legacy_sales_order_type(order)
+            key = f"sync:litecore:{order_type}:{order.sales_order_number}:{order.modified_datetime.isoformat()}"
             try:
-                result = ingest_legacy_order(
-                    sales_order_number=order.sales_order_number,
-                    idempotency_key=key,
-                    actor=actor,
-                )
+                if order_type in {"A", "D"}:
+                    result = process_legacy_order_impact(
+                        sales_order_number=order.sales_order_number,
+                        idempotency_key=key,
+                        actor=actor,
+                    )
+                else:
+                    result = ingest_legacy_order(
+                        sales_order_number=order.sales_order_number,
+                        idempotency_key=key,
+                        actor=actor,
+                    )
             except (FulfillmentRuleError, LegacyOrder.DoesNotExist, LegacyOrder.MultipleObjectsReturned) as exc:
                 skipped += 1
                 self.stdout.write(self.style.WARNING(f"{order.sales_order_number}: {exc}"))
-                continue
-            processed += 1
-            self.stdout.write(f"{order.sales_order_number}: {result.status}")
+            else:
+                processed += 1
+                self.stdout.write(f"{order.sales_order_number}: {result.status}")
+            if cursor is not None:
+                cursor.last_modified_datetime = order.modified_datetime
+                cursor.last_source_pk = order.transaction_id
+                cursor.updated_by = actor
+                cursor.save(update_fields=["last_modified_datetime", "last_source_pk", "updated_by", "updated_at"])
 
         self.stdout.write(self.style.SUCCESS(f"Procesados={processed} omitidos={skipped}"))

@@ -4,6 +4,7 @@ import { ArrowRight, Check, ClipboardList, PackageCheck, Send, Warehouse } from 
 
 import { createTransfer, fetchTransfers, transferCommand, type TransferOrder } from "../../api/transfers";
 import { StatusBadge } from "../../shared/components/StatusBadge";
+import { notify, useToastError } from "../../shared/components/toast";
 import type { StatusTone } from "../../types/operations";
 
 type TransferTab = "request" | "prepare" | "dispatch" | "receive" | "adjust";
@@ -43,7 +44,6 @@ export function TransfersPage() {
   const [qty, setQty] = useState("1");
   const [uom, setUom] = useState("UN");
   const [reason, setReason] = useState("");
-  const [message, setMessage] = useState<string | null>(null);
 
   const transfersQuery = useQuery({ queryKey: ["transfers-operational"], queryFn: fetchTransfers });
   const transfers = transfersQuery.data ?? [];
@@ -59,9 +59,9 @@ export function TransfersPage() {
         destination_warehouse_ref: destination,
         reason,
         lines: [{ item_ref: itemRef, requested_qty: qty, uom }],
-      }),
+    }),
     onSuccess: (transfer) => {
-      setMessage(`${transfer.transfer_number} creada.`);
+      notify({ message: `${transfer.transfer_number} creada.`, tone: "success" });
       setActiveId(transfer.id);
       void queryClient.invalidateQueries({ queryKey: ["transfers-operational"] });
     },
@@ -78,7 +78,7 @@ export function TransfersPage() {
       return transferCommand(transfer.id, command, payload);
     },
     onSuccess: (transfer) => {
-      setMessage(`${transfer.transfer_number} actualizado.`);
+      notify({ message: `${transfer.transfer_number} actualizado.`, tone: "success" });
       setActiveId(transfer.id);
       void queryClient.invalidateQueries({ queryKey: ["transfers-operational"] });
     },
@@ -86,6 +86,7 @@ export function TransfersPage() {
 
   const busy = transfersQuery.isLoading || createMutation.isPending || commandMutation.isPending;
   const error = transfersQuery.error || createMutation.error || commandMutation.error;
+  useToastError(error);
 
   function run(command: "approve" | "prepare" | "dispatch" | "receive" | "close") {
     if (!activeTransfer) return;
@@ -97,16 +98,9 @@ export function TransfersPage() {
       <header className="flex shrink-0 flex-wrap items-start justify-between gap-3">
         <div>
           <h1 className="text-[20px] font-semibold text-night">Transferencias entre sucursales</h1>
-          <p className="mt-1 text-[12px] text-secondaryText">Solicitud, preparacion, despacho, recepcion y cierre con diferencias.</p>
         </div>
         {activeTransfer && <StatusBadge label={activeTransfer.status} tone={statusTone[activeTransfer.status] ?? "neutral"} />}
       </header>
-
-      {(error || message) && (
-        <div className={`shrink-0 rounded border px-3 py-2 text-[12px] ${error ? "border-red-200 bg-red-50 text-red-700" : "border-blue-200 bg-blue-50 text-blue-800"}`}>
-          {error instanceof Error ? error.message : message}
-        </div>
-      )}
 
       <section className="flex shrink-0 gap-1 overflow-x-auto rounded border border-borderSoft bg-white p-1" aria-label="Etapas de transferencia">
         {tabs.map((entry) => (
@@ -156,7 +150,7 @@ export function TransfersPage() {
               {!transfers.length && (
                 <tr>
                   <td colSpan={5} className="px-3 py-6 text-[12px] text-secondaryText">
-                    {busy ? "Cargando transferencias..." : "No hay transferencias registradas."}
+                    {busy ? "Cargando..." : "Sin transferencias."}
                   </td>
                 </tr>
               )}

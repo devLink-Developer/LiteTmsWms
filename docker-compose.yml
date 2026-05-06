@@ -2,7 +2,7 @@ services:
   backend:
     build:
       context: ./backend
-    command: gunicorn config.wsgi:application --bind 0.0.0.0:8021 --workers 3
+    command: sh -c "python manage.py migrate --noinput && gunicorn config.wsgi:application --bind 0.0.0.0:8021 --workers 3"
     environment:
       POSTGRES_ENGINE: django.db.backends.postgresql
       DJANGO_CSRF_TRUSTED_ORIGINS: ${DJANGO_CSRF_TRUSTED_ORIGINS:-http://localhost:8021,http://127.0.0.1:8021}
@@ -39,7 +39,7 @@ services:
   legacy-order-sync:
     build:
       context: ./backend
-    command: python manage.py sync_legacy_orders --watch --poll-interval ${LEGACY_ORDER_SYNC_INTERVAL_SECONDS:-60} --limit ${LEGACY_ORDER_SYNC_LIMIT:-100} --actor backend.sync
+    command: sh -c "until python manage.py migrate --check; do sleep 2; done; python manage.py sync_legacy_orders --watch --poll-interval ${LEGACY_ORDER_SYNC_INTERVAL_SECONDS:-10} --limit ${LEGACY_ORDER_SYNC_LIMIT:-100} --actor backend.sync"
     restart: unless-stopped
     environment:
       POSTGRES_ENGINE: django.db.backends.postgresql

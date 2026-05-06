@@ -1,4 +1,4 @@
-import { apiGet, apiHeaders, apiPost, apiUrl } from "./client";
+import { apiGet, apiHeaders, apiPost, trackedFetch } from "./client";
 
 export type CapacityProfile = {
   id: string;
@@ -78,7 +78,7 @@ type CommandResult<T> = {
 };
 
 async function apiPatch<T>(path: string, body: unknown) {
-  const response = await fetch(apiUrl(path), {
+  const response = await trackedFetch(path, {
     method: "PATCH",
     credentials: "include",
     headers: apiHeaders({

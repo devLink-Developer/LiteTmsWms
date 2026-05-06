@@ -17,6 +17,7 @@ import {
   type VehicleRecord,
 } from "../../api/fleet";
 import { StatusBadge } from "../../shared/components/StatusBadge";
+import { notify, useToastError } from "../../shared/components/toast";
 import { useWorkspaceStore } from "../../stores/useWorkspaceStore";
 import type { StatusTone } from "../../types/operations";
 
@@ -168,7 +169,6 @@ export function FleetAdminPage({ initialTab = "vehicles" }: FleetAdminPageProps)
   const [vehicleForm, setVehicleForm] = useState<VehiclePayload>(() => emptyVehicle(branchRef));
   const [driverForm, setDriverForm] = useState<DriverPayload>(() => emptyDriver(branchRef, warehouseRef));
   const [profileForm, setProfileForm] = useState<CapacityProfilePayload>(() => emptyProfile());
-  const [message, setMessage] = useState<string | null>(null);
 
   useEffect(() => setTab(initialTab), [initialTab]);
 
@@ -204,7 +204,7 @@ export function FleetAdminPage({ initialTab = "vehicles" }: FleetAdminPageProps)
     onSuccess: (row) => {
       setVehicleId(row.id);
       setVehicleForm(vehiclePayload(row));
-      setMessage(`${row.code} guardado.`);
+      notify({ message: `${row.code} guardado.`, tone: "success" });
       void queryClient.invalidateQueries({ queryKey: ["fleet-vehicles"] });
       void queryClient.invalidateQueries({ queryKey: ["vehicles"] });
     },
@@ -215,7 +215,7 @@ export function FleetAdminPage({ initialTab = "vehicles" }: FleetAdminPageProps)
     onSuccess: (row) => {
       setDriverId(row.id);
       setDriverForm(driverPayload(row));
-      setMessage(`${row.code} guardado.`);
+      notify({ message: `${row.code} guardado.`, tone: "success" });
       void queryClient.invalidateQueries({ queryKey: ["fleet-drivers"] });
       void queryClient.invalidateQueries({ queryKey: ["drivers"] });
     },
@@ -226,7 +226,7 @@ export function FleetAdminPage({ initialTab = "vehicles" }: FleetAdminPageProps)
     onSuccess: (row) => {
       setProfileId(row.id);
       setProfileForm(profilePayload(row));
-      setMessage(`${row.name} guardado.`);
+      notify({ message: `${row.name} guardado.`, tone: "success" });
       void queryClient.invalidateQueries({ queryKey: ["fleet-profiles"] });
       void queryClient.invalidateQueries({ queryKey: ["vehicles"] });
     },
@@ -239,6 +239,7 @@ export function FleetAdminPage({ initialTab = "vehicles" }: FleetAdminPageProps)
     saveVehicleMutation.error ||
     saveDriverMutation.error ||
     saveProfileMutation.error;
+  useToastError(error);
   const busy = saveVehicleMutation.isPending || saveDriverMutation.isPending || saveProfileMutation.isPending;
 
   function resetVehicle() {
@@ -261,9 +262,6 @@ export function FleetAdminPage({ initialTab = "vehicles" }: FleetAdminPageProps)
       <header className="flex shrink-0 flex-wrap items-start justify-between gap-3">
         <div className="min-w-0">
           <h1 className="text-[20px] font-semibold text-night">ABM de flota</h1>
-          <div className="mt-1 text-[12px] text-secondaryText">
-            Vehiculos, choferes y perfiles de capacidad persistidos en tmswms.
-          </div>
         </div>
         <div className="inline-flex min-h-10 overflow-hidden rounded border border-borderSoft bg-white p-1 text-[12px] font-semibold shadow-panel">
           {[
@@ -288,17 +286,6 @@ export function FleetAdminPage({ initialTab = "vehicles" }: FleetAdminPageProps)
           })}
         </div>
       </header>
-
-      {(error || message) && (
-        <div
-          role="status"
-          className={`shrink-0 rounded border px-3 py-2 text-[12px] ${
-            error ? "border-red-200 bg-red-50 text-red-700" : "border-blue-200 bg-blue-50 text-blue-800"
-          }`}
-        >
-          {error instanceof Error ? error.message : message}
-        </div>
-      )}
 
       <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded border border-borderSoft bg-surface shadow-panel">
         <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-borderSoft bg-white p-3">
@@ -370,7 +357,6 @@ export function FleetAdminPage({ initialTab = "vehicles" }: FleetAdminPageProps)
             >
               <div>
                 <h2 className="text-[13px] font-semibold text-night">{vehicleId ? "Editar vehiculo" : "Nuevo vehiculo"}</h2>
-                <p className="mt-1 text-[11px] text-secondaryText">Codigo, patente y capacidad operativa.</p>
               </div>
               <div className="grid grid-cols-2 gap-2">
                 <Field label="Codigo">
@@ -399,7 +385,7 @@ export function FleetAdminPage({ initialTab = "vehicles" }: FleetAdminPageProps)
                   value={vehicleForm.capacity_profile_id}
                   onChange={(event) => setVehicleForm({ ...vehicleForm, capacity_profile_id: event.target.value })}
                 >
-                  <option value="">Seleccionar perfil</option>
+                  <option value="">Sin perfil</option>
                   {(profilesQuery.data ?? []).map((profile) => (
                     <option key={profile.id} value={profile.id}>
                       {profile.name} / {formatNumber(profile.max_weight_kg)} kg / {formatNumber(profile.max_volume_m3)} m3
@@ -470,7 +456,6 @@ export function FleetAdminPage({ initialTab = "vehicles" }: FleetAdminPageProps)
             >
               <div>
                 <h2 className="text-[13px] font-semibold text-night">{driverId ? "Editar chofer" : "Nuevo chofer"}</h2>
-                <p className="mt-1 text-[11px] text-secondaryText">Datos operativos, licencia y deposito base.</p>
               </div>
               <div className="grid grid-cols-2 gap-2">
                 <Field label="Codigo">
@@ -580,7 +565,6 @@ export function FleetAdminPage({ initialTab = "vehicles" }: FleetAdminPageProps)
             >
               <div>
                 <h2 className="text-[13px] font-semibold text-night">{profileId ? "Editar perfil" : "Nuevo perfil"}</h2>
-                <p className="mt-1 text-[11px] text-secondaryText">Capacidad base usada por ruteo.</p>
               </div>
               <Field label="Nombre">
                 <input className={inputClass} value={profileForm.name} onChange={(event) => setProfileForm({ ...profileForm, name: event.target.value })} />
