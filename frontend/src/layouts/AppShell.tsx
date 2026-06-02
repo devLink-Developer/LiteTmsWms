@@ -63,7 +63,7 @@ export function AppShell() {
     sidebarTimerRef.current = window.setTimeout(() => {
       setSidebarOpen(false);
       sidebarTimerRef.current = null;
-    }, 3000);
+    }, 1000);
   }
 
   async function handleLogout() {

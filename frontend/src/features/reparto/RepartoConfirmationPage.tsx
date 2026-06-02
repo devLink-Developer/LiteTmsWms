@@ -5,6 +5,7 @@ import { CalendarDays, CheckCircle2, ChevronDown, ChevronRight, Filter, PackageC
 import {
   checkDeliveryStock,
   checkFulfillmentStock,
+  confirmAvailableDeliveryStock,
   confirmDeliveryStock,
   fetchRepartoDeliveries,
   splitFulfillmentDelivery,
@@ -15,10 +16,18 @@ import { StatusBadge } from "../../shared/components/StatusBadge";
 import { notify, useToastError } from "../../shared/components/toast";
 import { formatAppDate } from "../../shared/utils/dateFormat";
 import { formatIdentifier } from "../../shared/utils/identifierFormat";
+import {
+  classifyStockAvailability,
+  hasConfirmableStock,
+  type StockAvailabilityLine,
+} from "../../shared/utils/stockAvailability";
 import type { StatusTone } from "../../types/operations";
 
 type StatusView = "pending" | "confirmed" | "all";
 type StockResultByRow = Record<string, { key: string; result: ApiStockValidationResult }>;
+type AvailableConfirmationState = {
+  rows: ApiRepartoDelivery[];
+} | null;
 
 const statusTone: Record<string, StatusTone> = {
   pending: "warning",
@@ -110,10 +119,39 @@ function stockLineFor(line: ApiRepartoDelivery["lines"][number], result: ApiStoc
   );
 }
 
-function stockIssueFor(line: ApiRepartoDelivery["lines"][number], result: ApiStockValidationResult | null | undefined) {
-  if (!result) return null;
-  const ids = [line.delivery_line_id, line.fulfillment_line_id].filter(Boolean);
-  return result.issues.find((candidate) => ids.includes(candidate.line_id) || ids.includes(candidate.line_id)) ?? null;
+function lineConversionFactor(line: ApiRepartoDelivery["lines"][number]) {
+  return Math.max(asNumber(line.conversion_factor) || 1, 0.000001);
+}
+
+function stockAvailabilitySourcesForReparto(delivery: ApiRepartoDelivery) {
+  return delivery.lines
+    .map((line) => {
+      const conversionFactor = lineConversionFactor(line);
+      return {
+        id: lineKey(line),
+        fulfillmentLineId: line.fulfillment_line_id,
+        deliveryLineId: line.delivery_line_id,
+        itemRef: line.item_ref,
+        itemName: line.item_name || line.item_long_name || "",
+        warehouseRef: line.warehouse_ref || delivery.warehouse_ref,
+        plannedQty: asNumber(line.split_qty),
+        uom: line.uom,
+        deliveryUom: line.delivery_uom || line.uom,
+        conversionFactor,
+        requestedDeliveryQty: asNumber(line.delivery_unit_qty ?? line.split_qty),
+        wholeDeliveryUnits: true,
+      };
+    })
+    .filter((line) => line.plannedQty > 0);
+}
+
+function stockAvailabilityForDelivery(delivery: ApiRepartoDelivery, result: ApiStockValidationResult | null | undefined) {
+  return result ? classifyStockAvailability(result, stockAvailabilitySourcesForReparto(delivery)) : [];
+}
+
+function rowHasConfirmableAvailableStock(delivery: ApiRepartoDelivery, result: ApiStockValidationResult | null | undefined) {
+  const availability = stockAvailabilityForDelivery(delivery, result);
+  return Boolean(result && !result.can_confirm && hasConfirmableStock(availability));
 }
 
 async function mapWithConcurrency<T, R>(items: T[], limit: number, handler: (item: T) => Promise<R>) {
@@ -140,6 +178,7 @@ export function RepartoConfirmationPage() {
   const [validatedRows, setValidatedRows] = useState<Record<string, string>>({});
   const [stockResults, setStockResults] = useState<StockResultByRow>({});
   const [expandedIds, setExpandedIds] = useState<string[]>([]);
+  const [availableConfirmation, setAvailableConfirmation] = useState<AvailableConfirmationState>(null);
 
   const deliveriesQuery = useQuery({
     queryKey: ["reparto-confirmation", plannedDate, query, statusView],
@@ -158,6 +197,26 @@ export function RepartoConfirmationPage() {
     [deliveries, selectedIds],
   );
   const selectedDeliveriesValidated = selectedDeliveries.length > 0 && selectedDeliveries.every((delivery) => validatedRows[delivery.id] === rowStockKey(delivery));
+  const selectedDeliveriesWithAvailableStock = useMemo(
+    () =>
+      selectedDeliveries.filter((delivery) => {
+        const stockResult = stockResults[delivery.id]?.key === rowStockKey(delivery) ? stockResults[delivery.id].result : null;
+        return rowHasConfirmableAvailableStock(delivery, stockResult);
+      }),
+    [selectedDeliveries, stockResults],
+  );
+  const availableConfirmationRows = useMemo(
+    () =>
+      (availableConfirmation?.rows ?? []).map((delivery) => {
+        const stockResult = stockResults[delivery.id]?.key === rowStockKey(delivery) ? stockResults[delivery.id].result : null;
+        return {
+          delivery,
+          availability: stockAvailabilityForDelivery(delivery, stockResult),
+        };
+      }),
+    [availableConfirmation, stockResults],
+  );
+  const availableConfirmationHasLines = availableConfirmationRows.some((row) => row.availability.some((line) => line.confirmQty > 0));
   const pendingCount = confirmableDeliveries.length;
   const confirmedCount = deliveries.filter((delivery) => ["confirmed", "reserved"].includes(delivery.status)).length;
   const allConfirmableSelected = confirmableDeliveries.length > 0 && confirmableDeliveries.every((delivery) => selectedIds.includes(delivery.id));
@@ -169,6 +228,7 @@ export function RepartoConfirmationPage() {
     setValidatedRows({});
     setStockResults({});
     setExpandedIds([]);
+    setAvailableConfirmation(null);
   }, [plannedDate, query, statusView]);
 
   function handlePlannedDateChange(value: string) {
@@ -252,8 +312,59 @@ export function RepartoConfirmationPage() {
       setValidatedRows({});
       setStockResults({});
       setExpandedIds([]);
+      setAvailableConfirmation(null);
       notify({
         message: `${confirmed.length} entrega${confirmed.length === 1 ? "" : "s"} confirmada${confirmed.length === 1 ? "" : "s"}.`,
+        tone: "success",
+      });
+      void queryClient.invalidateQueries({ queryKey: ["reparto-confirmation"] });
+    },
+  });
+
+  const confirmAvailableMutation = useMutation({
+    mutationFn: async (rows: ApiRepartoDelivery[]) => {
+      return mapWithConcurrency(rows, 3, async (row) => {
+        const stockResult = stockResults[row.id]?.key === rowStockKey(row) ? stockResults[row.id].result : null;
+        const availability = stockAvailabilityForDelivery(row, stockResult);
+        const availableLines = availability.filter((line) => line.confirmQty > 0);
+        if (!stockResult || !availableLines.length) {
+          throw new Error(`Sin stock disponible validado ${orderRef(row)}.`);
+        }
+        if (row.source_type === "fulfillment") {
+          const lines = availableLines.map((line) => ({
+            fulfillment_line_id: line.fulfillmentLineId || line.id,
+            split_qty: line.confirmQty,
+          }));
+          const revalidated = await checkFulfillmentStock(row.fulfillment_id, lines);
+          if (!revalidated.can_confirm) {
+            throw new Error(`El stock disponible cambio ${orderRef(row)}.`);
+          }
+          const delivery = await splitFulfillmentDelivery(row.fulfillment_id, {
+            delivery_mode: row.delivery_mode,
+            planned_date: row.planned_date || plannedDate,
+            reason: "Confirmacion parcial de reparto por stock disponible",
+            lines,
+          });
+          return confirmDeliveryStock(delivery.id);
+        }
+        if (row.delivery_id) {
+          return confirmAvailableDeliveryStock(row.delivery_id, {
+            lines: availableLines
+              .filter((line) => line.deliveryLineId)
+              .map((line) => ({ delivery_line_id: String(line.deliveryLineId), planned_qty: line.confirmQty })),
+          });
+        }
+        throw new Error("Fila sin entrega.");
+      });
+    },
+    onSuccess: (confirmed) => {
+      setSelectedIds([]);
+      setValidatedRows({});
+      setStockResults({});
+      setExpandedIds([]);
+      setAvailableConfirmation(null);
+      notify({
+        message: `${confirmed.length} entrega${confirmed.length === 1 ? "" : "s"} parcial${confirmed.length === 1 ? "" : "es"} confirmada${confirmed.length === 1 ? "" : "s"}.`,
         tone: "success",
       });
       void queryClient.invalidateQueries({ queryKey: ["reparto-confirmation"] });
@@ -276,8 +387,13 @@ export function RepartoConfirmationPage() {
     setExpandedIds((current) => (current.includes(id) ? current.filter((candidate) => candidate !== id) : [...current, id]));
   }
 
-  const busy = deliveriesQuery.isLoading || deliveriesQuery.isFetching || validateStockMutation.isPending || confirmMutation.isPending;
-  const error = deliveriesQuery.error || validateStockMutation.error || confirmMutation.error;
+  const busy =
+    deliveriesQuery.isLoading ||
+    deliveriesQuery.isFetching ||
+    validateStockMutation.isPending ||
+    confirmMutation.isPending ||
+    confirmAvailableMutation.isPending;
+  const error = deliveriesQuery.error || validateStockMutation.error || confirmMutation.error || confirmAvailableMutation.error;
   useToastError(error);
 
   return (
@@ -306,6 +422,15 @@ export function RepartoConfirmationPage() {
           >
             <CheckCircle2 size={15} />
             Confirmar seleccionadas
+          </button>
+          <button
+            type="button"
+            disabled={!selectedDeliveriesWithAvailableStock.length || busy}
+            onClick={() => setAvailableConfirmation({ rows: selectedDeliveriesWithAvailableStock })}
+            className="inline-flex min-h-9 items-center gap-2 rounded border border-amber-300 bg-amber-50 px-3 text-[12px] font-semibold text-amber-800 transition hover:bg-amber-100 focus:outline-none focus:ring-2 focus:ring-amber-500/20 disabled:bg-softStart disabled:text-secondaryText"
+          >
+            <PackageCheck size={15} />
+            Confirmar disponibles seleccionadas
           </button>
         </div>
       </header>
@@ -450,6 +575,9 @@ export function RepartoConfirmationPage() {
                 const stockResult = stockResults[delivery.id]?.key === rowStockKey(delivery) ? stockResults[delivery.id].result : null;
                 const stockValidated = validatedRows[delivery.id] === rowStockKey(delivery) && stockResult?.can_confirm !== false;
                 const stockBlocked = stockResult?.can_confirm === false;
+                const stockAvailability = stockAvailabilityForDelivery(delivery, stockResult);
+                const stockAvailabilityByLine = new Map(stockAvailability.map((line) => [line.id, line]));
+                const stockPartial = Boolean(stockBlocked && hasConfirmableStock(stockAvailability));
                 const expanded = expandedIds.includes(delivery.id) || !!stockResult;
                 return (
                   <Fragment key={delivery.id}>
@@ -487,8 +615,8 @@ export function RepartoConfirmationPage() {
                       <div className="flex flex-col items-start gap-1">
                         <StatusBadge label={statusLabel[delivery.status] ?? delivery.status} tone={statusTone[delivery.status] ?? "neutral"} />
                         {confirmable && (
-                          <span className={`text-[11px] font-semibold ${stockValidated ? "text-emerald-700" : stockBlocked ? "text-red-700" : "text-amber-700"}`}>
-                            {stockValidated ? "stock validado" : stockBlocked ? "sin stock" : "stock pendiente"}
+                          <span className={`text-[11px] font-semibold ${stockValidated ? "text-emerald-700" : stockPartial ? "text-amber-700" : stockBlocked ? "text-red-700" : "text-amber-700"}`}>
+                            {stockValidated ? "stock validado" : stockPartial ? "stock parcial" : stockBlocked ? "sin stock" : "stock pendiente"}
                           </span>
                         )}
                       </div>
@@ -521,6 +649,15 @@ export function RepartoConfirmationPage() {
                           <CheckCircle2 size={14} />
                           {delivery.source_type === "fulfillment" ? "Crear y confirmar" : "Confirmar"}
                         </button>
+                        <button
+                          type="button"
+                          disabled={!confirmable || !stockPartial || busy}
+                          onClick={() => setAvailableConfirmation({ rows: [delivery] })}
+                          className="inline-flex min-h-8 items-center gap-2 rounded border border-amber-300 bg-amber-50 px-3 text-[12px] font-semibold text-amber-800 transition hover:bg-amber-100 focus:outline-none focus:ring-2 focus:ring-amber-500/20 disabled:bg-softStart disabled:text-secondaryText"
+                        >
+                          <PackageCheck size={14} />
+                          Confirmar Disponibles
+                        </button>
                       </div>
                     </td>
                   </tr>
@@ -530,14 +667,24 @@ export function RepartoConfirmationPage() {
                         <div className="grid gap-1">
                           {delivery.lines.map((line) => {
                             const validationLine = stockLineFor(line, stockResult);
-                            const validationIssue = stockIssueFor(line, stockResult);
+                            const availabilityLine = stockAvailabilityByLine.get(lineKey(line));
                             const requestedQty = validationLine?.planned_qty ?? line.split_qty;
-                            const availableQty = validationLine?.available_qty ?? line.max_dispatchable_qty ?? line.stock_available ?? "";
-                            const lineHasStock = stockResult ? !validationIssue && asNumber(availableQty) >= asNumber(requestedQty) : null;
+                            const availableQty = availabilityLine ? String(availabilityLine.confirmQty) : validationLine?.available_qty ?? line.max_dispatchable_qty ?? line.stock_available ?? "";
+                            const lineStockStatus = availabilityLine?.status ?? null;
+                            const lineHasStock = stockResult ? lineStockStatus === "ok" : null;
+                            const linePartial = lineStockStatus === "partial";
                             return (
                               <div
                                 key={lineKey(line)}
-                                className="grid items-center gap-2 rounded border border-borderSoft bg-white px-2 py-1 text-[11px] md:grid-cols-[minmax(180px,1.3fr)_120px_150px_130px_90px]"
+                                className={`grid items-center gap-2 rounded border px-2 py-1 text-[11px] md:grid-cols-[minmax(180px,1.3fr)_120px_170px_130px_100px] ${
+                                  linePartial
+                                    ? "border-amber-200 bg-amber-50"
+                                    : lineStockStatus === "missing"
+                                      ? "border-red-200 bg-red-50"
+                                      : lineStockStatus === "ok"
+                                        ? "border-emerald-200 bg-emerald-50"
+                                        : "border-borderSoft bg-white"
+                                }`}
                               >
                                 <div className="min-w-0">
                                   <div className="truncate font-mono font-semibold text-night">{line.item_ref}</div>
@@ -550,6 +697,11 @@ export function RepartoConfirmationPage() {
                                   {stockResult ? (
                                     <>
                                       {formatNumber(requestedQty)} / {formatNumber(availableQty)} {validationLine?.uom ?? line.uom}
+                                      {linePartial && availabilityLine && (
+                                        <div className="mt-1 text-amber-700">
+                                          disp. {formatNumber(availabilityLine.availableDeliveryQty)} {availabilityLine.deliveryUom || availabilityLine.uom}
+                                        </div>
+                                      )}
                                     </>
                                   ) : (
                                     <span className="text-secondaryText">sin validar</span>
@@ -563,6 +715,8 @@ export function RepartoConfirmationPage() {
                                     <span className="rounded border border-borderSoft bg-softMid px-2 py-1 font-semibold text-secondaryText">pendiente</span>
                                   ) : lineHasStock ? (
                                     <span className="rounded border border-emerald-200 bg-emerald-50 px-2 py-1 font-semibold text-emerald-800">con stock</span>
+                                  ) : linePartial ? (
+                                    <span className="rounded border border-amber-200 bg-amber-50 px-2 py-1 font-semibold text-amber-800">parcial</span>
                                   ) : (
                                     <span className="rounded border border-red-200 bg-red-50 px-2 py-1 font-semibold text-red-700">sin stock</span>
                                   )}
@@ -589,6 +743,98 @@ export function RepartoConfirmationPage() {
           )}
         </div>
       </section>
+      {availableConfirmation && (
+        <div
+          className="fixed inset-0 z-50 grid place-items-center bg-deep/45 px-4 py-6"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="reparto-available-title"
+          aria-describedby="reparto-available-description"
+          onKeyDown={(event) => {
+            if (event.key === "Escape" && !busy) {
+              setAvailableConfirmation(null);
+            }
+          }}
+        >
+          <div className="w-full max-w-3xl rounded border border-borderSoft bg-white shadow-panel">
+            <div className="border-b border-borderSoft px-4 py-3">
+              <p className="text-[11px] font-semibold uppercase text-amber-700">Confirmacion requerida</p>
+              <h2 id="reparto-available-title" className="mt-1 text-[16px] font-semibold text-night">
+                Confirmar disponibles
+              </h2>
+            </div>
+            <div className="grid max-h-[70vh] gap-3 overflow-auto px-4 py-3">
+              <p id="reparto-available-description" className="text-[13px] leading-5 text-secondaryText">
+                Se van a confirmar entregas parciales con las cantidades disponibles. Las lineas sin cantidad entregable quedan pendientes.
+              </p>
+              {availableConfirmationRows.map(({ delivery, availability }) => {
+                const confirmLines = availability.filter((line) => line.confirmQty > 0);
+                const pendingLines = availability.filter((line) => line.status === "missing");
+                return (
+                  <section key={delivery.id} className="rounded border border-borderSoft bg-softMid px-3 py-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <h3 className="font-mono text-[13px] font-semibold text-night">{orderRef(delivery)}</h3>
+                      <StatusBadge label={delivery.source_type === "fulfillment" ? "crea entrega parcial" : "ajusta entrega"} tone="warning" />
+                    </div>
+                    <div className="mt-2 grid gap-2">
+                      {confirmLines.map((line) => (
+                        <div key={line.id} className="grid gap-1 rounded border border-amber-200 bg-white px-2 py-2 text-[12px] md:grid-cols-[minmax(160px,1fr)_auto]">
+                          <div className="min-w-0">
+                            <div className="font-mono font-semibold text-night">{line.itemRef}</div>
+                            <div className="truncate text-secondaryText">{line.itemName || "sin descripcion"}</div>
+                          </div>
+                          <div className="font-mono text-night">
+                            {formatNumber(line.availableDeliveryQty)} {line.deliveryUom || line.uom}
+                            {line.status === "partial" && (
+                              <span className="ml-2 text-amber-700">
+                                falta {formatNumber(line.missingDeliveryQty)} {line.deliveryUom || line.uom}
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      ))}
+                      {!confirmLines.length && <div className="text-[12px] text-secondaryText">Sin lineas disponibles.</div>}
+                    </div>
+                    {!!pendingLines.length && (
+                      <div className="mt-2 rounded border border-rose-200 bg-rose-50 px-2 py-2">
+                        <div className="text-[12px] font-semibold text-rose-900">Quedan pendientes</div>
+                        <div className="mt-1 grid gap-1">
+                          {pendingLines.map((line) => (
+                            <div key={line.id} className="flex flex-wrap justify-between gap-2 text-[11px]">
+                              <span className="font-mono text-night">{line.itemRef}</span>
+                              <span className="font-mono text-rose-700">
+                                solicitado {formatNumber(line.requestedDeliveryQty)} {line.deliveryUom || line.uom} / disponible 0
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </section>
+                );
+              })}
+            </div>
+            <div className="flex flex-wrap justify-end gap-2 border-t border-borderSoft px-4 py-3">
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => setAvailableConfirmation(null)}
+                className="min-h-10 rounded border border-borderSoft bg-white px-3 text-[12px] font-semibold text-night transition hover:border-primary hover:text-primaryHover focus:outline-none focus:ring-2 focus:ring-primary/20 disabled:cursor-not-allowed disabled:bg-softStart disabled:text-secondaryText"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                disabled={busy || !availableConfirmationHasLines}
+                onClick={() => confirmAvailableMutation.mutate(availableConfirmation.rows)}
+                className="min-h-10 rounded bg-amber-600 px-3 text-[12px] font-semibold text-white transition hover:bg-amber-700 focus:outline-none focus:ring-2 focus:ring-amber-500/30 disabled:cursor-not-allowed disabled:bg-softStart disabled:text-secondaryText"
+              >
+                {confirmAvailableMutation.isPending ? "Confirmando..." : "Confirmar Disponibles"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

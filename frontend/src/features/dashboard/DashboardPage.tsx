@@ -14,6 +14,7 @@ import {
 } from "../../api/operations";
 import { StatusBadge } from "../../shared/components/StatusBadge";
 import { notify } from "../../shared/components/toast";
+import { translateStatusLabel } from "../../shared/utils/statusLabels";
 import type { StatusTone } from "../../types/operations";
 
 const metricToneClasses: Record<StatusTone, string> = {
@@ -120,7 +121,7 @@ function HorizontalBarChart({
         const width = Math.round((row.count / max) * 100);
         return (
           <div key={row.key} className="grid grid-cols-[minmax(112px,0.55fr)_minmax(120px,1fr)_56px] items-center gap-2">
-            <div className="min-w-0 text-[12px] font-semibold leading-4 text-night">{row.label}</div>
+            <div className="min-w-0 text-[12px] font-semibold leading-4 text-night">{translateStatusLabel(row.label || row.key)}</div>
             <div className="h-3 overflow-hidden rounded bg-softMid" aria-hidden="true">
               <div className={`h-full ${barToneClasses[row.count ? tone : "neutral"]}`} style={{ width: `${width}%` }} />
             </div>
@@ -144,7 +145,7 @@ function StockStateChart({ data }: { data: DashboardStockState[] }) {
         return (
           <div key={row.key} className="grid grid-cols-[minmax(120px,0.5fr)_minmax(120px,1fr)_72px] items-center gap-2">
             <div className="min-w-0">
-              <div className="text-[12px] font-semibold leading-4 text-night">{row.label}</div>
+              <div className="text-[12px] font-semibold leading-4 text-night">{translateStatusLabel(row.label || row.key)}</div>
               <div className="text-[11px] leading-4 text-secondaryText">{quantityText(row.quantity_by_uom)}</div>
             </div>
             <div className="h-3 overflow-hidden rounded bg-softMid" aria-hidden="true">
@@ -231,7 +232,7 @@ function RouteLoadPanel({ routes }: { routes: DashboardRouteLoad[] }) {
           {routes.map((route) => (
             <tr key={route.route_number} className="border-b border-borderSoft bg-white">
               <td className="px-3 py-2 font-mono font-semibold text-night">{route.route_number}</td>
-              <td className="px-3 py-2 text-secondaryText">{route.status}</td>
+              <td className="px-3 py-2 text-secondaryText">{translateStatusLabel(route.status)}</td>
               <td className="px-3 py-2 text-right font-mono text-night">{formatCount(route.stops)}</td>
               <td className="px-3 py-2 text-right font-mono text-night">{formatQuantity(route.planned_weight_kg)}</td>
               <td className="px-3 py-2 text-right font-mono text-night">{formatQuantity(route.planned_volume_m3)}</td>

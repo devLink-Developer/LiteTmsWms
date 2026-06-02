@@ -250,7 +250,7 @@ def prepare_transfer(*, transfer_id: str, payload: dict, idempotency_key: str, a
                     for line in transfer.lines.all()
                 ],
                 idempotency_key=f"{idempotency_key}:inventory",
-                source_stock_state=StockState.ON_HAND,
+                source_stock_state=StockState.PACKED,
             )
         except InventoryRuleError as exc:
             raise TransferRuleError(str(exc)) from exc
@@ -362,7 +362,7 @@ def receive_transfer(*, transfer_id: str, payload: dict, idempotency_key: str, a
                 item_ref=line.item_ref,
                 quantity=delta,
                 uom=line.uom,
-                to_state=StockState.ON_HAND,
+                to_state=StockState.PACKED,
                 target_location_purpose="available",
                 document_type="transfer_order",
                 document_ref=str(transfer.id),

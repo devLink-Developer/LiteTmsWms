@@ -26,6 +26,7 @@ from apps.fulfillment.services import (
     _apply_order_impact,
     check_delivery_stock,
     check_fulfillment_stock_for_split,
+    confirm_available_delivery_stock,
     expedition_queue,
     ingest_legacy_order,
     issue_remito,
@@ -265,6 +266,119 @@ class DeliveryPreparationFlowTests(TestCase):
         self.assertEqual(packed.quantity, Decimal("2"))
         self.assertEqual(reserved.quantity, Decimal("3"))
 
+    def test_confirm_delivery_matches_packed_stock_when_line_uom_case_differs(self):
+        self.fulfillment_line.uom = "un"
+        self.fulfillment_line.save(update_fields=["uom", "updated_at"])
+        self.delivery_line.uom = "un"
+        self.delivery_line.save(update_fields=["uom", "updated_at"])
+
+        validate_delivery_stock(
+            delivery_id=str(self.delivery.id),
+            idempotency_key="confirm-uom-case",
+            actor="tester",
+            authorized_warehouses=["W001"],
+        )
+
+        packed = InventoryBalance.objects.get(
+            warehouse_ref="W001",
+            location_ref="W001-DSP-GEN",
+            item_ref="ITEM-1",
+            stock_state=StockState.PACKED,
+            uom="UN",
+        )
+        reserved = InventoryBalance.objects.get(
+            warehouse_ref="W001",
+            location_ref="W001-RSV-GEN",
+            item_ref="ITEM-1",
+            stock_state=StockState.RESERVED,
+            uom="UN",
+        )
+        reservation_line = InventoryReservation.objects.get(source_type="delivery_order", source_ref=str(self.delivery.id)).lines.get()
+
+        self.assertEqual(packed.quantity, Decimal("2"))
+        self.assertEqual(reserved.quantity, Decimal("3"))
+        self.assertEqual(reservation_line.uom, "UN")
+
+    def test_confirm_available_delivery_reduces_lines_and_reserves_only_available_quantities(self):
+        second_fulfillment_line = FulfillmentOrderLine.objects.create(
+            fulfillment=self.fulfillment,
+            ordered_qty=Decimal("2"),
+            uom="UN",
+            item_ref="ITEM-2",
+            warehouse_ref="W001",
+            legacy_sales_order_number="SO-1",
+            legacy_line_id="20",
+        )
+        second_delivery_line = DeliveryOrderLine.objects.create(
+            delivery=self.delivery,
+            fulfillment_line=second_fulfillment_line,
+            planned_qty=Decimal("2"),
+            uom="UN",
+            item_ref="ITEM-2",
+            warehouse_ref="W001",
+            legacy_sales_order_number="SO-1",
+            legacy_line_id="20",
+        )
+        DeliverySplit.objects.create(
+            fulfillment_line=self.fulfillment_line,
+            delivery_line=self.delivery_line,
+            split_qty=Decimal("3"),
+            remaining_after_split=Decimal("2"),
+            reason="test",
+        )
+        DeliverySplit.objects.create(
+            fulfillment_line=second_fulfillment_line,
+            delivery_line=second_delivery_line,
+            split_qty=Decimal("2"),
+            remaining_after_split=Decimal("0"),
+            reason="test",
+        )
+
+        result = confirm_available_delivery_stock(
+            delivery_id=str(self.delivery.id),
+            lines=[{"delivery_line_id": str(self.delivery_line.id), "planned_qty": "2"}],
+            idempotency_key="confirm-available-1",
+            actor="tester",
+            authorized_warehouses=["W001"],
+        )
+
+        self.delivery.refresh_from_db()
+        self.delivery_line.refresh_from_db()
+        self.fulfillment_line.refresh_from_db()
+        self.assertEqual(result.payload["result"]["status"], DeliveryOrder.DeliveryStatus.CONFIRMED)
+        self.assertEqual(self.delivery.status, DeliveryOrder.DeliveryStatus.CONFIRMED)
+        self.assertEqual(self.delivery.lines.count(), 1)
+        self.assertFalse(DeliveryOrderLine.objects.filter(id=second_delivery_line.id).exists())
+        self.assertEqual(self.delivery_line.planned_qty, Decimal("2.000000"))
+        self.assertEqual(self.fulfillment_line.reserved_qty, Decimal("2"))
+        self.assertEqual(DeliverySplit.objects.get(delivery_line=self.delivery_line).split_qty, Decimal("2.000000"))
+        reservation_line = InventoryReservation.objects.get(source_type="delivery_order", source_ref=str(self.delivery.id)).lines.get()
+        self.assertEqual(reservation_line.reserved_qty, Decimal("2.000000"))
+        self.assertTrue(
+            StatusHistory.objects.filter(
+                entity_type="delivery_order",
+                entity_id=str(self.delivery.id),
+                reason="Confirmacion parcial por stock disponible",
+            ).exists()
+        )
+
+    def test_confirm_available_delivery_rejects_preparation_started(self):
+        DeliveryPreparationTask.objects.create(
+            delivery=self.delivery,
+            status=DeliveryPreparationTask.TaskStatus.ASSIGNED,
+            assigned_to="picker-1",
+            assigned_at=timezone.now(),
+        )
+
+        with self.assertRaisesRegex(FulfillmentRuleError, "inicio preparacion"):
+            confirm_available_delivery_stock(
+                delivery_id=str(self.delivery.id),
+                lines=[{"delivery_line_id": str(self.delivery_line.id), "planned_qty": "2"}],
+                idempotency_key="confirm-available-prep",
+                actor="tester",
+                authorized_warehouses=["W001"],
+            )
+
     def test_annulment_impact_cancels_non_remitted_qty_and_releases_reservation(self):
         validate_delivery_stock(
             delivery_id=str(self.delivery.id),
@@ -401,6 +515,15 @@ class DeliveryPreparationFlowTests(TestCase):
         labels = {movement["label"] for movement in result[0]["movements"]}
         self.assertIn("Devolucion recibida", labels)
         self.assertIn("Stock ingresado", labels)
+
+    def test_expedition_queue_matches_normalized_indexed_filters(self):
+        customer = {"customer_ref": "CUST-1", "name": "Cliente Test", "document_number": "", "address": {}}
+        with patch("apps.fulfillment.services._resolve_customer_snapshots", return_value={"CUST-1": customer}):
+            by_order = expedition_queue(sales_order_number="so-1", authorized_warehouses=["W001"])
+            by_customer = expedition_queue(customer_ref="cust-1", authorized_warehouses=["W001"])
+
+        self.assertEqual([row["sales_order_number"] for row in by_order], ["SO-1"])
+        self.assertEqual([row["customer_ref"] for row in by_customer], ["CUST-1"])
 
     def test_reassign_confirmed_delivery_moves_reservation_to_target_warehouse(self):
         validate_delivery_stock(
@@ -755,6 +878,25 @@ class DeliveryPreparationFlowTests(TestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["sales_order_number"], "SO-LEGACY")
         self.assertEqual(result[0]["warehouse_ref"], "W002")
+
+    def test_expedition_queue_uses_target_warehouse_for_stock_availability(self):
+        InventoryBalance.objects.create(
+            warehouse_ref="W002",
+            item_ref="ITEM-1",
+            lot_ref="",
+            stock_state=StockState.PACKED,
+            uom="UN",
+            quantity=Decimal("1"),
+        )
+
+        with patch("apps.fulfillment.services._resolve_customer_snapshots", return_value={"CUST-1": {"name": "Cliente", "address": {}}}):
+            result = expedition_queue(sales_order_number="SO-1", target_warehouse_ref="W002")
+
+        self.assertEqual(len(result), 1)
+        line = result[0]["lines"][0]
+        self.assertEqual(line["warehouse_ref"], "W001")
+        self.assertEqual(line["stock_available"], "1")
+        self.assertEqual(line["max_dispatchable_qty"], "1")
 
     def test_expedition_queue_serializes_delivery_route_and_document_movements(self):
         now = timezone.now()

@@ -2,6 +2,7 @@ import { useMemo } from "react";
 
 import type { OperationModule, OperationRow } from "../../types/operations";
 import { formatMaybeDateValue } from "../utils/dateFormat";
+import { translateStatusLabel } from "../utils/statusLabels";
 import { StatusBadge } from "./StatusBadge";
 import { TraceabilitySection } from "./TraceabilitySection";
 
@@ -90,7 +91,7 @@ function deliveryRoute(delivery: RawRecord) {
   const route = asRecord(delivery.route_sheet);
   const routeNumber = display(route.route_number, "");
   const routeStatus = display(route.status, "");
-  return routeNumber ? `${routeNumber}${routeStatus ? ` / ${routeStatus}` : ""}` : "";
+  return routeNumber ? `${routeNumber}${routeStatus ? ` / ${translateStatusLabel(routeStatus)}` : ""}` : "";
 }
 
 function DeliveryList({ title, deliveries, emptyText }: { title: string; deliveries: RawRecord[]; emptyText: string }) {
@@ -130,7 +131,7 @@ function DeliveryList({ title, deliveries, emptyText }: { title: string; deliver
                     <div className="flex flex-wrap gap-1">
                       {remitos.map((document) => (
                         <span key={display(document.id, display(document.document_number))} className="rounded border border-emerald-200 bg-emerald-50 px-1.5 py-0.5 font-mono text-emerald-800">
-                          {display(document.document_number)} / {display(document.status)}
+                          {display(document.document_number)} / {translateStatusLabel(display(document.status))}
                         </span>
                       ))}
                     </div>

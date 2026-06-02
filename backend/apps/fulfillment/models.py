@@ -31,6 +31,9 @@ class FulfillmentOrder(TimestampedModel, LegacyReferenceModel):
             models.Index(fields=["delivery_mode", "status", "requested_date"], name="ful_order_mode_st_req_idx"),
             models.Index(fields=["legacy_sales_order_number"]),
             models.Index(fields=["customer_ref"]),
+            models.Index(fields=["legacy_sales_order_number", "-updated_at", "-created_at"], name="ful_order_so_recent_idx"),
+            models.Index(fields=["legacy_transaction_number", "-updated_at", "-created_at"], name="ful_order_tx_recent_idx"),
+            models.Index(fields=["customer_ref", "-updated_at", "-created_at"], name="ful_order_cust_recent_idx"),
         ]
 
 

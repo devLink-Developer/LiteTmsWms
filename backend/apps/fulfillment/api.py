@@ -16,6 +16,7 @@ from apps.fulfillment.services import (
     build_remito_pdf,
     check_delivery_stock,
     check_fulfillment_stock_for_split,
+    confirm_available_delivery_stock,
     expedition_queue,
     ingest_legacy_order,
     issue_remito,
@@ -360,6 +361,7 @@ def _serialize_reparto_delivery(row: DeliveryOrder, *, item_snapshots: dict | No
                 "delivery_unit_qty": str(delivery_unit_qty),
                 "uom": line.uom,
                 "delivery_uom": _display_uom(line.delivery_uom or snapshot.get("delivery_uom") or line.uom),
+                "conversion_factor": str(line.conversion_factor),
                 "planned_weight_kg": str(line.planned_weight_kg),
                 "planned_volume_m3": str(line.planned_volume_m3),
             }
@@ -406,6 +408,7 @@ def _serialize_reparto_fulfillment(
     for line in lines:
         snapshot = _with_display_uom(snapshots.get(line.id, {}), fallback_uom=line.uom)
         split_qty = line.pending_qty
+        delivery_unit_qty = _delivery_unit_qty_from_commercial(split_qty, snapshot)
         planned_weight_kg, planned_volume_m3 = _capacity_totals(split_qty, snapshot)
         metric = metrics.get(line.id, {})
         max_dispatchable_qty = _max_dispatchable_from_values(
@@ -424,9 +427,10 @@ def _serialize_reparto_fulfillment(
                 "item_long_name": snapshot.get("long_name", ""),
                 "warehouse_ref": line.warehouse_ref or row.warehouse_ref,
                 "split_qty": str(split_qty),
-                "delivery_unit_qty": str(split_qty),
+                "delivery_unit_qty": str(delivery_unit_qty),
                 "uom": line.uom,
                 "delivery_uom": snapshot.get("delivery_uom") or _display_uom(line.uom),
+                "conversion_factor": snapshot.get("conversion_factor") or "1",
                 "planned_weight_kg": str(planned_weight_kg),
                 "planned_volume_m3": str(planned_volume_m3),
                 "stock_available": str(metric.get("packed_qty", 0)),
@@ -639,10 +643,15 @@ def expedition_queue_view(request):
     filters = _queue_filters(request)
     if not any(filters.values()):
         return json_response({"results": []})
+    target_warehouse_ref = (
+        request.GET.get("target_warehouse_ref", "").strip()
+        or request.GET.get("warehouse_ref", "").strip()
+        or request.GET.get("warehouse", "").strip()
+    )
     try:
         return json_response(
             {
-                "results": expedition_queue(**filters),
+                "results": expedition_queue(**filters, target_warehouse_ref=target_warehouse_ref),
             }
         )
     except MasterDataSourceError as exc:
@@ -817,6 +826,48 @@ def validate_stock(request, delivery_id):
                 return forbidden
         result = validate_delivery_stock(
             delivery_id=delivery_id,
+            idempotency_key=require_idempotency_key(request),
+            actor=_request_actor(request) or "local.tmswms",
+            authorized_warehouses=authorized_warehouses,
+            target_warehouse_ref=target_warehouse_ref,
+        )
+        return json_response(result.payload, status=result.status)
+    except DeliveryOrder.DoesNotExist:
+        return error_response("not_found", "Entrega no encontrada.", status=404)
+    except MasterDataSourceError as exc:
+        return error_response("master_data_unavailable", str(exc), status=503)
+    except FulfillmentAuthorizationError as exc:
+        return error_response("forbidden", str(exc), status=403)
+    except ValueError as exc:
+        return error_response("business_rule_violation", str(exc), status=422)
+
+
+@csrf_exempt
+@require_POST
+def confirm_available_stock(request, delivery_id):
+    try:
+        payload = parse_json_body(request)
+        authorized_warehouses = _authorized_warehouses(request)
+        forbidden = _forbidden_without_warehouse(authorized_warehouses)
+        if forbidden:
+            return forbidden
+        allow_past_reparto_date = _truthy_payload_flag(payload, "allow_past_reparto_date")
+        target_warehouse_ref, forbidden = _target_warehouse_from_payload(request, payload, authorized_warehouses)
+        if forbidden:
+            return forbidden
+        delivery = DeliveryOrder.objects.only("id", "fulfillment_id", "status", "warehouse_ref", "delivery_number", "legacy_sales_order_number").get(id=delivery_id)
+        conflict = None
+        if target_warehouse_ref:
+            conflict = _confirmed_cross_warehouse_delivery(delivery.fulfillment_id, target_warehouse_ref, exclude_delivery_id=delivery.id)
+        if conflict:
+            return _cross_warehouse_conflict_response(conflict, target_warehouse_ref)
+        if not allow_past_reparto_date:
+            forbidden = _forbidden_for_delivery_id(delivery_id)
+            if forbidden:
+                return forbidden
+        result = confirm_available_delivery_stock(
+            delivery_id=delivery_id,
+            lines=payload.get("lines") or [],
             idempotency_key=require_idempotency_key(request),
             actor=_request_actor(request) or "local.tmswms",
             authorized_warehouses=authorized_warehouses,

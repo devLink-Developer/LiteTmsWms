@@ -1,4 +1,4 @@
-import { requestJson } from "./client";
+import { apiPost, requestJson } from "./client";
 
 export type InventoryBalance = {
   id: string;
@@ -278,4 +278,222 @@ export async function fetchInventoryStockReport(filters: InventoryBalanceFilters
     }
     throw error;
   }
+}
+
+export type InventoryMaterialOption = {
+  item_ref: string;
+  sap_code?: string;
+  sap_item_id?: string;
+  name?: string;
+  long_name?: string;
+  category?: string;
+  coverage_group?: string;
+  uom?: string;
+  uom_code?: string;
+};
+
+export async function fetchInventoryMaterials(filters: { query?: string; limit?: number } = {}) {
+  const params = new URLSearchParams();
+  if (filters.query) params.set("q", filters.query);
+  if (filters.limit) params.set("limit", String(filters.limit));
+  const query = params.toString();
+  return requestJson<{ results?: InventoryMaterialOption[] }>(`/api/v1/inventory/materials/${query ? `?${query}` : ""}`);
+}
+
+type CommandResult<T> = {
+  result: T;
+};
+
+function inventoryTransactionQuery(filters: { warehouse?: string; item?: string; status?: string; purchaseOrderRef?: string; limit?: number } = {}) {
+  const params = new URLSearchParams();
+  if (filters.warehouse) params.set("warehouse", filters.warehouse);
+  if (filters.item) params.set("item", filters.item);
+  if (filters.status) params.set("status", filters.status);
+  if (filters.purchaseOrderRef) params.set("purchase_order_ref", filters.purchaseOrderRef);
+  if (filters.limit) params.set("limit", String(filters.limit));
+  const query = params.toString();
+  return query ? `?${query}` : "";
+}
+
+export type PurchaseReceiptLine = {
+  id?: string;
+  item_ref: string;
+  warehouse_ref?: string;
+  location_ref?: string;
+  lot_ref?: string;
+  expected_qty?: string;
+  received_qty: string;
+  difference_qty?: string;
+  uom: string;
+  incident_ref?: string;
+  legacy_line_id?: string;
+};
+
+export type PurchaseReceipt = {
+  id: string;
+  purchase_order_ref: string;
+  supplier_ref?: string;
+  status: string;
+  warehouse_ref: string;
+  reason?: string;
+  received_at?: string | null;
+  closed_at?: string | null;
+  lines_count?: number;
+  lines?: PurchaseReceiptLine[];
+};
+
+export type CreatePurchaseReceiptPayload = {
+  warehouse_ref: string;
+  purchase_order_ref: string;
+  supplier_ref?: string;
+  location_ref?: string;
+  target_location_ref?: string;
+  reason?: string;
+  lines: Array<{
+    item_ref: string;
+    received_qty: string;
+    expected_qty?: string;
+    uom: string;
+    location_ref?: string;
+    target_location_ref?: string;
+    lot_ref?: string;
+    incident_ref?: string;
+    legacy_line_id?: string;
+  }>;
+};
+
+export async function fetchPurchaseReceipts(filters: { warehouse?: string; item?: string; status?: string; purchaseOrderRef?: string; limit?: number } = {}) {
+  return requestJson<{ results?: PurchaseReceipt[] }>(`/api/v1/inventory/receipts/${inventoryTransactionQuery(filters)}`);
+}
+
+export async function createPurchaseReceipt(payload: CreatePurchaseReceiptPayload, idempotencyKey?: string) {
+  const response = await apiPost<CommandResult<PurchaseReceipt>>("/api/v1/inventory/receipts/", payload, { idempotencyKey });
+  return response.result;
+}
+
+export type InventoryExchangeLine = {
+  id?: string;
+  role: "input" | "output" | string;
+  item_ref: string;
+  warehouse_ref?: string;
+  location_ref?: string;
+  lot_ref?: string;
+  quantity: string;
+  uom: string;
+  parent_line_ref?: string;
+  conversion_factor?: string;
+};
+
+export type InventoryExchange = {
+  id: string;
+  transformation_type: string;
+  status: string;
+  warehouse_ref: string;
+  reason?: string;
+  conversion_group_id?: string;
+  posted_at?: string | null;
+  lines?: InventoryExchangeLine[];
+};
+
+export type CreateInventoryExchangePayload = {
+  warehouse_ref: string;
+  reason?: string;
+  input: {
+    item_ref: string;
+    quantity: string;
+    uom: string;
+    location_ref: string;
+    lot_ref?: string;
+  };
+  outputs: Array<{
+    item_ref: string;
+    quantity: string;
+    uom: string;
+    input_conversion_factor: string;
+    location_ref?: string;
+    target_location_ref?: string;
+    lot_ref?: string;
+  }>;
+};
+
+export async function fetchInventoryExchanges(filters: { warehouse?: string; item?: string; limit?: number } = {}) {
+  return requestJson<{ results?: InventoryExchange[] }>(`/api/v1/inventory/exchanges/${inventoryTransactionQuery(filters)}`);
+}
+
+export async function createInventoryExchange(payload: CreateInventoryExchangePayload, idempotencyKey?: string) {
+  const response = await apiPost<CommandResult<InventoryExchange>>("/api/v1/inventory/exchanges/", payload, { idempotencyKey });
+  return response.result;
+}
+
+export type CreateLocationMovePayload = {
+  warehouse_ref: string;
+  source_location_ref: string;
+  target_location_ref: string;
+  item_ref: string;
+  lot_ref?: string;
+  quantity: string;
+  uom: string;
+  reason?: string;
+};
+
+export type LocationMoveResult = CreateLocationMovePayload & {
+  document_ref: string;
+  stock_state: string;
+  ledger_entry_ids?: string[];
+};
+
+export async function createLocationMove(payload: CreateLocationMovePayload, idempotencyKey?: string) {
+  const response = await apiPost<CommandResult<LocationMoveResult>>("/api/v1/inventory/location-moves/", payload, { idempotencyKey });
+  return response.result;
+}
+
+export type InventoryLedgerEntry = {
+  id: string;
+  movement_type: string;
+  direction: "increase" | "decrease" | string;
+  warehouse_ref: string;
+  location_ref?: string;
+  lot_ref?: string;
+  item_ref: string;
+  stock_state: string;
+  quantity: string;
+  uom: string;
+  document_type: string;
+  document_ref: string;
+  reason?: string;
+  posted_at?: string;
+};
+
+export type ManualStockAdjustmentPayload = {
+  warehouse_ref: string;
+  direction: "increase" | "decrease";
+  item_ref: string;
+  location_ref: string;
+  lot_ref?: string;
+  quantity: string;
+  uom: string;
+  reason: string;
+};
+
+export type ManualStockAdjustmentResult = ManualStockAdjustmentPayload & {
+  document_ref: string;
+  stock_state: string;
+  ledger_entries?: InventoryLedgerEntry[];
+};
+
+export async function fetchManualStockAdjustments(filters: { warehouse?: string; item?: string; direction?: string; limit?: number } = {}) {
+  const params = new URLSearchParams();
+  if (filters.warehouse) params.set("warehouse", filters.warehouse);
+  if (filters.item) params.set("item", filters.item);
+  if (filters.direction) params.set("direction", filters.direction);
+  if (filters.limit) params.set("limit", String(filters.limit));
+  const query = params.toString();
+  return requestJson<{ results?: InventoryLedgerEntry[]; allowed_warehouses?: string[] }>(
+    `/api/v1/inventory/manual-adjustments/${query ? `?${query}` : ""}`,
+  );
+}
+
+export async function createManualStockAdjustment(payload: ManualStockAdjustmentPayload, idempotencyKey?: string) {
+  const response = await apiPost<CommandResult<ManualStockAdjustmentResult>>("/api/v1/inventory/manual-adjustments/", payload, { idempotencyKey });
+  return response.result;
 }

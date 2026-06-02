@@ -268,7 +268,7 @@ describe("RoutePlanningPage", () => {
     fireEvent.click(screen.getByRole("button", { name: /Optimizar/i }));
 
     await waitFor(() => expect(screen.getByText(/HR-000000001/)).toBeInTheDocument());
-    expect(screen.getByText("fallback_no_ors_key")).toBeInTheDocument();
+    expect(screen.getByText("Ruteo manual: sin clave ORS")).toBeInTheDocument();
     expect(screen.getAllByText("Cliente Uno").length).toBeGreaterThan(0);
     expect(screen.getAllByText("Calle 1, Posadas, Misiones").length).toBeGreaterThan(0);
     expect(screen.queryAllByTestId("route-tooltip")).toHaveLength(0);

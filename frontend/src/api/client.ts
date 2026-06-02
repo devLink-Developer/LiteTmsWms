@@ -187,13 +187,24 @@ export async function apiGet<T>(path: string, options?: RequestTrackingOptions):
   return response.json() as Promise<ApiResult<T>>;
 }
 
-export async function apiPost<T>(path: string, body?: unknown): Promise<T> {
+export type ApiPostOptions = {
+  idempotencyKey?: string;
+};
+
+export function newIdempotencyKey() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `${Date.now()}-${Math.random()}`;
+}
+
+export async function apiPost<T>(path: string, body?: unknown, options: ApiPostOptions = {}): Promise<T> {
   const response = await trackedFetch(path, {
     method: "POST",
     credentials: "include",
     headers: buildHeaders({
       "Content-Type": "application/json",
-      "Idempotency-Key": crypto.randomUUID?.() ?? `${Date.now()}-${Math.random()}`,
+      "Idempotency-Key": options.idempotencyKey || newIdempotencyKey(),
       ...actorHeaders(),
     }),
     body: body === undefined ? undefined : JSON.stringify(body),

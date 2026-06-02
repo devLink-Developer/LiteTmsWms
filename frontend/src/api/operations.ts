@@ -1,6 +1,7 @@
 import { apiGet, requestJson } from "./client";
 import { formatAppDateTime } from "../shared/utils/dateFormat";
 import { formatIdentifier } from "../shared/utils/identifierFormat";
+import { translateStatusLabel } from "../shared/utils/statusLabels";
 import type { Kpi, OperationModule, OperationRow, StatusTone, TimelineEvent } from "../types/operations";
 
 type ApiRecord = Record<string, unknown>;
@@ -224,7 +225,7 @@ function timelineFor(record: ApiRecord): TimelineEvent[] {
         label: first(movement, ["label"], "Movimiento"),
         actor: first(movement, ["actor", "source_type"], "api"),
         at: formatAppDateTime(first(movement, ["at"], ""), first(movement, ["at"], "-")),
-        details: details || first(movement, ["status"], "Movimiento informado por backend."),
+        details: details || translateStatusLabel(first(movement, ["status"], "Movimiento informado por backend.")),
       };
     });
   }
@@ -257,7 +258,7 @@ export function mapOperationRows(moduleKey: string, records: ApiRecord[]): Opera
       statusTone: toneFor(status),
       warehouse: warehouseFor(record, moduleKey),
       owner: ownerFor(record, moduleKey),
-      priority: moduleKey === "vehicles" ? first(record, ["status"]) : "-",
+      priority: moduleKey === "vehicles" ? translateStatusLabel(first(record, ["status"])) : "-",
       quantity: quantityFor(record, moduleKey),
       sla: formatAppDateTime(first(record, ["planned_date", "posted_at"], ""), "-"),
       raw: record,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import defaultdict
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from uuid import UUID, uuid4
@@ -20,6 +21,8 @@ from apps.inventory.models import (
     InventoryTransformationLine,
     InventoryWriteOff,
     InventoryWriteOffLine,
+    PurchaseOrderReceipt,
+    PurchaseOrderReceiptLine,
     StockState,
 )
 from apps.logistics.models import WarehouseLocation, WarehouseMaster
@@ -226,7 +229,7 @@ def _allocate_balances(
 ) -> list[StockAllocation]:
     wh = _warehouse_ref(warehouse_ref)
     item = _clean(item_ref)
-    unit = _clean(uom) or "UN"
+    unit = _stock_uom(uom)
     qty = _decimal(quantity)
     lot = _clean(lot_ref)
     if qty <= ZERO:
@@ -289,16 +292,24 @@ def available_stock_quantities_for_keys(
     actor: str = "system",
 ) -> dict[tuple[str, str, str], Decimal]:
     normalized_keys = {
-        (_warehouse_ref(warehouse_ref), _clean(item_ref), _clean(uom) or "UN")
+        (_warehouse_ref(warehouse_ref), _clean(item_ref), _clean(uom) or "UN"): _stock_uom(uom)
         for warehouse_ref, item_ref, uom in keys
         if _warehouse_ref(warehouse_ref) and _clean(item_ref) and (_clean(uom) or "UN")
     }
     if not normalized_keys:
         return {}
-    totals = {key: ZERO for key in normalized_keys}
+    totals = {key: ZERO for key in normalized_keys.keys()}
+    requested_by_canonical_key: dict[tuple[str, str, str], list[tuple[str, str, str]]] = defaultdict(list)
+    for requested_key, canonical_uom in normalized_keys.items():
+        requested_by_canonical_key[(requested_key[0], requested_key[1], canonical_uom)].append(requested_key)
     warehouses = {key[0] for key in normalized_keys}
     items = {key[1] for key in normalized_keys}
-    uoms = {key[2] for key in normalized_keys}
+    uoms = {
+        variant
+        for requested_uom, canonical_uom in {(key[2], canonical) for key, canonical in normalized_keys.items()}
+        for variant in {requested_uom, requested_uom.upper(), requested_uom.lower(), canonical_uom, canonical_uom.upper(), canonical_uom.lower()}
+        if variant
+    }
     dispatchable_by_warehouse = {
         warehouse_ref: set(_dispatchable_location_refs(warehouse_ref, actor=actor))
         for warehouse_ref in warehouses
@@ -317,9 +328,9 @@ def available_stock_quantities_for_keys(
             .values("warehouse_ref", "item_ref", "uom")
             .annotate(total=Sum("quantity"))
         ):
-            key = (row["warehouse_ref"], row["item_ref"], row["uom"])
-            if key in totals:
-                totals[key] += row["total"] or ZERO
+            canonical_key = (row["warehouse_ref"], row["item_ref"], _stock_uom(row["uom"]))
+            for requested_key in requested_by_canonical_key.get(canonical_key, []):
+                totals[requested_key] += row["total"] or ZERO
     if include_legacy_blank:
         for row in (
             InventoryBalance.objects.filter(
@@ -333,9 +344,9 @@ def available_stock_quantities_for_keys(
             .values("warehouse_ref", "item_ref", "uom")
             .annotate(total=Sum("quantity"))
         ):
-            key = (row["warehouse_ref"], row["item_ref"], row["uom"])
-            if key in totals:
-                totals[key] += row["total"] or ZERO
+            canonical_key = (row["warehouse_ref"], row["item_ref"], _stock_uom(row["uom"]))
+            for requested_key in requested_by_canonical_key.get(canonical_key, []):
+                totals[requested_key] += row["total"] or ZERO
     return totals
 
 
@@ -445,13 +456,14 @@ def _apply_balance_delta(
     delta: Decimal,
     lot_ref: str = "",
 ) -> InventoryBalance:
+    unit = _stock_uom(uom)
     balance, _ = InventoryBalance.objects.select_for_update().get_or_create(
         warehouse_ref=warehouse_ref,
         location_ref=location_ref,
         item_ref=item_ref,
         lot_ref=lot_ref,
         stock_state=stock_state,
-        uom=uom,
+        uom=unit,
         defaults={"quantity": Decimal("0")},
     )
     next_quantity = balance.quantity + delta
@@ -469,13 +481,14 @@ def post_ledger_entry(command: LedgerCommand) -> InventoryLedgerEntry:
     if existing:
         return existing
 
+    unit = _stock_uom(command.uom)
     delta = _signed_quantity(command.direction, command.quantity)
     balance = _apply_balance_delta(
         warehouse_ref=command.warehouse_ref,
         location_ref=command.location_ref,
         item_ref=command.item_ref,
         stock_state=command.stock_state,
-        uom=command.uom,
+        uom=unit,
         delta=delta,
         lot_ref=command.lot_ref,
     )
@@ -487,8 +500,9 @@ def post_ledger_entry(command: LedgerCommand) -> InventoryLedgerEntry:
         location_ref=command.location_ref,
         item_ref=command.item_ref,
         stock_state=command.stock_state,
+        lot_ref=command.lot_ref,
         quantity=command.quantity,
-        uom=command.uom,
+        uom=unit,
         document_type=command.document_type,
         document_ref=command.document_ref,
         reason=command.reason,
@@ -505,11 +519,24 @@ def post_ledger_entry(command: LedgerCommand) -> InventoryLedgerEntry:
         action="posted",
         actor=command.actor,
         reason=command.reason,
-        after={"movement_type": entry.movement_type, "quantity": str(entry.quantity)},
+        after={
+            "movement_type": entry.movement_type,
+            "direction": entry.direction,
+            "warehouse_ref": entry.warehouse_ref,
+            "location_ref": entry.location_ref,
+            "lot_ref": entry.lot_ref,
+            "item_ref": entry.item_ref,
+            "stock_state": entry.stock_state,
+            "quantity": str(entry.quantity),
+            "uom": entry.uom,
+            "document_type": entry.document_type,
+            "document_ref": entry.document_ref,
+        },
         source_references={
             "document_type": command.document_type,
             "document_ref": command.document_ref,
             "location_ref": command.location_ref,
+            "lot_ref": command.lot_ref,
             "legacy_sales_order_number": command.legacy_sales_order_number,
             "legacy_line_id": command.legacy_line_id,
         },
@@ -559,7 +586,7 @@ def reserve_inventory(
         qty = _decimal(line["quantity"])
         item_ref = _clean(line["item_ref"])
         line_warehouse_ref = _warehouse_ref(line.get("warehouse_ref") or warehouse_ref)
-        uom = _clean(line.get("uom")) or "UN"
+        uom = _stock_uom(line.get("uom"))
         if source_stock_state in {StockState.ON_HAND, StockState.PACKED}:
             source_locations = _dispatchable_location_refs(line_warehouse_ref, actor=actor)
         else:
@@ -1371,6 +1398,602 @@ def execute_sheet_cutting(*, payload: dict, idempotency_key: str, actor: str) ->
     _audit_event("inventory_transformation", str(transformation.id), "sheet_cutting_posted", actor, reason=reason, after=after)
     result = InventoryCommandResult({"result": after}, 201)
     return _finish_idempotent_command(idempotency, result)
+
+
+def _command_ref(prefix: str, idempotency_key: str) -> str:
+    digest = hashlib.sha1(idempotency_key.encode("utf-8")).hexdigest()[:12].upper()
+    return f"{prefix}-{digest}"
+
+
+def _ensure_location_active(warehouse_ref: str, location_ref: str) -> None:
+    if not location_ref:
+        raise InventoryRuleError("location_ref es obligatorio.")
+    exists = WarehouseLocation.objects.filter(warehouse_ref=warehouse_ref, location_ref=location_ref, active=True).exists()
+    if not exists:
+        raise InventoryRuleError("La ubicacion informada no existe o esta inactiva.")
+
+
+def _ensure_location_purpose(warehouse_ref: str, location_ref: str, *, allowed_purposes: set[str], message: str) -> None:
+    if not location_ref:
+        raise InventoryRuleError("location_ref es obligatorio.")
+    location = WarehouseLocation.objects.filter(warehouse_ref=warehouse_ref, location_ref=location_ref, active=True).first()
+    if not location:
+        raise InventoryRuleError("La ubicacion informada no existe o esta inactiva.")
+    if location.purpose not in allowed_purposes:
+        raise InventoryRuleError(message)
+
+
+def serialize_receipt(receipt: PurchaseOrderReceipt) -> dict:
+    receipt = PurchaseOrderReceipt.objects.prefetch_related("lines").get(id=receipt.id)
+    return {
+        "id": str(receipt.id),
+        "purchase_order_ref": receipt.purchase_order_ref,
+        "supplier_ref": receipt.supplier_ref,
+        "status": receipt.status,
+        "warehouse_ref": receipt.warehouse_ref,
+        "reason": receipt.reason,
+        "received_at": receipt.received_at.isoformat() if receipt.received_at else None,
+        "closed_at": receipt.closed_at.isoformat() if receipt.closed_at else None,
+        "lines_count": receipt.lines.count(),
+        "lines": [
+            {
+                "id": str(line.id),
+                "item_ref": line.item_ref,
+                "warehouse_ref": line.warehouse_ref,
+                "location_ref": line.location_ref,
+                "lot_ref": line.lot_ref,
+                "expected_qty": _display_decimal(line.expected_qty),
+                "received_qty": _display_decimal(line.received_qty),
+                "difference_qty": _display_decimal(line.difference_qty),
+                "uom": line.uom,
+                "incident_ref": line.incident_ref,
+                "legacy_line_id": line.legacy_line_id,
+            }
+            for line in receipt.lines.order_by("created_at")
+        ],
+    }
+
+
+@transaction.atomic
+def receive_purchase_order(*, payload: dict, idempotency_key: str, actor: str) -> InventoryCommandResult:
+    idempotency, replay = _start_idempotent_command(
+        key=idempotency_key,
+        operation_type="inventory.receipt.receive",
+        reference_type="purchase_order_receipt",
+        reference_id=_clean(payload.get("purchase_order_ref")) or "new",
+        payload=payload,
+    )
+    if replay and idempotency.status == IdempotencyKey.ProcessingStatus.SUCCEEDED:
+        return InventoryCommandResult(idempotency.response_payload, idempotency.response_status)
+
+    warehouse_ref = _warehouse_ref(payload.get("warehouse_ref"))
+    if not warehouse_ref:
+        raise InventoryRuleError("La recepcion requiere warehouse_ref.")
+    purchase_order_ref = _clean(payload.get("purchase_order_ref"))
+    if not purchase_order_ref:
+        raise InventoryRuleError("La recepcion requiere purchase_order_ref.")
+    raw_lines = payload.get("lines") or []
+    if not raw_lines:
+        raise InventoryRuleError("La recepcion requiere lineas.")
+    header_location_ref = _clean(payload.get("location_ref") or payload.get("target_location_ref")) or location_ref_for_purpose(
+        warehouse_ref,
+        "available",
+        actor=actor,
+    )
+    _ensure_location_active(warehouse_ref, header_location_ref)
+
+    receipt = PurchaseOrderReceipt.objects.create(
+        purchase_order_ref=purchase_order_ref,
+        supplier_ref=_clean(payload.get("supplier_ref")),
+        status=PurchaseOrderReceipt.ReceiptStatus.RECEIVING,
+        warehouse_ref=warehouse_ref,
+        reason=_clean(payload.get("reason")),
+        received_at=timezone.now(),
+        created_by=actor,
+        updated_by=actor,
+    )
+    has_difference = False
+    has_over_receipt = False
+    for index, raw_line in enumerate(raw_lines, start=1):
+        item_ref = _clean(raw_line.get("item_ref"))
+        if not item_ref:
+            raise InventoryRuleError("Todas las lineas de recepcion requieren item_ref.")
+        received_qty = _decimal(raw_line.get("received_qty") or raw_line.get("quantity"))
+        if received_qty <= ZERO:
+            raise InventoryRuleError("Todas las lineas de recepcion deben tener cantidad positiva.")
+        expected_qty = _decimal(raw_line.get("expected_qty") or raw_line.get("ordered_qty") or received_qty)
+        uom = _clean(raw_line.get("uom")) or "UN"
+        line_warehouse_ref = _warehouse_ref(raw_line.get("warehouse_ref") or warehouse_ref)
+        if line_warehouse_ref != warehouse_ref:
+            raise InventoryRuleError("Todas las lineas de recepcion deben pertenecer al mismo almacen.")
+        location_ref = _clean(raw_line.get("location_ref") or raw_line.get("target_location_ref")) or header_location_ref
+        _ensure_location_active(warehouse_ref, location_ref)
+        lot_ref = _clean(raw_line.get("lot_ref"))
+        difference_qty = expected_qty - received_qty
+        has_difference = has_difference or difference_qty != ZERO
+        has_over_receipt = has_over_receipt or difference_qty < ZERO
+        line = PurchaseOrderReceiptLine.objects.create(
+            receipt=receipt,
+            warehouse_ref=warehouse_ref,
+            location_ref=location_ref,
+            lot_ref=lot_ref,
+            item_ref=item_ref,
+            expected_qty=expected_qty,
+            received_qty=received_qty,
+            difference_qty=difference_qty,
+            uom=uom,
+            incident_ref=_clean(raw_line.get("incident_ref")),
+            legacy_line_id=_clean(raw_line.get("legacy_line_id")),
+            legacy_line_rec_id=_clean(raw_line.get("legacy_line_rec_id")),
+            created_by=actor,
+            updated_by=actor,
+        )
+        post_ledger_entry(
+            LedgerCommand(
+                idempotency_key=f"{idempotency_key}:line:{index}:packed",
+                movement_type=InventoryLedgerEntry.MovementType.INBOUND_RECEIPT,
+                direction=InventoryLedgerEntry.Direction.INCREASE,
+                warehouse_ref=warehouse_ref,
+                location_ref=location_ref,
+                item_ref=item_ref,
+                stock_state=StockState.PACKED,
+                quantity=received_qty,
+                uom=uom,
+                document_type="purchase_order_receipt",
+                document_ref=str(receipt.id),
+                actor=actor,
+                reason=receipt.reason or "Recepcion de orden de compra",
+                lot_ref=lot_ref,
+                legacy_line_id=line.legacy_line_id,
+            )
+        )
+
+    from_status = receipt.status
+    receipt.status = (
+        PurchaseOrderReceipt.ReceiptStatus.WITH_INCIDENT
+        if has_over_receipt
+        else PurchaseOrderReceipt.ReceiptStatus.PARTIAL_RECEIVED
+        if has_difference
+        else PurchaseOrderReceipt.ReceiptStatus.RECEIVED
+    )
+    receipt.updated_by = actor
+    receipt.save(update_fields=["status", "updated_by", "updated_at"])
+    after = serialize_receipt(receipt)
+    _status_history("purchase_order_receipt", str(receipt.id), from_status, receipt.status, actor, "received", after)
+    _audit_event("purchase_order_receipt", str(receipt.id), "received", actor, reason=receipt.reason, after=after)
+    result = InventoryCommandResult({"result": after}, 201)
+    return _finish_idempotent_command(idempotency, result)
+
+
+def serialize_transformation(transformation: InventoryTransformation) -> dict:
+    transformation = InventoryTransformation.objects.prefetch_related("lines").get(id=transformation.id)
+    return {
+        "id": str(transformation.id),
+        "transformation_type": transformation.transformation_type,
+        "status": transformation.status,
+        "warehouse_ref": transformation.warehouse_ref,
+        "reason": transformation.reason,
+        "conversion_group_id": transformation.conversion_group_id,
+        "posted_at": transformation.posted_at.isoformat() if transformation.posted_at else None,
+        "lines": [
+            {
+                "id": str(line.id),
+                "role": line.role,
+                "item_ref": line.item_ref,
+                "warehouse_ref": line.warehouse_ref,
+                "location_ref": line.location_ref,
+                "lot_ref": line.lot_ref,
+                "quantity": _display_decimal(line.quantity),
+                "uom": line.uom,
+                "parent_line_ref": line.parent_line_ref,
+                "conversion_factor": str(line.conversion_factor),
+            }
+            for line in transformation.lines.order_by("created_at")
+        ],
+    }
+
+
+@transaction.atomic
+def execute_inventory_exchange(*, payload: dict, idempotency_key: str, actor: str) -> InventoryCommandResult:
+    idempotency, replay = _start_idempotent_command(
+        key=idempotency_key,
+        operation_type="inventory.exchange.execute",
+        reference_type="inventory_transformation",
+        reference_id=_clean(payload.get("exchange_ref")) or "new",
+        payload=payload,
+    )
+    if replay and idempotency.status == IdempotencyKey.ProcessingStatus.SUCCEEDED:
+        return InventoryCommandResult(idempotency.response_payload, idempotency.response_status)
+
+    source = payload.get("input") or payload.get("source") or payload
+    warehouse_ref = _warehouse_ref(payload.get("warehouse_ref") or source.get("warehouse_ref"))
+    if not warehouse_ref:
+        raise InventoryRuleError("El canje requiere warehouse_ref.")
+    source_item_ref = _clean(source.get("item_ref"))
+    if not source_item_ref:
+        raise InventoryRuleError("El canje requiere item_ref origen.")
+    source_qty = _decimal(source.get("quantity") or source.get("input_qty"))
+    if source_qty <= ZERO:
+        raise InventoryRuleError("La cantidad origen debe ser mayor a cero.")
+    source_uom = _clean(source.get("uom")) or "UN"
+    source_location_ref = _clean(source.get("location_ref") or source.get("source_location_ref")) or location_ref_for_purpose(
+        warehouse_ref,
+        "available",
+        actor=actor,
+    )
+    _ensure_location_active(warehouse_ref, source_location_ref)
+    source_lot_ref = _clean(source.get("lot_ref"))
+    raw_outputs = payload.get("outputs") or []
+    if not raw_outputs:
+        raise InventoryRuleError("El canje requiere salidas.")
+
+    normalized_outputs = []
+    consumed_total = ZERO
+    for index, output in enumerate(raw_outputs, start=1):
+        output_item_ref = _clean(output.get("item_ref"))
+        if not output_item_ref:
+            raise InventoryRuleError("Todas las salidas de canje requieren item_ref.")
+        output_qty = _decimal(output.get("quantity"))
+        if output_qty <= ZERO:
+            raise InventoryRuleError("Todas las salidas de canje deben tener cantidad positiva.")
+        factor = _decimal(output.get("input_conversion_factor") or output.get("conversion_factor"), "0")
+        if factor <= ZERO:
+            raise InventoryRuleError("Cada salida de canje requiere input_conversion_factor positivo.")
+        target_location_ref = _clean(output.get("location_ref") or output.get("target_location_ref") or payload.get("target_location_ref")) or location_ref_for_purpose(
+            warehouse_ref,
+            "available",
+            actor=actor,
+        )
+        _ensure_location_active(warehouse_ref, target_location_ref)
+        consumed_total += output_qty * factor
+        normalized_outputs.append(
+            {
+                "line_number": index,
+                "item_ref": output_item_ref,
+                "quantity": output_qty,
+                "uom": _clean(output.get("uom")) or source_uom,
+                "input_conversion_factor": factor,
+                "location_ref": target_location_ref,
+                "lot_ref": _clean(output.get("lot_ref")),
+            }
+        )
+    if abs(_decimal(consumed_total) - source_qty) > QTY_SCALE:
+        raise InventoryRuleError("El canje no conserva cantidad segun los factores declarados.")
+
+    reason = _clean(payload.get("reason")) or "Canje lote a saldo"
+    allocations = _allocate_balances(
+        warehouse_ref=warehouse_ref,
+        item_ref=source_item_ref,
+        stock_state=StockState.PACKED,
+        quantity=source_qty,
+        uom=source_uom,
+        actor=actor,
+        location_refs=[source_location_ref],
+        lot_ref=source_lot_ref,
+        normalize_blank=False,
+    )
+    transformation = InventoryTransformation.objects.create(
+        transformation_type=InventoryTransformation.TransformationType.EXCHANGE,
+        status=InventoryTransformation.TransformationStatus.DRAFT,
+        reason=reason,
+        conversion_group_id=_clean(payload.get("exchange_ref")) or _command_ref("EXC", idempotency_key),
+        warehouse_ref=warehouse_ref,
+        item_ref=source_item_ref,
+        created_by=actor,
+        updated_by=actor,
+    )
+    input_line = InventoryTransformationLine.objects.create(
+        transformation=transformation,
+        role=InventoryTransformationLine.LineRole.INPUT,
+        warehouse_ref=warehouse_ref,
+        location_ref=source_location_ref,
+        lot_ref=source_lot_ref,
+        item_ref=source_item_ref,
+        quantity=source_qty,
+        uom=source_uom,
+        conversion_factor=Decimal("1"),
+        created_by=actor,
+        updated_by=actor,
+    )
+    for index, allocation in enumerate(allocations, start=1):
+        post_ledger_entry(
+            LedgerCommand(
+                idempotency_key=f"{idempotency_key}:source:{index}",
+                movement_type=InventoryLedgerEntry.MovementType.TRANSFORMATION_OUT,
+                direction=InventoryLedgerEntry.Direction.DECREASE,
+                warehouse_ref=warehouse_ref,
+                location_ref=allocation.location_ref,
+                item_ref=source_item_ref,
+                stock_state=StockState.PACKED,
+                quantity=allocation.quantity,
+                uom=source_uom,
+                document_type="inventory_exchange",
+                document_ref=str(transformation.id),
+                actor=actor,
+                reason=reason,
+                lot_ref=allocation.lot_ref,
+            )
+        )
+    for output in normalized_outputs:
+        InventoryTransformationLine.objects.create(
+            transformation=transformation,
+            role=InventoryTransformationLine.LineRole.OUTPUT,
+            warehouse_ref=warehouse_ref,
+            location_ref=output["location_ref"],
+            lot_ref=output["lot_ref"],
+            item_ref=output["item_ref"],
+            quantity=output["quantity"],
+            uom=output["uom"],
+            parent_line_ref=str(input_line.id),
+            conversion_factor=output["input_conversion_factor"],
+            created_by=actor,
+            updated_by=actor,
+        )
+        post_ledger_entry(
+            LedgerCommand(
+                idempotency_key=f"{idempotency_key}:output:{output['line_number']}",
+                movement_type=InventoryLedgerEntry.MovementType.TRANSFORMATION_IN,
+                direction=InventoryLedgerEntry.Direction.INCREASE,
+                warehouse_ref=warehouse_ref,
+                location_ref=output["location_ref"],
+                item_ref=output["item_ref"],
+                stock_state=StockState.PACKED,
+                quantity=output["quantity"],
+                uom=output["uom"],
+                document_type="inventory_exchange",
+                document_ref=str(transformation.id),
+                actor=actor,
+                reason=reason,
+                lot_ref=output["lot_ref"],
+            )
+        )
+
+    from_status = transformation.status
+    transformation.status = InventoryTransformation.TransformationStatus.POSTED
+    transformation.posted_at = timezone.now()
+    transformation.updated_by = actor
+    transformation.save(update_fields=["status", "posted_at", "updated_by", "updated_at"])
+    after = serialize_transformation(transformation)
+    _status_history("inventory_transformation", str(transformation.id), from_status, transformation.status, actor, "exchange", after)
+    _audit_event("inventory_transformation", str(transformation.id), "exchange_posted", actor, reason=reason, after=after)
+    result = InventoryCommandResult({"result": after}, 201)
+    return _finish_idempotent_command(idempotency, result)
+
+
+@transaction.atomic
+def move_inventory_between_locations(*, payload: dict, idempotency_key: str, actor: str) -> InventoryCommandResult:
+    idempotency, replay = _start_idempotent_command(
+        key=idempotency_key,
+        operation_type="inventory.location_move",
+        reference_type="inventory_location_move",
+        reference_id=_clean(payload.get("move_ref")) or "new",
+        payload=payload,
+    )
+    if replay and idempotency.status == IdempotencyKey.ProcessingStatus.SUCCEEDED:
+        return InventoryCommandResult(idempotency.response_payload, idempotency.response_status)
+
+    warehouse_ref = _warehouse_ref(payload.get("warehouse_ref"))
+    item_ref = _clean(payload.get("item_ref"))
+    source_location_ref = _clean(payload.get("source_location_ref"))
+    target_location_ref = _clean(payload.get("target_location_ref"))
+    quantity = _decimal(payload.get("quantity"))
+    uom = _clean(payload.get("uom")) or "UN"
+    lot_ref = _clean(payload.get("lot_ref"))
+    reason = _clean(payload.get("reason")) or "Movimiento entre posiciones"
+    if not warehouse_ref or not item_ref:
+        raise InventoryRuleError("El movimiento requiere warehouse_ref e item_ref.")
+    if quantity <= ZERO:
+        raise InventoryRuleError("La cantidad del movimiento debe ser mayor a cero.")
+    if source_location_ref == target_location_ref:
+        raise InventoryRuleError("La ubicacion origen y destino deben ser distintas.")
+    _ensure_location_active(warehouse_ref, source_location_ref)
+    _ensure_location_active(warehouse_ref, target_location_ref)
+
+    document_ref = _clean(payload.get("move_ref")) or _command_ref("MOV", idempotency_key)
+    allocations = _allocate_balances(
+        warehouse_ref=warehouse_ref,
+        item_ref=item_ref,
+        stock_state=StockState.PACKED,
+        quantity=quantity,
+        uom=uom,
+        actor=actor,
+        location_refs=[source_location_ref],
+        lot_ref=lot_ref,
+        normalize_blank=False,
+    )
+    entries = []
+    for index, allocation in enumerate(allocations, start=1):
+        source_entry = post_ledger_entry(
+            LedgerCommand(
+                idempotency_key=f"{idempotency_key}:source:{index}",
+                movement_type=InventoryLedgerEntry.MovementType.LOCATION_TRANSFER,
+                direction=InventoryLedgerEntry.Direction.DECREASE,
+                warehouse_ref=warehouse_ref,
+                location_ref=allocation.location_ref,
+                item_ref=item_ref,
+                stock_state=StockState.PACKED,
+                quantity=allocation.quantity,
+                uom=uom,
+                document_type="inventory_location_move",
+                document_ref=document_ref,
+                actor=actor,
+                reason=reason,
+                lot_ref=allocation.lot_ref,
+            )
+        )
+        target_entry = post_ledger_entry(
+            LedgerCommand(
+                idempotency_key=f"{idempotency_key}:target:{index}",
+                movement_type=InventoryLedgerEntry.MovementType.LOCATION_TRANSFER,
+                direction=InventoryLedgerEntry.Direction.INCREASE,
+                warehouse_ref=warehouse_ref,
+                location_ref=target_location_ref,
+                item_ref=item_ref,
+                stock_state=StockState.PACKED,
+                quantity=allocation.quantity,
+                uom=uom,
+                document_type="inventory_location_move",
+                document_ref=document_ref,
+                actor=actor,
+                reason=reason,
+                lot_ref=allocation.lot_ref,
+            )
+        )
+        entries.extend([source_entry, target_entry])
+
+    result_payload = {
+        "result": {
+            "document_ref": document_ref,
+            "warehouse_ref": warehouse_ref,
+            "source_location_ref": source_location_ref,
+            "target_location_ref": target_location_ref,
+            "item_ref": item_ref,
+            "lot_ref": lot_ref,
+            "stock_state": StockState.PACKED,
+            "quantity": _display_decimal(quantity),
+            "uom": uom,
+            "reason": reason,
+            "ledger_entry_ids": [str(entry.id) for entry in entries],
+        }
+    }
+    _audit_event("inventory_location_move", document_ref, "posted", actor, reason=reason, after=result_payload["result"])
+    return _finish_idempotent_command(idempotency, InventoryCommandResult(result_payload, 201))
+
+
+def serialize_ledger_entry(entry: InventoryLedgerEntry) -> dict:
+    return {
+        "id": str(entry.id),
+        "movement_type": entry.movement_type,
+        "direction": entry.direction,
+        "warehouse_ref": entry.warehouse_ref,
+        "location_ref": entry.location_ref,
+        "lot_ref": entry.lot_ref,
+        "item_ref": entry.item_ref,
+        "stock_state": entry.stock_state,
+        "quantity": _display_decimal(entry.quantity),
+        "uom": entry.uom,
+        "document_type": entry.document_type,
+        "document_ref": entry.document_ref,
+        "reason": entry.reason,
+        "posted_at": entry.posted_at.isoformat(),
+    }
+
+
+@transaction.atomic
+def adjust_inventory_manually(*, payload: dict, idempotency_key: str, actor: str) -> InventoryCommandResult:
+    document_ref = _clean(payload.get("document_ref") or payload.get("adjustment_ref")) or _command_ref("AJU", idempotency_key)
+    idempotency, replay = _start_idempotent_command(
+        key=idempotency_key,
+        operation_type="inventory.manual_adjustment",
+        reference_type="inventory_manual_adjustment",
+        reference_id=document_ref,
+        payload=payload,
+    )
+    if replay and idempotency.status == IdempotencyKey.ProcessingStatus.SUCCEEDED:
+        return InventoryCommandResult(idempotency.response_payload, idempotency.response_status)
+
+    warehouse_ref = _warehouse_ref(payload.get("warehouse_ref"))
+    item_ref = _clean(payload.get("item_ref"))
+    quantity = _decimal(payload.get("quantity"))
+    uom = _stock_uom(payload.get("uom"))
+    direction = _clean(payload.get("direction")).lower()
+    lot_ref = _clean(payload.get("lot_ref"))
+    reason = _clean(payload.get("reason"))
+    if not warehouse_ref or not item_ref:
+        raise InventoryRuleError("El ajuste manual requiere warehouse_ref e item_ref.")
+    if quantity <= ZERO:
+        raise InventoryRuleError("La cantidad del ajuste debe ser mayor a cero.")
+    if direction not in {InventoryLedgerEntry.Direction.INCREASE, InventoryLedgerEntry.Direction.DECREASE}:
+        raise InventoryRuleError("La direccion debe ser increase o decrease.")
+    if not reason:
+        raise InventoryRuleError("El ajuste manual requiere motivo.")
+
+    location_ref = _clean(
+        payload.get("location_ref")
+        or payload.get("source_location_ref")
+        or payload.get("target_location_ref")
+    ) or location_ref_for_purpose(warehouse_ref, "available", actor=actor)
+
+    entries: list[InventoryLedgerEntry] = []
+    if direction == InventoryLedgerEntry.Direction.INCREASE:
+        _ensure_location_purpose(
+            warehouse_ref,
+            location_ref,
+            allowed_purposes={"available"},
+            message="La alta manual solo permite ubicaciones disponibles.",
+        )
+        entries.append(
+            post_ledger_entry(
+                LedgerCommand(
+                    idempotency_key=f"{idempotency_key}:increase",
+                    movement_type=InventoryLedgerEntry.MovementType.ADJUSTMENT,
+                    direction=InventoryLedgerEntry.Direction.INCREASE,
+                    warehouse_ref=warehouse_ref,
+                    location_ref=location_ref,
+                    item_ref=item_ref,
+                    stock_state=StockState.PACKED,
+                    quantity=quantity,
+                    uom=uom,
+                    document_type="inventory_manual_adjustment",
+                    document_ref=document_ref,
+                    actor=actor,
+                    reason=reason,
+                    lot_ref=lot_ref,
+                )
+            )
+        )
+    else:
+        _ensure_location_active(warehouse_ref, location_ref)
+        allocations = _allocate_balances(
+            warehouse_ref=warehouse_ref,
+            item_ref=item_ref,
+            stock_state=StockState.PACKED,
+            quantity=quantity,
+            uom=uom,
+            actor=actor,
+            location_refs=[location_ref],
+            lot_ref=lot_ref,
+            normalize_blank=False,
+        )
+        for index, allocation in enumerate(allocations, start=1):
+            entries.append(
+                post_ledger_entry(
+                    LedgerCommand(
+                        idempotency_key=f"{idempotency_key}:decrease:{index}",
+                        movement_type=InventoryLedgerEntry.MovementType.ADJUSTMENT,
+                        direction=InventoryLedgerEntry.Direction.DECREASE,
+                        warehouse_ref=warehouse_ref,
+                        location_ref=allocation.location_ref,
+                        item_ref=item_ref,
+                        stock_state=StockState.PACKED,
+                        quantity=allocation.quantity,
+                        uom=uom,
+                        document_type="inventory_manual_adjustment",
+                        document_ref=document_ref,
+                        actor=actor,
+                        reason=reason,
+                        lot_ref=allocation.lot_ref,
+                    )
+                )
+            )
+
+    result_payload = {
+        "result": {
+            "document_ref": document_ref,
+            "warehouse_ref": warehouse_ref,
+            "location_ref": location_ref,
+            "lot_ref": lot_ref,
+            "item_ref": item_ref,
+            "stock_state": StockState.PACKED,
+            "direction": direction,
+            "quantity": _display_decimal(quantity),
+            "uom": uom,
+            "reason": reason,
+            "ledger_entries": [serialize_ledger_entry(entry) for entry in entries],
+        }
+    }
+    _audit_event("inventory_manual_adjustment", document_ref, "posted", actor, reason=reason, after=result_payload["result"])
+    return _finish_idempotent_command(idempotency, InventoryCommandResult(result_payload, 201))
 
 
 def serialize_write_off(write_off: InventoryWriteOff) -> dict:

@@ -201,6 +201,7 @@ export type ApiRepartoDelivery = {
     delivery_unit_qty?: string;
     uom: string;
     delivery_uom?: string;
+    conversion_factor?: string;
     planned_weight_kg?: string;
     planned_volume_m3?: string;
     stock_available?: string;
@@ -282,6 +283,7 @@ export type ExpeditionCommandOptions = {
 export type ExpeditionQueueSearch = {
   mode: "sales_order" | "customer_ref" | "customer_dni";
   value: string;
+  warehouseRef?: string;
 };
 
 function expeditionQueuePath(search: ExpeditionQueueSearch) {
@@ -294,6 +296,9 @@ function expeditionQueuePath(search: ExpeditionQueueSearch) {
   }
   if (search.mode === "customer_dni") {
     params.set("customer_dni", search.value);
+  }
+  if (search.warehouseRef) {
+    params.set("target_warehouse_ref", search.warehouseRef);
   }
   return `/api/v1/fulfillment/expedition-queue/?${params.toString()}`;
 }
@@ -363,6 +368,19 @@ export async function confirmDeliveryStock(deliveryId: string, options: Expediti
   const result = await apiPost<CommandResult<ApiDeliveryOrder>>(
     `/api/v1/fulfillment/deliveries/${deliveryId}/validate-stock`,
     options,
+  );
+  return result.result;
+}
+
+export async function confirmAvailableDeliveryStock(
+  deliveryId: string,
+  payload: {
+    lines: Array<{ delivery_line_id: string; planned_qty: number }>;
+  } & ExpeditionCommandOptions,
+) {
+  const result = await apiPost<CommandResult<ApiDeliveryOrder>>(
+    `/api/v1/fulfillment/deliveries/${deliveryId}/confirm-available`,
+    payload,
   );
   return result.result;
 }

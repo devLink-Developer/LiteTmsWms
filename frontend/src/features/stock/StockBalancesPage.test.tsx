@@ -7,8 +7,11 @@ import { useWorkspaceStore } from "../../stores/useWorkspaceStore";
 function jsonResponse(payload: unknown) {
   return {
     ok: true,
+    status: 200,
+    statusText: "OK",
     headers: new Headers({ "content-type": "application/json" }),
     json: async () => payload,
+    text: async () => JSON.stringify(payload),
   };
 }
 
@@ -93,6 +96,34 @@ describe("StockBalancesPage", () => {
                   total: "6",
                 },
               },
+              {
+                warehouse_ref: "WH-C",
+                location_ref: "C-03-03",
+                warehouse_location_ref: "C-03-03",
+                location_name: "Reserva C",
+                purpose: "reserved",
+                zone_ref: "Z03",
+                aisle: "A03",
+                floor: "F01",
+                level: "N03",
+                position: "P004",
+                is_dispatchable: false,
+                lot_ref: "L-2",
+                item_ref: "200000",
+                item_name: "Bacha blanca",
+                category_ref: "SAN",
+                category: "SAN",
+                uom: "un",
+                quantities: {
+                  available: "0",
+                  reserved: "2",
+                  in_preparation: "1",
+                  prepared: "0",
+                  in_transit: "0",
+                  damaged_waste: "0",
+                  total: "3",
+                },
+              },
             ],
           });
         }
@@ -169,8 +200,9 @@ describe("StockBalancesPage", () => {
     await waitFor(() => expect(screen.getByText("1 buckets")).toBeInTheDocument());
 
     expect(fetch).toHaveBeenCalledWith(expect.stringContaining("/api/v1/inventory/advanced-stock/"), expect.any(Object));
-    expect(fetch).toHaveBeenCalledWith(expect.stringContaining("location_scope=available"), expect.any(Object));
-    expect(fetch).toHaveBeenCalledWith(expect.stringContaining("state=packed%2Con_hand"), expect.any(Object));
+    const stockCalls = vi.mocked(fetch).mock.calls.map(([input]) => String(input)).filter((url) => url.includes("/api/v1/inventory/advanced-stock/"));
+    expect(stockCalls.some((url) => url.includes("location_scope="))).toBe(false);
+    expect(stockCalls.some((url) => url.includes("state="))).toBe(false);
     expect(screen.getByText("scope operativo")).toBeInTheDocument();
     expect(screen.getByRole("option", { name: "WH-C / Deposito C" })).toBeInTheDocument();
     expect(screen.getAllByText("A-01-01").length).toBeGreaterThan(0);
@@ -179,16 +211,35 @@ describe("StockBalancesPage", () => {
     expect(screen.getAllByText("Porcelanato gris").length).toBeGreaterThan(0);
     expect(screen.queryByText("Bacha blanca")).not.toBeInTheDocument();
     expect(screen.getAllByText("12,5 m2").length).toBeGreaterThan(0);
-    expect(screen.getByText("Detalle compacto")).toBeInTheDocument();
+    expect(screen.getByText("Detalle por posiciones")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Limpiar" }));
     await waitFor(() => expect(screen.getByText("0 buckets")).toBeInTheDocument());
     expect(screen.getByText("Sin filtros.")).toBeInTheDocument();
 
     fireEvent.change(screen.getByLabelText("Busqueda rapida"), { target: { value: "200000" } });
-    await waitFor(() => expect(screen.getByText("1 buckets")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("2 buckets")).toBeInTheDocument());
     const table = screen.getAllByRole("table")[0];
-    expect(within(table).getByText("200000")).toBeInTheDocument();
+    expect(within(table).getAllByText("200000").length).toBeGreaterThan(0);
     expect(within(table).queryByText("103374")).not.toBeInTheDocument();
+  });
+
+  it("shows selected item quantities by warehouse location without movement actions", async () => {
+    render(<StockBalancesPage />);
+
+    fireEvent.change(screen.getByLabelText("Busqueda rapida"), { target: { value: "200000" } });
+    await waitFor(() => expect(screen.getByText("2 buckets")).toBeInTheDocument());
+
+    const detail = screen.getByLabelText("Detalle por posiciones del articulo");
+    expect(within(detail).getByText("C-03-02")).toBeInTheDocument();
+    expect(within(detail).getByText("C-03-03")).toBeInTheDocument();
+    expect(within(detail).getByText("Rack C")).toBeInTheDocument();
+    expect(within(detail).getByText("Reserva C")).toBeInTheDocument();
+    expect(within(detail).getByText("5 un")).toBeInTheDocument();
+    expect(within(detail).getByText("2 un")).toBeInTheDocument();
+    expect(within(detail).getAllByText("1 un").length).toBeGreaterThan(0);
+    expect(screen.queryByText("Movimiento interno")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Confirmar movimiento" })).not.toBeInTheDocument();
+    expect(vi.mocked(fetch).mock.calls.some(([input]) => String(input).includes("/api/v1/inventory/location-moves/"))).toBe(false);
   });
 });

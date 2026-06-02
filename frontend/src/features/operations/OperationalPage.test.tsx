@@ -109,7 +109,10 @@ describe("OperationalPage", () => {
     render(<OperationalPage module={operationModuleByKey("orders")} />);
 
     expect(calls).toHaveLength(0);
-    fireEvent.change(screen.getByLabelText("Busqueda"), { target: { value: "VENT8-100001719" } });
+    const searchInput = screen.getByLabelText("Busqueda");
+    fireEvent.change(searchInput, { target: { value: "VENT8-100001719" } });
+    expect(calls).toHaveLength(0);
+    fireEvent.keyDown(searchInput, { key: "Enter" });
 
     await waitFor(() => expect(screen.getByText("VENT8-100001719")).toBeInTheDocument());
     expect(calls.some((url) => url.includes("/api/v1/fulfillment/?q=VENT8-100001719"))).toBe(true);
@@ -120,12 +123,47 @@ describe("OperationalPage", () => {
     expect(screen.getByText("E-000000005")).toBeInTheDocument();
     expect(screen.getByText("en ruta")).toBeInTheDocument();
     expect(screen.getByText("Entregas con remito")).toBeInTheDocument();
-    expect(screen.getByText("R-000000005 / closed")).toBeInTheDocument();
+    expect(screen.getByText("R-000000005 / Cerrado")).toBeInTheDocument();
 
     expect(screen.queryByText("Ejecucion de reparto")).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Ver trazabilidad" }));
 
     expect(screen.getByText("Ejecucion de reparto")).toBeInTheDocument();
     expect(screen.getByText(/Hoja de ruta HR-000000123/)).toBeInTheDocument();
+  });
+
+  it("runs order search from the Buscar button", async () => {
+    const calls: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        calls.push(String(input));
+        return {
+          ok: true,
+          json: async () => ({
+            results: [
+              {
+                id: "fulfillment-button",
+                fulfillment_number: "FUL-VENT8-100002000",
+                status: "pending",
+                sales_order_number: "VENT8-100002000",
+                customer_ref: "20000071",
+                warehouse_ref: "PS03DP",
+                lines_count: 1,
+              },
+            ],
+          }),
+        };
+      }),
+    );
+
+    render(<OperationalPage module={operationModuleByKey("orders")} />);
+
+    fireEvent.change(screen.getByLabelText("Busqueda"), { target: { value: "VENT8-100002000" } });
+    expect(calls).toHaveLength(0);
+    fireEvent.click(screen.getByRole("button", { name: "Buscar" }));
+
+    await waitFor(() => expect(screen.getByText("VENT8-100002000")).toBeInTheDocument());
+    expect(calls.some((url) => url.includes("/api/v1/fulfillment/?q=VENT8-100002000"))).toBe(true);
   });
 });

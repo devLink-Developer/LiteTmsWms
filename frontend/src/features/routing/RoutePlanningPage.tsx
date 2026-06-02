@@ -42,6 +42,7 @@ import {
 import { fetchDrivers } from "../../api/fleet";
 import { StatusBadge } from "../../shared/components/StatusBadge";
 import { notify, useToastError } from "../../shared/components/toast";
+import { translateStatusLabel } from "../../shared/utils/statusLabels";
 import { useWorkspaceStore } from "../../stores/useWorkspaceStore";
 import type { StatusTone } from "../../types/operations";
 
@@ -823,7 +824,7 @@ export function RoutePlanningPage() {
             </div>
             {route?.preview_payload.routing_status && (
               <div className="rounded border border-borderSoft bg-white px-3 py-2 text-[12px] text-secondaryText shadow-panel">
-                {route.preview_payload.routing_status}
+                {translateStatusLabel(route.preview_payload.routing_status)}
               </div>
             )}
           </div>

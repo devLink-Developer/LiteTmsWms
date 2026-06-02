@@ -12,11 +12,18 @@ from apps.common.api import error_response, json_response, parse_json_body, requ
 from apps.inventory.models import InventoryBalance, InventoryLedgerEntry, InventoryWriteOff, PurchaseOrderReceipt, StockState
 from apps.inventory.services import (
     InventoryRuleError,
+    adjust_inventory_manually,
     create_inventory_write_off,
+    execute_inventory_exchange,
     execute_sheet_cutting,
+    move_inventory_between_locations,
     post_inventory_write_off,
+    receive_purchase_order,
     reserve_inventory,
     reverse_inventory_write_off,
+    serialize_ledger_entry,
+    serialize_receipt,
+    serialize_transformation,
     serialize_write_off,
     validate_sheet_cutting_stock,
 )
@@ -287,6 +294,36 @@ def _serialize_material_snapshot(row: MaterialMasterSnapshot) -> dict:
     }
 
 
+@require_GET
+def materials(request: HttpRequest):
+    query = _query_alias(request, "q", "search", "item", "item_ref").strip()
+    if not query:
+        return json_response({"results": []})
+    limit = _limit(request.GET.get("limit"), default=50, maximum=200)
+    qs = (
+        MaterialMasterSnapshot.objects.filter(
+            Q(item_ref__icontains=query)
+            | Q(sap_code__icontains=query)
+            | Q(sap_item_id__icontains=query)
+            | Q(name__icontains=query)
+            | Q(long_name__icontains=query)
+            | Q(category__icontains=query)
+        )
+        .order_by("item_ref", "store_ref")
+        .only("item_ref", "sap_code", "sap_item_id", "name", "long_name", "category", "coverage_group", "uom", "uom_code")
+    )
+    rows = []
+    seen_refs = set()
+    for row in qs[: limit * 3]:
+        if row.item_ref in seen_refs:
+            continue
+        seen_refs.add(row.item_ref)
+        rows.append(_serialize_material_snapshot(row))
+        if len(rows) >= limit:
+            break
+    return json_response({"results": rows})
+
+
 def _cached_material_snapshots_for_items(item_refs: set[str]) -> dict[str, dict]:
     if not item_refs:
         return {}
@@ -514,6 +551,8 @@ def ledger(request: HttpRequest):
         qs = qs.filter(item_ref=item)
     if location_ref := _query_alias(request, "location", "location_ref"):
         qs = qs.filter(location_ref=location_ref)
+    if lot_ref := _query_alias(request, "lot", "lot_ref"):
+        qs = qs.filter(lot_ref=lot_ref)
     if stock_state := _query_alias(request, "stock_state", "state"):
         qs = qs.filter(stock_state=stock_state)
     if document_type := _query_alias(request, "document_type", "reference_type"):
@@ -537,6 +576,7 @@ def ledger(request: HttpRequest):
             "direction": row.direction,
             "warehouse_ref": row.warehouse_ref,
             "location_ref": row.location_ref,
+            "lot_ref": row.lot_ref,
             "item_ref": row.item_ref,
             "stock_state": row.stock_state,
             "quantity": _decimal(row.quantity),
@@ -550,8 +590,28 @@ def ledger(request: HttpRequest):
     return json_response({"results": data})
 
 
-@require_GET
+@csrf_exempt
+@require_http_methods(["GET", "POST"])
 def receipts(request: HttpRequest):
+    if request.method == "POST":
+        try:
+            actor = _request_actor(request)
+            if not actor:
+                raise PermissionError("La recepcion requiere un usuario operativo.")
+            payload = _ensure_active_warehouse_operation_payload(
+                request,
+                parse_json_body(request),
+                operation_label="recepcion",
+            )
+            result = receive_purchase_order(
+                payload=payload,
+                idempotency_key=require_idempotency_key(request),
+                actor=actor,
+            )
+            return json_response(result.payload, status=result.status)
+        except Exception as exc:
+            return _inventory_error_response(exc)
+
     qs = PurchaseOrderReceipt.objects.all().order_by("-created_at")
     if purchase_order_ref := request.GET.get("purchase_order_ref"):
         qs = qs.filter(purchase_order_ref=purchase_order_ref)
@@ -561,20 +621,108 @@ def receipts(request: HttpRequest):
         qs = qs.filter(status=status)
     if item := request.GET.get("item"):
         qs = qs.filter(lines__item_ref=item).distinct()
-    data = [
-        {
-            "id": str(row.id),
-            "purchase_order_ref": row.purchase_order_ref,
-            "supplier_ref": row.supplier_ref,
-            "status": row.status,
-            "warehouse_ref": row.warehouse_ref,
-            "lines_count": row.lines.count(),
-            "received_at": _iso_datetime(row.received_at),
-            "closed_at": _iso_datetime(row.closed_at),
-        }
-        for row in qs[:100]
-    ]
+    data = [serialize_receipt(row) for row in qs[:100]]
     return json_response({"results": data})
+
+
+@csrf_exempt
+@require_http_methods(["GET", "POST"])
+def exchanges(request: HttpRequest):
+    if request.method == "POST":
+        try:
+            actor = _request_actor(request)
+            if not actor:
+                raise PermissionError("El canje requiere un usuario operativo.")
+            payload = _ensure_active_warehouse_operation_payload(
+                request,
+                parse_json_body(request),
+                operation_label="canje",
+            )
+            result = execute_inventory_exchange(
+                payload=payload,
+                idempotency_key=require_idempotency_key(request),
+                actor=actor,
+            )
+            return json_response(result.payload, status=result.status)
+        except Exception as exc:
+            return _inventory_error_response(exc)
+
+    from apps.inventory.models import InventoryTransformation
+
+    qs = InventoryTransformation.objects.filter(
+        transformation_type=InventoryTransformation.TransformationType.EXCHANGE
+    ).order_by("-created_at")
+    if warehouse := _query_alias(request, "warehouse", "warehouse_ref"):
+        qs = qs.filter(warehouse_ref=warehouse)
+    return json_response({"results": [serialize_transformation(row) for row in qs[: _limit(request.GET.get("limit"), default=100, maximum=500)]]})
+
+
+@csrf_exempt
+@require_POST
+def location_moves(request: HttpRequest):
+    try:
+        actor = _request_actor(request)
+        if not actor:
+            raise PermissionError("El movimiento requiere un usuario operativo.")
+        payload = _ensure_active_warehouse_operation_payload(
+            request,
+            parse_json_body(request),
+            operation_label="movimiento",
+        )
+        result = move_inventory_between_locations(
+            payload=payload,
+            idempotency_key=require_idempotency_key(request),
+            actor=actor,
+        )
+        return json_response(result.payload, status=result.status)
+    except Exception as exc:
+        return _inventory_error_response(exc)
+
+
+@csrf_exempt
+@require_http_methods(["GET", "POST"])
+def manual_adjustments(request: HttpRequest):
+    if request.method == "POST":
+        try:
+            actor = _request_actor(request)
+            if not actor:
+                raise PermissionError("El ajuste manual requiere un usuario operativo.")
+            payload = _ensure_active_warehouse_operation_payload(
+                request,
+                parse_json_body(request),
+                operation_label="ajuste manual",
+            )
+            result = adjust_inventory_manually(
+                payload=payload,
+                idempotency_key=require_idempotency_key(request),
+                actor=actor,
+            )
+            return json_response(result.payload, status=result.status)
+        except Exception as exc:
+            return _inventory_error_response(exc)
+
+    qs = InventoryLedgerEntry.objects.filter(
+        movement_type=InventoryLedgerEntry.MovementType.ADJUSTMENT,
+        document_type="inventory_manual_adjustment",
+    ).order_by("-posted_at")
+    try:
+        qs, forbidden, authorized_warehouses = _apply_stock_warehouse_scope(request, qs)
+    except MasterDataSourceError as exc:
+        return error_response("master_data_unavailable", str(exc), status=503)
+    if forbidden is not None:
+        return forbidden
+    if warehouse := _query_alias(request, "warehouse", "warehouse_ref"):
+        qs = qs.filter(warehouse_ref=warehouse)
+    if item := _query_alias(request, "item", "item_ref"):
+        qs = qs.filter(item_ref=item)
+    if direction := request.GET.get("direction"):
+        qs = qs.filter(direction=direction)
+    return json_response(
+        {
+            "results": [serialize_ledger_entry(row) for row in qs[: _limit(request.GET.get("limit"), default=100, maximum=500)]],
+            "allowed_warehouses": authorized_warehouses,
+        }
+    )
 
 
 @csrf_exempt

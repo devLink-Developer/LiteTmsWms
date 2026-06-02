@@ -1,10 +1,13 @@
+import { Search } from "lucide-react";
+
 type FilterBarProps = {
   filters: Record<string, string>;
   onFilter: (key: string, value: string) => void;
   onReset: () => void;
+  onSearch?: () => void;
 };
 
-export function FilterBar({ filters, onFilter, onReset }: FilterBarProps) {
+export function FilterBar({ filters, onFilter, onReset, onSearch }: FilterBarProps) {
   return (
     <section className="flex flex-wrap items-end gap-2 border-y border-borderSoft bg-softMid px-3 py-2" aria-label="Filtros">
       <label className="flex min-w-44 flex-col gap-1 text-[11px] font-semibold text-secondaryText">
@@ -13,6 +16,12 @@ export function FilterBar({ filters, onFilter, onReset }: FilterBarProps) {
           className="h-8 rounded border border-borderSoft bg-white px-2 text-[12px] text-night outline-none focus:border-primary focus:ring-2 focus:ring-primary/20"
           value={filters.busqueda}
           onChange={(event) => onFilter("busqueda", event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && onSearch) {
+              event.preventDefault();
+              onSearch();
+            }
+          }}
           placeholder="Pedido, item, cliente"
         />
       </label>
@@ -54,6 +63,16 @@ export function FilterBar({ filters, onFilter, onReset }: FilterBarProps) {
       >
         Limpiar
       </button>
+      {onSearch && (
+        <button
+          type="button"
+          className="inline-flex h-8 items-center gap-2 rounded bg-primary px-3 text-[12px] font-semibold text-white transition hover:bg-primaryHover focus:outline-none focus:ring-2 focus:ring-primary/30"
+          onClick={onSearch}
+        >
+          <Search size={14} />
+          Buscar
+        </button>
+      )}
     </section>
   );
 }

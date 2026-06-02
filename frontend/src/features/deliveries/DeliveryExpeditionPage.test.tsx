@@ -13,6 +13,7 @@ describe("DeliveryExpeditionPage", () => {
   let fullRemittedOrder: boolean;
   let duplicatedStockIssues: boolean;
   let activeLineStockIssue: boolean;
+  let activeLinePartialStockIssue: boolean;
   let orderImpacts: boolean;
   let lastStockCheckBody: Record<string, unknown>;
   let lastSplitBody: Record<string, unknown>;
@@ -28,6 +29,7 @@ describe("DeliveryExpeditionPage", () => {
     fullRemittedOrder = false;
     duplicatedStockIssues = false;
     activeLineStockIssue = false;
+    activeLinePartialStockIssue = false;
     orderImpacts = false;
     lastStockCheckBody = {};
     lastSplitBody = {};
@@ -149,6 +151,71 @@ describe("DeliveryExpeditionPage", () => {
                       warehouse_ref: "PS003MT",
                       planned_qty: "2.88",
                       available_qty: "0",
+                      uom: "m2",
+                    },
+                  ],
+                },
+              }),
+            };
+          }
+          if (activeLinePartialStockIssue) {
+            const requestedLine = Array.isArray((lastStockCheckBody as { lines?: unknown[] }).lines)
+              ? (lastStockCheckBody as { lines: Array<{ delivery_unit_qty?: number }> }).lines[0]
+              : null;
+            const requestedUnits = Number(requestedLine?.delivery_unit_qty ?? 0);
+            if (requestedUnits <= 1) {
+              return {
+                ok: true,
+                status: 200,
+                json: async () => ({
+                  result: {
+                    reference_type: "fulfillment_order",
+                    reference_id: "order-184",
+                    reference_number: "PED-000184",
+                    status: "ok",
+                    can_confirm: true,
+                    issues: [],
+                    lines: [
+                      {
+                        line_id: "184-1",
+                        item_ref: "CER-104",
+                        warehouse_ref: "PS003MT",
+                        planned_qty: "1.44",
+                        available_qty: "1.44",
+                        uom: "m2",
+                      },
+                    ],
+                  },
+                }),
+              };
+            }
+            return {
+              ok: true,
+              status: 200,
+              json: async () => ({
+                result: {
+                  reference_type: "fulfillment_order",
+                  reference_id: "order-184",
+                  reference_number: "PED-000184",
+                  status: "insufficient",
+                  can_confirm: false,
+                  issues: [
+                    {
+                      line_id: "184-1",
+                      item_ref: "CER-104",
+                      warehouse_ref: "PS003MT",
+                      planned_qty: "2.88",
+                      available_qty: "1.44",
+                      uom: "m2",
+                    },
+                  ],
+                  lines: [
+                    {
+                      line_id: "184-1",
+                      item_ref: "CER-104",
+                      warehouse_ref: "PS003MT",
+                      planned_qty: "2.88",
+                      available_qty: "1.44",
                       uom: "m2",
                     },
                   ],
@@ -954,6 +1021,37 @@ describe("DeliveryExpeditionPage", () => {
     expect(screen.getByRole("button", { name: "Confirmar entrega" })).toBeDisabled();
   });
 
+  it("confirms available stock as a partial draft delivery", async () => {
+    activeLinePartialStockIssue = true;
+    render(<DeliveryExpeditionPage />);
+
+    fireEvent.change(screen.getByLabelText("Busqueda"), { target: { value: "PED-000184" } });
+    fireEvent.click(screen.getByRole("button", { name: "Buscar pedido" }));
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "Agregar entrega" })).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Agregar entrega" }));
+    fireEvent.click(screen.getByRole("button", { name: "Entregar todo" }));
+    fireEvent.click(screen.getByRole("button", { name: "Validar Stock" }));
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "Confirmar Disponibles" })).not.toBeDisabled());
+    const partialRow = screen.getByLabelText("Cantidad a entregar CER-104").closest("tr");
+    expect(partialRow).toHaveClass("bg-amber-50");
+    expect(within(partialRow as HTMLElement).getByText("parcial")).toBeInTheDocument();
+    expect(within(partialRow as HTMLElement).getByText("Entregar disponible")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Confirmar Disponibles" }));
+    const dialog = screen.getByRole("dialog", { name: "Confirmar disponibles" });
+    expect(dialog).toBeInTheDocument();
+    expect(within(dialog).getByText(/falta 1 caja/)).toBeInTheDocument();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Confirmar Disponibles" }));
+
+    await waitFor(() => expect(screen.getByText(/ENT-000184-1 confirmada parcialmente; stock reservado./)).toBeInTheDocument());
+    expect(lastSplitBody).toMatchObject({
+      lines: [{ fulfillment_line_id: "184-1", delivery_unit_qty: 1 }],
+    });
+  });
+
   it("shows a modal and reassigns a confirmed delivery from another warehouse", async () => {
     crossWarehouseConflict = true;
     useWorkspaceStore.setState({ warehouseRef: "PS003MT", authorizedWarehouses: ["PS003MT"] });
@@ -986,5 +1084,6 @@ describe("DeliveryExpeditionPage", () => {
     fireEvent.click(screen.getByRole("button", { name: "Buscar pedido" }));
 
     await waitFor(() => expect(screen.getAllByText("PED-000184").length).toBeGreaterThan(0));
+    expect(fetch).toHaveBeenCalledWith(expect.stringContaining("target_warehouse_ref=PS003MT"), expect.any(Object));
   });
 });

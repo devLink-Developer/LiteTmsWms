@@ -14,6 +14,13 @@ type OperationalPageProps = {
   module: OperationModule;
 };
 
+const emptyOperationFilters: Record<string, string> = {
+  estado: "",
+  warehouse: "",
+  busqueda: "",
+  fecha: "",
+};
+
 export function OperationalPage({ module }: OperationalPageProps) {
   const useStore = storeForModule(module.key);
   const filters = useStore((state) => state.filters);
@@ -28,8 +35,11 @@ export function OperationalPage({ module }: OperationalPageProps) {
   const setLoading = useStore((state) => state.setLoading);
   const setError = useStore((state) => state.setError);
   const [rows, setRows] = useState<OperationRow[]>([]);
-  const requiresSearchBeforeLoad = module.key === "orders";
-  const hasSearchFilter = filters.busqueda.trim().length > 0;
+  const manualSearch = module.key === "orders";
+  const [submittedFilters, setSubmittedFilters] = useState<Record<string, string>>(filters);
+  const appliedFilters = manualSearch ? submittedFilters : filters;
+  const requiresSearchBeforeLoad = manualSearch;
+  const hasSearchFilter = appliedFilters.busqueda.trim().length > 0;
 
   useEffect(() => {
     if (requiresSearchBeforeLoad && !hasSearchFilter) {
@@ -43,7 +53,7 @@ export function OperationalPage({ module }: OperationalPageProps) {
     setError(null);
     const debounce = window.setTimeout(
       () => {
-        fetchOperationRows(module, filters)
+        fetchOperationRows(module, appliedFilters)
           .then((apiRows) => {
             if (!cancelled) {
               setRows(apiRows);
@@ -63,28 +73,42 @@ export function OperationalPage({ module }: OperationalPageProps) {
             }
           });
       },
-      filters.busqueda.trim() ? 250 : 0,
+      manualSearch ? 0 : appliedFilters.busqueda.trim() ? 250 : 0,
     );
 
     return () => {
       cancelled = true;
       window.clearTimeout(debounce);
     };
-  }, [filters, hasSearchFilter, module, requiresSearchBeforeLoad, setError, setLoading]);
+  }, [appliedFilters, hasSearchFilter, manualSearch, module, requiresSearchBeforeLoad, setError, setLoading]);
 
   const filteredRows = useMemo(() => {
     return rows.filter((row) => {
-      const search = filters.busqueda.trim().toLowerCase();
+      const search = appliedFilters.busqueda.trim().toLowerCase();
       const rawText = JSON.stringify(row.raw ?? {});
       const matchesSearch = !search || `${row.ref} ${row.owner} ${row.warehouse} ${rawText}`.toLowerCase().includes(search);
-      const matchesStatus = !filters.estado || row.status === filters.estado;
-      const matchesWarehouse = !filters.warehouse || row.warehouse.toLowerCase().includes(filters.warehouse.toLowerCase());
+      const matchesStatus = !appliedFilters.estado || row.status === appliedFilters.estado;
+      const matchesWarehouse = !appliedFilters.warehouse || row.warehouse.toLowerCase().includes(appliedFilters.warehouse.toLowerCase());
       return matchesSearch && matchesStatus && matchesWarehouse;
     });
-  }, [filters, rows]);
+  }, [appliedFilters, rows]);
 
   const activeRow = filteredRows.find((row) => row.id === activeRecordId) ?? rows.find((row) => row.id === activeRecordId);
   const kpis = useMemo(() => buildKpis(rows), [rows]);
+
+  function submitSearch() {
+    setSubmittedFilters({ ...filters });
+  }
+
+  function handleResetFilters() {
+    resetFilters();
+    if (manualSearch) {
+      setSubmittedFilters(emptyOperationFilters);
+      setRows([]);
+      setLoading(false);
+      setError(null);
+    }
+  }
 
   return (
     <div className="flex h-full min-h-0">
@@ -113,7 +137,7 @@ export function OperationalPage({ module }: OperationalPageProps) {
             </div>
             <div className="text-[11px] text-secondaryText">{selectedIds.length} seleccionados</div>
           </div>
-          <FilterBar filters={filters} onFilter={setFilter} onReset={resetFilters} />
+          <FilterBar filters={filters} onFilter={setFilter} onReset={handleResetFilters} onSearch={manualSearch ? submitSearch : undefined} />
           <DataTable
             rows={filteredRows}
             columns={module.columns}

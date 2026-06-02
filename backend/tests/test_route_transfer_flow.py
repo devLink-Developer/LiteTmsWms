@@ -495,7 +495,7 @@ class TransferFlowTests(TestCase):
             warehouse_ref="WH-A",
             item_ref="ITEM-T",
             lot_ref="",
-            stock_state=StockState.ON_HAND,
+            stock_state=StockState.PACKED,
             uom="UN",
             quantity=Decimal("5"),
         )
@@ -515,11 +515,11 @@ class TransferFlowTests(TestCase):
         prepare_transfer(transfer_id=transfer_id, payload={}, idempotency_key="transfer-prepare", actor="origin")
         dispatch_transfer(transfer_id=transfer_id, payload={}, idempotency_key="transfer-dispatch", actor="origin")
 
-        origin_on_hand = InventoryBalance.objects.get(
+        origin_packed = InventoryBalance.objects.get(
             warehouse_ref="WH-A",
             location_ref="WH-A-DSP-GEN",
             item_ref="ITEM-T",
-            stock_state=StockState.ON_HAND,
+            stock_state=StockState.PACKED,
         )
         transit = InventoryBalance.objects.get(
             warehouse_ref="WH-A",
@@ -527,7 +527,7 @@ class TransferFlowTests(TestCase):
             item_ref="ITEM-T",
             stock_state=StockState.IN_TRANSIT,
         )
-        self.assertEqual(origin_on_hand.quantity, Decimal("3"))
+        self.assertEqual(origin_packed.quantity, Decimal("3"))
         self.assertEqual(transit.quantity, Decimal("2"))
 
         line = TransferOrder.objects.get(id=transfer_id).lines.get()
@@ -538,14 +538,14 @@ class TransferFlowTests(TestCase):
             actor="dest",
         )
         line.refresh_from_db()
-        destination_on_hand = InventoryBalance.objects.get(
+        destination_packed = InventoryBalance.objects.get(
             warehouse_ref="WH-B",
             location_ref="WH-B-DSP-GEN",
             item_ref="ITEM-T",
-            stock_state=StockState.ON_HAND,
+            stock_state=StockState.PACKED,
         )
         transit.refresh_from_db()
         self.assertEqual(line.received_qty, Decimal("1"))
         self.assertEqual(line.difference_qty, Decimal("1"))
-        self.assertEqual(destination_on_hand.quantity, Decimal("1"))
+        self.assertEqual(destination_packed.quantity, Decimal("1"))
         self.assertEqual(transit.quantity, Decimal("1"))

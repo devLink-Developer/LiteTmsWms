@@ -7,8 +7,11 @@ import { DeliveryExpeditionPage } from "../features/deliveries/DeliveryExpeditio
 import { FleetAdminPage } from "../features/fleet/FleetAdminPage";
 import { DriverRouteExecutionPage } from "../features/reparto/DriverRouteExecutionPage";
 import { BreakagesLossesPage } from "../features/operations/BreakagesLossesPage";
+import { InventoryExchangePage } from "../features/operations/InventoryExchangePage";
+import { ManualStockAdjustmentPage } from "../features/operations/ManualStockAdjustmentPage";
 import { OperationalPage } from "../features/operations/OperationalPage";
 import { PlaceholderPage } from "../features/operations/PlaceholderPage";
+import { PurchaseReceiptsPage } from "../features/receipts/PurchaseReceiptsPage";
 import { SheetCuttingPage } from "../features/operations/SheetCuttingPage";
 import { RepartoConfirmationPage } from "../features/reparto/RepartoConfirmationPage";
 import { RepartoPreparationPage } from "../features/reparto/RepartoPreparationPage";
@@ -57,8 +60,11 @@ export const appRoutes: RouteObject[] = [
       { path: "maestros/choferes", element: <FleetAdminPage initialTab="drivers" /> },
       { path: "maestros/almacenes", element: <WarehouseMasterPage /> },
       { path: "pedidos/tareas", element: <PreparationTasksPage /> },
+      { path: "ingresos/oc", element: <PurchaseReceiptsPage /> },
       { path: "ingresos/tr-depositos", element: <TransfersPage /> },
       { path: "stock/almacenes", element: <StockBalancesPage /> },
+      { path: "operaciones/canje-lote-saldo", element: <InventoryExchangePage /> },
+      { path: "operaciones/alta-baja-articulos", element: <ManualStockAdjustmentPage /> },
       { path: "operaciones/corte-chapas", element: <SheetCuttingPage /> },
       { path: "operaciones/roturas-perdidas", element: <BreakagesLossesPage /> },
       ...legacyRedirects,

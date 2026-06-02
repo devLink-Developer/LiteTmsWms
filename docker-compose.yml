@@ -10,12 +10,12 @@ services:
       POSTGRES_DB_USER: litecore
       POSTGRES_DB_PASS: litecorepass
       POSTGRES_DB_HOST: 10.11.0.30
-      POSTGRES_DB_PORT: "5433"
+      POSTGRES_DB_PORT: ${POSTGRES_DB_PORT:-5434}
       LITECORE_DB_NAME: litecore
       LITECORE_DB_USER: litecore
       LITECORE_DB_PASS: litecorepass
       LITECORE_DB_HOST: 10.11.0.30
-      LITECORE_DB_PORT: "5433"
+      LITECORE_DB_PORT: ${LITECORE_DB_PORT:-5434}
       TMSWMS_DB_SCHEMA: tmswms
       TMSWMS_DEFAULT_ACTOR: ${TMSWMS_DEFAULT_ACTOR:-eespinoza}
       LDAP_SERVER: ${LDAP_SERVER:-}
@@ -47,12 +47,12 @@ services:
       POSTGRES_DB_USER: litecore
       POSTGRES_DB_PASS: litecorepass
       POSTGRES_DB_HOST: 10.11.0.30
-      POSTGRES_DB_PORT: "5433"
+      POSTGRES_DB_PORT: ${POSTGRES_DB_PORT:-5434}
       LITECORE_DB_NAME: litecore
       LITECORE_DB_USER: litecore
       LITECORE_DB_PASS: litecorepass
       LITECORE_DB_HOST: 10.11.0.30
-      LITECORE_DB_PORT: "5433"
+      LITECORE_DB_PORT: ${LITECORE_DB_PORT:-5434}
       TMSWMS_DB_SCHEMA: tmswms
       ROUTING_PROVIDER: ${ROUTING_PROVIDER:-ors}
       ORS_API_KEY: ${ORS_API_KEY:-}

@@ -9,6 +9,7 @@ import { fetchDrivers } from "../../api/fleet";
 import { executeStop, fetchRouteSheet, fetchRouteSheets, routeCommand, type RouteSheet, type RouteStop } from "../../api/routing";
 import { StatusBadge } from "../../shared/components/StatusBadge";
 import { notify, useToastError } from "../../shared/components/toast";
+import { translateStatusLabel } from "../../shared/utils/statusLabels";
 import type { StatusTone } from "../../types/operations";
 import {
   offlineRouteList,
@@ -264,9 +265,9 @@ export function DriverRouteExecutionPage() {
         <div className="min-w-0">
           <h1 className="text-[20px] font-semibold text-night">Ejecucion chofer</h1>
           <div className="mt-1 flex flex-wrap gap-2 text-[12px] text-secondaryText">
-            <span>{online ? "Online" : "Offline"}</span>
+            <span>{online ? "En linea" : "Sin conexion"}</span>
             <span>{pendingCount} pendientes de sincronizar</span>
-            {route && <span>{route.route_number} / {route.status}</span>}
+            {route && <span>{route.route_number} / {translateStatusLabel(route.status)}</span>}
           </div>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -298,10 +299,10 @@ export function DriverRouteExecutionPage() {
               <select value={routeId} onChange={(event) => setRouteId(event.target.value)} className="h-9 rounded border border-borderSoft bg-white px-2 text-[12px] text-night outline-none focus:border-primary focus:ring-2 focus:ring-primary/20">
                 <option value="">Sin ruta</option>
                 {(routesQuery.data ?? []).map((summary) => (
-                  <option key={summary.id} value={summary.id}>{summary.route_number} / {summary.status}</option>
+                  <option key={summary.id} value={summary.id}>{summary.route_number} / {translateStatusLabel(summary.status)}</option>
                 ))}
                 {offlineRoutes.map((cached) => (
-                  <option key={`offline-${cached.id}`} value={cached.id}>{cached.route_number} / offline</option>
+                  <option key={`offline-${cached.id}`} value={cached.id}>{cached.route_number} / Sin conexion</option>
                 ))}
               </select>
             </label>

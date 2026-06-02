@@ -190,7 +190,6 @@ export const dashboardOperationModules = [
 
 export const routedOperationModules = [
   "orders",
-  "receipts",
   "transfers",
   "returns",
   "routes",
@@ -200,14 +199,6 @@ export const routedOperationModules = [
 ].map(operationModuleByKey);
 
 export const placeholderPages: PlaceholderPageConfig[] = [
-  {
-    key: "lot-to-balance",
-    label: "Canje lote a saldo",
-    path: "/operaciones/canje-lote-saldo",
-    groupLabel: "Operaciones",
-    description: "",
-    checkpoints: [],
-  },
   {
     key: "breakages-losses",
     label: "Roturas y perdidas",
@@ -270,7 +261,8 @@ export const navigationEntries: NavigationEntry[] = [
     label: "Operaciones",
     items: [
       { key: "sheet-cutting", label: "Corte de chapas", path: "/operaciones/corte-chapas" },
-      { key: "lot-to-balance", label: "Canje lote a saldo", path: placeholderPageByKey("lot-to-balance").path },
+      { key: "lot-to-balance", label: "Canje lote a saldo", path: "/operaciones/canje-lote-saldo" },
+      { key: "manual-stock-adjustment", label: "Alta y baja de articulos", path: "/operaciones/alta-baja-articulos" },
       { key: "breakages-losses", label: "Roturas y perdidas", path: placeholderPageByKey("breakages-losses").path },
     ],
   },

@@ -777,10 +777,11 @@ def _active_delivery_lines_queryset():
     )
 
 
-def _line_metrics(lines: list[FulfillmentOrderLine]) -> dict:
+def _line_metrics(lines: list[FulfillmentOrderLine], *, target_warehouse_ref: str = "") -> dict:
     if not lines:
         return {}
 
+    stock_warehouse_ref = _target_warehouse(target_warehouse_ref)
     line_ids = [line.id for line in lines]
     planned_by_line = {
         row["fulfillment_line_id"]: row["total"] or Decimal("0")
@@ -799,19 +800,31 @@ def _line_metrics(lines: list[FulfillmentOrderLine]) -> dict:
         .annotate(total=Sum("applied_qty"))
     }
 
-    packed_by_key = _packed_quantities_for_keys({(line.warehouse_ref, line.item_ref, line.uom) for line in lines})
+    packed_by_key = _packed_quantities_for_keys(
+        {
+            (stock_warehouse_ref or line.warehouse_ref, line.item_ref, line.uom)
+            for line in lines
+        }
+    )
 
     return {
         line.id: {
             "planned_qty": planned_by_line.get(line.id, Decimal("0")),
-            "packed_qty": packed_by_key.get((line.warehouse_ref, line.item_ref, line.uom), Decimal("0")),
+            "packed_qty": packed_by_key.get((stock_warehouse_ref or line.warehouse_ref, line.item_ref, line.uom), Decimal("0")),
             "returned_qty": returned_by_line.get(line.id, Decimal("0")),
+            "stock_warehouse_ref": stock_warehouse_ref or line.warehouse_ref,
         }
         for line in lines
     }
 
 
-def _serialize_fulfillment_line(line: FulfillmentOrderLine, metrics: dict, item_snapshot: dict | None = None) -> dict:
+def _serialize_fulfillment_line(
+    line: FulfillmentOrderLine,
+    metrics: dict,
+    item_snapshot: dict | None = None,
+    *,
+    target_warehouse_ref: str = "",
+) -> dict:
     metric = metrics.get(line.id)
     if metric is None:
         planned_qty = _planned_elsewhere(line)
@@ -830,11 +843,14 @@ def _serialize_fulfillment_line(line: FulfillmentOrderLine, metrics: dict, item_
     item_snapshot = _with_display_uom(item_snapshot or _default_item_snapshot(line.item_ref, line.uom), fallback_uom=line.uom)
     conversion_factor = _item_conversion_factor(item_snapshot)
     planned_delivery_unit_qty = _delivery_unit_qty_from_commercial(planned_qty, item_snapshot)
-    max_dispatchable_qty = _max_dispatchable_from_values(
-        line,
-        already_planned=planned_qty,
-        packed_qty=packed_qty,
-    )
+    if _target_warehouse(target_warehouse_ref):
+        max_dispatchable_qty = min(max(Decimal("0"), line.pending_qty - planned_qty), max(Decimal("0"), packed_qty))
+    else:
+        max_dispatchable_qty = _max_dispatchable_from_values(
+            line,
+            already_planned=planned_qty,
+            packed_qty=packed_qty,
+        )
     max_dispatchable_delivery_unit_qty = _delivery_unit_qty_from_commercial(max_dispatchable_qty, item_snapshot)
     planned_weight_kg, planned_volume_m3 = _capacity_totals(planned_qty, item_snapshot)
 
@@ -1500,6 +1516,7 @@ def _serialize_fulfillment(
     customer_snapshot: dict | None = None,
     item_snapshots: dict | None = None,
     movement_context: dict | None = None,
+    target_warehouse_ref: str = "",
 ) -> dict:
     prefetched_lines = _prefetched_list(fulfillment, "lines")
     lines = sorted(prefetched_lines, key=lambda line: line.legacy_line_id) if prefetched_lines is not None else list(fulfillment.lines.order_by("legacy_line_id"))
@@ -1572,7 +1589,15 @@ def _serialize_fulfillment(
         "customer_dni": customer_snapshot.get("document_number", ""),
         "customer_document": customer_snapshot.get("document_number", ""),
         "pickup_authorization": _pickup_authorization(fulfillment, deliveries, customer_snapshot),
-        "lines": [_serialize_fulfillment_line(line, metrics, item_snapshots.get(line.id)) for line in physical_lines],
+        "lines": [
+            _serialize_fulfillment_line(
+                line,
+                metrics,
+                item_snapshots.get(line.id),
+                target_warehouse_ref=target_warehouse_ref,
+            )
+            for line in physical_lines
+        ],
         "deliveries": serialized_deliveries,
         "impacts": [_serialize_order_impact(impact) for impact in impacts],
         "movements": _fulfillment_movements(fulfillment, serialized_deliveries, movement_context=movement_context),
@@ -2902,6 +2927,150 @@ def _apply_delivery_warehouse(delivery: DeliveryOrder, target_warehouse_ref: str
 
 
 @transaction.atomic
+def confirm_available_delivery_stock(
+    *,
+    delivery_id: str,
+    lines: list[dict],
+    idempotency_key: str,
+    actor: str,
+    authorized_warehouses=None,
+    target_warehouse_ref: str = "",
+) -> IdempotentResult:
+    target_warehouse_ref = _target_warehouse(target_warehouse_ref)
+    command_payload = {"delivery_id": delivery_id, "lines": lines}
+    if target_warehouse_ref:
+        command_payload["target_warehouse_ref"] = target_warehouse_ref
+    idempotency, replay = _start_idempotent_command(
+        key=idempotency_key,
+        operation_type="delivery.confirm_available",
+        reference_type="delivery_order",
+        reference_id=delivery_id,
+        payload=command_payload,
+    )
+    if replay and idempotency.status == IdempotencyKey.ProcessingStatus.SUCCEEDED:
+        return IdempotentResult(idempotency.response_payload, idempotency.response_status)
+
+    delivery = (
+        DeliveryOrder.objects.select_for_update()
+        .select_related("fulfillment")
+        .prefetch_related("lines__fulfillment_line", "documents", "preparation_task")
+        .get(id=delivery_id)
+    )
+    _ensure_warehouse_authorized(target_warehouse_ref or delivery.warehouse_ref, authorized_warehouses)
+    if delivery.status not in [DeliveryOrder.DeliveryStatus.CREATED, DeliveryOrder.DeliveryStatus.PLANNED]:
+        raise FulfillmentRuleError("La entrega solo se puede confirmar parcialmente desde creada o planificada.")
+    if _active_delivery_reservations().filter(source_type="delivery_order", source_ref=str(delivery.id)).exists():
+        raise FulfillmentRuleError("La entrega ya tiene stock reservado.")
+    if delivery.documents.filter(document_type=DeliveryDocument.DocumentType.REMITO).exists():
+        raise FulfillmentRuleError("La entrega ya tiene remito.")
+    if hasattr(delivery, "preparation_task") and delivery.preparation_task.status != DeliveryPreparationTask.TaskStatus.CANCELLED:
+        raise FulfillmentRuleError("La entrega ya inicio preparacion.")
+
+    requested_by_line_id: dict[str, Decimal] = {}
+    for payload_line in lines:
+        line_id = str(payload_line.get("delivery_line_id") or "").strip()
+        if not line_id:
+            raise FulfillmentRuleError("delivery_line_id es obligatorio.")
+        if line_id in requested_by_line_id:
+            raise FulfillmentRuleError("La linea de entrega esta duplicada.")
+        requested_qty = _to_decimal(payload_line.get("planned_qty"))
+        if requested_qty < ZERO:
+            raise FulfillmentRuleError("La cantidad a confirmar no puede ser negativa.")
+        requested_by_line_id[line_id] = requested_qty
+
+    delivery_lines = list(delivery.lines.select_for_update().select_related("fulfillment_line"))
+    physical_lines = physical_delivery_lines(delivery_lines)
+    physical_line_ids = {str(line.id) for line in physical_lines}
+    unknown_line_ids = set(requested_by_line_id) - physical_line_ids
+    if unknown_line_ids:
+        raise FulfillmentRuleError("La linea de entrega indicada no existe para esta entrega.")
+
+    kept_lines = 0
+    changed_lines: list[dict] = []
+    for line in physical_lines:
+        line_id = str(line.id)
+        next_qty = _quantize_qty(requested_by_line_id.get(line_id, ZERO))
+        previous_qty = line.planned_qty
+        if next_qty > previous_qty:
+            raise FulfillmentRuleError(f"La linea {line.item_ref} no puede aumentar cantidad en confirmacion parcial.")
+        if next_qty <= ZERO:
+            changed_lines.append(
+                {
+                    "delivery_line_id": line_id,
+                    "item_ref": line.item_ref,
+                    "from_qty": str(previous_qty),
+                    "to_qty": "0",
+                    "uom": line.uom,
+                }
+            )
+            line.delete()
+            continue
+
+        snapshot = _delivery_line_snapshot(line)
+        planned_weight_kg, planned_volume_m3 = _capacity_totals(next_qty, snapshot)
+        next_delivery_unit_qty = _delivery_unit_qty_from_commercial(next_qty, snapshot)
+        if next_qty != previous_qty:
+            changed_lines.append(
+                {
+                    "delivery_line_id": line_id,
+                    "item_ref": line.item_ref,
+                    "from_qty": str(previous_qty),
+                    "to_qty": str(next_qty),
+                    "uom": line.uom,
+                }
+            )
+        line.planned_qty = next_qty
+        line.delivery_unit_qty = next_delivery_unit_qty
+        line.planned_weight_kg = planned_weight_kg
+        line.planned_volume_m3 = planned_volume_m3
+        line.updated_by = actor
+        line.save(
+            update_fields=[
+                "planned_qty",
+                "delivery_unit_qty",
+                "planned_weight_kg",
+                "planned_volume_m3",
+                "updated_by",
+                "updated_at",
+            ]
+        )
+        remaining_after_split = max(
+            ZERO,
+            line.fulfillment_line.pending_qty - (_planned_elsewhere(line.fulfillment_line, exclude_delivery_id=str(delivery.id)) + next_qty),
+        )
+        DeliverySplit.objects.filter(delivery_line=line).update(
+            split_qty=next_qty,
+            remaining_after_split=remaining_after_split,
+            updated_by=actor,
+            updated_at=timezone.now(),
+        )
+        kept_lines += 1
+
+    if kept_lines <= 0:
+        raise FulfillmentRuleError("La entrega no tiene cantidades disponibles para confirmar.")
+
+    if changed_lines:
+        StatusHistory.objects.create(
+            entity_type="delivery_order",
+            entity_id=str(delivery.id),
+            from_status=delivery.status,
+            to_status=delivery.status,
+            actor=actor,
+            reason="Confirmacion parcial por stock disponible",
+            payload={"lines": changed_lines},
+        )
+
+    result = validate_delivery_stock(
+        delivery_id=delivery_id,
+        idempotency_key=f"{idempotency_key}:validate",
+        actor=actor,
+        authorized_warehouses=authorized_warehouses,
+        target_warehouse_ref=target_warehouse_ref,
+    )
+    return _finish_idempotent_command(idempotency, result)
+
+
+@transaction.atomic
 def validate_delivery_stock(
     *,
     delivery_id: str,
@@ -3567,6 +3736,7 @@ def _legacy_orders_for_expedition_search(
     customer_refs: set[str] | None = None,
     limit: int = 100,
 ) -> list[LegacyOrder]:
+    sales_order_candidates = _lookup_candidates(sales_order_number)
     try:
         queryset = LegacyOrder.objects.using("litecore").filter(invoice_number__gt="", invoice_date__isnull=False).filter(
             Q(sales_order_type__iexact=LEGACY_ORDER_TYPE_DELIVERABLE)
@@ -3575,9 +3745,9 @@ def _legacy_orders_for_expedition_search(
         )
         if sales_order_number:
             queryset = queryset.filter(
-                Q(sales_order_number__iexact=sales_order_number)
-                | Q(transaction_number__iexact=sales_order_number)
-                | Q(invoice_number__iexact=sales_order_number)
+                Q(sales_order_number__in=sales_order_candidates)
+                | Q(transaction_number__in=sales_order_candidates)
+                | Q(invoice_number__in=sales_order_candidates)
             )
         elif customer_refs:
             queryset = queryset.filter(
@@ -3621,16 +3791,26 @@ def _ensure_legacy_orders_available_for_expedition(
     return available_order_numbers
 
 
+def _lookup_candidates(value: str) -> list[str]:
+    cleaned = str(value or "").strip()
+    if not cleaned:
+        return []
+    candidates = [cleaned, cleaned.upper(), cleaned.lower()]
+    return list(dict.fromkeys(candidate for candidate in candidates if candidate))
+
+
 def expedition_queue(
     *,
     sales_order_number: str = "",
     customer_ref: str = "",
     customer_dni: str = "",
     authorized_warehouses: list[str] | tuple[str, ...] | set[str] | None = None,
+    target_warehouse_ref: str = "",
 ) -> list[dict]:
     sales_order_number = sales_order_number.strip()
     customer_ref = customer_ref.strip()
     customer_dni = customer_dni.strip()
+    target_warehouse_ref = _target_warehouse(target_warehouse_ref)
     authorized_warehouse_set = (
         None
         if authorized_warehouses is None
@@ -3642,18 +3822,19 @@ def expedition_queue(
     if authorized_warehouses is not None and not authorized_warehouse_set:
         return []
 
-    customer_refs = {customer_ref} if customer_ref else set()
+    customer_refs = set(_lookup_candidates(customer_ref)) if customer_ref else set()
     if customer_dni:
         customer_refs.update(customer_refs_for_dni(customer_dni))
         if not customer_refs:
             return []
 
     filters = Q()
+    sales_order_candidates = _lookup_candidates(sales_order_number)
     if sales_order_number:
         filters &= (
-            Q(legacy_sales_order_number__iexact=sales_order_number)
-            | Q(legacy_transaction_number__iexact=sales_order_number)
-            | Q(fulfillment_number__iexact=sales_order_number)
+            Q(legacy_sales_order_number__in=sales_order_candidates)
+            | Q(legacy_transaction_number__in=sales_order_candidates)
+            | Q(fulfillment_number__in=sales_order_candidates)
         )
     if customer_refs:
         filters &= Q(customer_ref__in=customer_refs)
@@ -3669,7 +3850,6 @@ def expedition_queue(
                 "impacts__lines",
             )
             .filter(filters)
-            .distinct()
             .order_by("-updated_at", "-created_at")
         )
         if authorized_warehouse_set is not None:
@@ -3697,7 +3877,7 @@ def expedition_queue(
         for fulfillment in fulfillments
         for line in list(fulfillment.lines.all())
     ]
-    metrics = _line_metrics(lines)
+    metrics = _line_metrics(lines, target_warehouse_ref=target_warehouse_ref)
     customers = _resolve_customer_snapshots({fulfillment.customer_ref for fulfillment in fulfillments})
     item_snapshots = _resolve_line_item_snapshots(lines)
     movement_context = _build_movement_context(fulfillments)
@@ -3708,6 +3888,7 @@ def expedition_queue(
             customer_snapshot=customers.get(fulfillment.customer_ref),
             item_snapshots=item_snapshots,
             movement_context=movement_context,
+            target_warehouse_ref=target_warehouse_ref,
         )
         for fulfillment in fulfillments
     ]

@@ -24,8 +24,15 @@ import { StatusBadge } from "../../shared/components/StatusBadge";
 import { TraceabilitySection } from "../../shared/components/TraceabilitySection";
 import { notify, type ToastTone } from "../../shared/components/toast";
 import { eventsAffectOperationalStatuses, useLiveStatusRefresh } from "../../shared/hooks/useLiveStatusEvents";
+import {
+  classifyStockAvailability,
+  hasConfirmableStock,
+  type StockAvailabilityLine,
+  type StockAvailabilityStatus,
+} from "../../shared/utils/stockAvailability";
 import { formatAppDate, formatAppDateTime } from "../../shared/utils/dateFormat";
 import { formatIdentifier } from "../../shared/utils/identifierFormat";
+import { translateStatusLabel } from "../../shared/utils/statusLabels";
 import { useWorkspaceStore } from "../../stores/useWorkspaceStore";
 import type { StatusTone, TimelineEvent } from "../../types/operations";
 
@@ -165,9 +172,13 @@ type ValidationMessage = {
 } | null;
 
 type StockLineValidationState = {
-  status: "ok" | "issue";
+  status: StockAvailabilityStatus;
   plannedQty: string;
   availableQty: string;
+  availableDeliveryQty: string;
+  missingQty: string;
+  missingDeliveryQty: string;
+  confirmDeliveryQty: number;
 };
 
 type StockValidationState = {
@@ -175,6 +186,11 @@ type StockValidationState = {
   ok: boolean;
   text: string;
   lines: Record<string, StockLineValidationState>;
+  availability: StockAvailabilityLine[];
+} | null;
+
+type AvailableConfirmationState = {
+  lineId?: string;
 } | null;
 
 type WarehouseConflict = {
@@ -346,36 +362,54 @@ function formatStockValidationIssues(result: ApiStockValidationResult) {
   return [header, ...details].join("\n");
 }
 
-function stockValidationLines(result: ApiStockValidationResult): Record<string, StockLineValidationState> {
-  const issueKeys = new Set(
-    result.issues.flatMap((issue) => [
-      issue.line_id,
-      `${issue.item_ref}::${issue.warehouse_ref}::${issue.uom}`,
-    ]),
-  );
+function deliveryStockKey(order: ExpeditionOrder | undefined, delivery: DeliveryDraft | undefined, warehouseRef: string) {
+  if (!order || !delivery) {
+    return "";
+  }
+  return [
+    order.id,
+    delivery.id,
+    delivery.source,
+    delivery.status,
+    warehouseRef,
+    delivery.mode,
+    delivery.plannedDate,
+    delivery.lines.map((line) => `${line.lineId}:${line.qty}:${line.warehouse ?? ""}`).join("|"),
+  ].join("::");
+}
+
+function deliveryStockAvailabilitySources(order: ExpeditionOrder, delivery: DeliveryDraft, warehouseRef: string) {
+  return order.lines
+    .map((line) => {
+      const requestedDeliveryQty = getDeliveryLineQty(delivery, line.id);
+      return {
+        id: line.id,
+        fulfillmentLineId: line.id,
+        itemRef: line.itemRef,
+        itemName: line.itemName,
+        warehouseRef: warehouseRef || line.warehouse,
+        plannedQty: requestedDeliveryQty * line.conversionFactor,
+        uom: line.uom,
+        deliveryUom: line.deliveryUom,
+        conversionFactor: line.conversionFactor,
+        requestedDeliveryQty,
+        wholeDeliveryUnits: true,
+      };
+    })
+    .filter((line) => line.plannedQty > 0);
+}
+
+function stockValidationLines(availability: StockAvailabilityLine[]): Record<string, StockLineValidationState> {
   const statuses: Record<string, StockLineValidationState> = {};
-
-  result.lines.forEach((line) => {
-    const lineId = line.fulfillment_line_id || line.line_id;
-    const issue =
-      issueKeys.has(line.line_id) ||
-      issueKeys.has(lineId) ||
-      issueKeys.has(`${line.item_ref}::${line.warehouse_ref}::${line.uom}`);
-    statuses[lineId] = {
-      status: issue ? "issue" : "ok",
-      plannedQty: formatQty(asNumber(line.planned_qty), line.uom),
-      availableQty: formatQty(asNumber(line.available_qty), line.uom),
-    };
-  });
-
-  result.issues.forEach((issue) => {
-    if (statuses[issue.line_id]) {
-      return;
-    }
-    statuses[issue.line_id] = {
-      status: "issue",
-      plannedQty: formatQty(asNumber(issue.planned_qty), issue.uom),
-      availableQty: formatQty(asNumber(issue.available_qty), issue.uom),
+  availability.forEach((line) => {
+    statuses[line.id] = {
+      status: line.status,
+      plannedQty: formatQty(line.requestedQty, line.uom),
+      availableQty: formatQty(line.confirmQty, line.uom),
+      availableDeliveryQty: formatQty(line.availableDeliveryQty, line.deliveryUom || line.uom),
+      missingQty: formatQty(line.missingQty, line.uom),
+      missingDeliveryQty: formatQty(line.missingDeliveryQty, line.deliveryUom || line.uom),
+      confirmDeliveryQty: line.availableDeliveryQty,
     };
   });
 
@@ -770,10 +804,12 @@ export function DeliveryExpeditionPage() {
   });
   const [submittedSearch, setSubmittedSearch] = useState<ExpeditionQueueSearch | null>(null);
   const [stockValidation, setStockValidation] = useState<StockValidationState>(null);
+  const [availableConfirmation, setAvailableConfirmation] = useState<AvailableConfirmationState>(null);
   const [warehouseConflict, setWarehouseConflict] = useState<WarehouseConflict | null>(null);
   const [loading, setLoading] = useState(false);
   const [processing, setProcessing] = useState(false);
   const conflictConfirmRef = useRef<HTMLButtonElement | null>(null);
+  const availableConfirmRef = useRef<HTMLButtonElement | null>(null);
 
   function setMessage(nextMessage: ValidationMessage) {
     if (!nextMessage) {
@@ -856,6 +892,12 @@ export function DeliveryExpeditionPage() {
   }, [warehouseConflict]);
 
   useEffect(() => {
+    if (availableConfirmation) {
+      availableConfirmRef.current?.focus();
+    }
+  }, [availableConfirmation]);
+
+  useEffect(() => {
     if (!activeOrder || draftState?.orderId !== activeOrder.id) {
       return;
     }
@@ -918,10 +960,11 @@ export function DeliveryExpeditionPage() {
       setSummaryDeliveryId("");
       setDraftState(null);
       setStockValidation(null);
+      setAvailableConfirmation(null);
       setWarehouseConflict(null);
       return;
     }
-    const nextSearch = { mode: search.mode, value };
+    const nextSearch = { mode: search.mode, value, warehouseRef: warehouseRef || "" };
     setSubmittedSearch(nextSearch);
     setOrders([]);
     setActiveOrderId("");
@@ -929,6 +972,7 @@ export function DeliveryExpeditionPage() {
     setSummaryDeliveryId("");
     setDraftState(null);
     setStockValidation(null);
+    setAvailableConfirmation(null);
     setWarehouseConflict(null);
     setMessage(null);
     void loadQueue(nextSearch);
@@ -943,6 +987,7 @@ export function DeliveryExpeditionPage() {
       setDraftState(null);
     }
     setStockValidation(null);
+    setAvailableConfirmation(null);
     setWarehouseConflict(null);
     setMessage(null);
   }
@@ -978,6 +1023,7 @@ export function DeliveryExpeditionPage() {
     setActiveDeliveryId(draft.id);
     setSummaryDeliveryId(draft.id);
     setStockValidation(null);
+    setAvailableConfirmation(null);
     setMessage({ tone: "info", text: "Borrador creado." });
   }
 
@@ -987,6 +1033,7 @@ export function DeliveryExpeditionPage() {
     }
     setDraftState({ orderId: activeOrder.id, delivery: updater(draftState.delivery) });
     setStockValidation(null);
+    setAvailableConfirmation(null);
     setMessage(null);
   }
 
@@ -1109,11 +1156,16 @@ export function DeliveryExpeditionPage() {
             )
           : await checkDeliveryStock(activeDelivery.id, expeditionCommandOptions);
       const text = formatStockValidationIssues(result);
-      setStockValidation({ key: stockKey, ok: result.can_confirm, text, lines: stockValidationLines(result) });
+      const availability = classifyStockAvailability(
+        result,
+        deliveryStockAvailabilitySources(activeOrder, activeDelivery, activeWarehouseRef),
+      );
+      setStockValidation({ key: stockKey, ok: result.can_confirm, text, lines: stockValidationLines(availability), availability });
       setWarehouseConflict(null);
       setMessage({ tone: result.can_confirm ? "success" : "danger", text });
     } catch (apiError) {
       setStockValidation(null);
+      setAvailableConfirmation(null);
       handleDeliveryCommandError(apiError, "Stock no validado.");
     } finally {
       setProcessing(false);
@@ -1141,11 +1193,80 @@ export function DeliveryExpeditionPage() {
       setActiveDeliveryId(confirmed.id);
       setSummaryDeliveryId(confirmed.id);
       setStockValidation(null);
+      setAvailableConfirmation(null);
       setWarehouseConflict(null);
       setMessage({ tone: "success", text: `${confirmed.delivery_number} confirmada; stock reservado.` });
       return confirmed;
     } catch (apiError) {
       handleDeliveryCommandError(apiError, "Confirmacion fallida.");
+      return null;
+    } finally {
+      setProcessing(false);
+    }
+  }
+
+  function deliveryWithAvailableQuantities(delivery: DeliveryDraft, availability: StockAvailabilityLine[], lineId?: string): DeliveryDraft {
+    const availableByLine = new Map(availability.map((line) => [line.id, line]));
+    return {
+      ...delivery,
+      lines: delivery.lines.map((line) => {
+        const availableLine = availableByLine.get(line.lineId);
+        if (!availableLine || (lineId && availableLine.id !== lineId)) {
+          return { ...line, qty: 0 };
+        }
+        return { ...line, qty: Math.max(0, availableLine.availableDeliveryQty) };
+      }),
+    };
+  }
+
+  async function confirmAvailableActiveDelivery(lineId?: string) {
+    if (!activeOrder || !activeDelivery || activeDelivery.source !== "draft") {
+      setMessage({ tone: "danger", text: "Solo se puede confirmar disponibles desde un borrador." });
+      return null;
+    }
+    const availability = activeStockValidation?.availability ?? [];
+    const adjustedDelivery = deliveryWithAvailableQuantities(activeDelivery, availability, lineId);
+    const lines = adjustedDelivery.lines
+      .filter((line) => line.qty > 0)
+      .map((line) => ({ fulfillment_line_id: line.lineId, delivery_unit_qty: line.qty }));
+    if (!lines.length) {
+      setMessage({ tone: "danger", text: "Sin cantidades disponibles para confirmar." });
+      return null;
+    }
+    setProcessing(true);
+    try {
+      const result = await checkFulfillmentStock(activeOrder.id, lines, expeditionCommandOptions);
+      const adjustedKey = deliveryStockKey(activeOrder, adjustedDelivery, activeWarehouseRef);
+      const adjustedAvailability = classifyStockAvailability(
+        result,
+        deliveryStockAvailabilitySources(activeOrder, adjustedDelivery, activeWarehouseRef),
+      );
+      if (!result.can_confirm) {
+        setDraftState({ orderId: activeOrder.id, delivery: adjustedDelivery });
+        setStockValidation({
+          key: adjustedKey,
+          ok: false,
+          text: formatStockValidationIssues(result),
+          lines: stockValidationLines(adjustedAvailability),
+          availability: adjustedAvailability,
+        });
+        setMessage({ tone: "warning", text: "El stock disponible cambio. Revisa las cantidades actualizadas." });
+        return null;
+      }
+      const deliveryToConfirm = await persistDraftDelivery(adjustedDelivery);
+      const confirmed = await confirmDeliveryStock(deliveryToConfirm.id, expeditionCommandOptions);
+      if (submittedSearch) {
+        await loadQueue(submittedSearch, { silent: true });
+      }
+      setActiveDeliveryId(confirmed.id);
+      setSummaryDeliveryId(confirmed.id);
+      setStockValidation(null);
+      setAvailableConfirmation(null);
+      setWarehouseConflict(null);
+      setMessage({ tone: "success", text: `${confirmed.delivery_number} confirmada parcialmente; stock reservado.` });
+      return confirmed;
+    } catch (apiError) {
+      handleDeliveryCommandError(apiError, "Confirmacion parcial fallida.");
       return null;
     } finally {
       setProcessing(false);
@@ -1298,19 +1419,7 @@ export function DeliveryExpeditionPage() {
   const summaryPartialInfo = getPartialConfirmedInfo(activeOrder, summaryDelivery, visibleDeliveries);
   const activeImpactBadges = orderImpactBadges(activeOrder);
   const activeOrderHasDispatchableQty = activeOrder ? hasDispatchableDeliveryQty(activeOrder) : false;
-  const activeDeliveryStockKey =
-    activeOrder && activeDelivery
-      ? [
-          activeOrder.id,
-          activeDelivery.id,
-          activeDelivery.source,
-          activeDelivery.status,
-          activeWarehouseRef,
-          activeDelivery.mode,
-          activeDelivery.plannedDate,
-          activeDelivery.lines.map((line) => `${line.lineId}:${line.qty}:${line.warehouse ?? ""}`).join("|"),
-        ].join("::")
-      : "";
+  const activeDeliveryStockKey = deliveryStockKey(activeOrder, activeDelivery, activeWarehouseRef);
   const activeStockValidation = stockValidation?.key === activeDeliveryStockKey ? stockValidation : null;
   const canValidateActiveDeliveryStock =
     !!activeDelivery &&
@@ -1323,6 +1432,20 @@ export function DeliveryExpeditionPage() {
     activeDeliveryQty > 0 &&
     !(activeDelivery.status === "draft" && activeDeliveryHasInvalidQty) &&
     activeStockValidation?.ok === true;
+  const canConfirmAvailableActiveDelivery =
+    !!activeDelivery &&
+    activeDelivery.source === "draft" &&
+    activeDelivery.status === "draft" &&
+    Boolean(activeStockValidation && activeStockValidation.ok === false && hasConfirmableStock(activeStockValidation.availability)) &&
+    !processing;
+  const availableConfirmationLines = activeStockValidation?.availability ?? [];
+  const scopedAvailableConfirmationLines = availableConfirmation?.lineId
+    ? availableConfirmationLines.filter((line) => line.id === availableConfirmation.lineId)
+    : availableConfirmationLines;
+  const availableLinesToConfirm = scopedAvailableConfirmationLines.filter((line) => line.confirmQty > 0);
+  const availableLinesNotConfirmed = availableConfirmation?.lineId
+    ? []
+    : scopedAvailableConfirmationLines.filter((line) => line.status === "missing");
   const workflowActions = (
     <div className="flex flex-wrap items-center gap-2">
       <button
@@ -1356,6 +1479,14 @@ export function DeliveryExpeditionPage() {
         className="min-h-10 rounded border border-primary/30 bg-primary/10 px-3 text-[12px] font-semibold text-primaryHover transition hover:bg-primary/15 focus:outline-none focus:ring-2 focus:ring-primary/20 disabled:bg-softStart"
       >
         Confirmar entrega
+      </button>
+      <button
+        type="button"
+        disabled={!canConfirmAvailableActiveDelivery}
+        onClick={() => setAvailableConfirmation({})}
+        className="min-h-10 rounded border border-amber-300 bg-amber-50 px-3 text-[12px] font-semibold text-amber-800 transition hover:bg-amber-100 focus:outline-none focus:ring-2 focus:ring-amber-500/20 disabled:bg-softStart disabled:text-secondaryText"
+      >
+        Confirmar Disponibles
       </button>
       <button
         type="button"
@@ -1635,38 +1766,49 @@ export function DeliveryExpeditionPage() {
                       const lineVolume = commercialQty * line.unitVolumeM3;
                       const issue = plannedUnits > maxUnits;
                       const lineStockValidation = activeStockValidation?.lines[line.id];
+                      const validationStatus = lineStockValidation?.status;
                       const stockToneValue: StatusTone = lineStockValidation
-                        ? lineStockValidation.status === "issue"
+                        ? validationStatus === "missing"
                           ? "danger"
-                          : "success"
+                          : validationStatus === "partial"
+                            ? "warning"
+                            : "success"
                         : maxUnits <= 0
                           ? "danger"
                           : issue
                             ? "warning"
                             : "success";
                       const stockLabel = lineStockValidation
-                        ? lineStockValidation.status === "issue"
+                        ? validationStatus === "missing"
                           ? "sin stock"
-                          : "stock ok"
+                          : validationStatus === "partial"
+                            ? "parcial"
+                            : "stock ok"
                         : maxUnits <= 0
                           ? "bloqueado"
                           : issue
                             ? "rev."
                             : "ok";
                       const rowClass = lineStockValidation
-                        ? lineStockValidation.status === "issue"
+                        ? validationStatus === "missing"
                           ? "border-rose-200 bg-rose-50 hover:bg-rose-100"
-                          : "border-emerald-200 bg-emerald-50 hover:bg-emerald-100"
+                          : validationStatus === "partial"
+                            ? "border-amber-200 bg-amber-50 hover:bg-amber-100"
+                            : "border-emerald-200 bg-emerald-50 hover:bg-emerald-100"
                         : "border-borderSoft bg-white hover:bg-softStart";
                       const rowMarkerClass = lineStockValidation
-                        ? lineStockValidation.status === "issue"
+                        ? validationStatus === "missing"
                           ? "border-l-4 border-l-rose-500"
-                          : "border-l-4 border-l-emerald-500"
+                          : validationStatus === "partial"
+                            ? "border-l-4 border-l-amber-500"
+                            : "border-l-4 border-l-emerald-500"
                         : "";
                       const availableClass = lineStockValidation
-                        ? lineStockValidation.status === "issue"
+                        ? validationStatus === "missing"
                           ? "text-rose-700"
-                          : "text-emerald-700"
+                          : validationStatus === "partial"
+                            ? "text-amber-700"
+                            : "text-emerald-700"
                         : "text-primaryHover";
                       const lineInputDisabled = !canEditActiveDelivery || activeDelivery?.status !== "draft" || maxUnits <= 0;
 
@@ -1693,7 +1835,12 @@ export function DeliveryExpeditionPage() {
                             <div>{formatQty(maxUnits, line.deliveryUom)}</div>
                             {lineStockValidation && (
                               <div className="mt-1 text-[11px]">
-                                val. {lineStockValidation.availableQty}
+                                disp. {lineStockValidation.availableDeliveryQty}
+                              </div>
+                            )}
+                            {lineStockValidation?.status === "partial" && (
+                              <div className="mt-1 text-[11px] text-amber-700">
+                                falta {lineStockValidation.missingDeliveryQty}
                               </div>
                             )}
                           </td>
@@ -1711,7 +1858,15 @@ export function DeliveryExpeditionPage() {
                               value={plannedUnits}
                               onChange={(event) => updateLineQty(line.id, event.target.value)}
                               className={`h-9 w-24 rounded border bg-white px-2 font-mono text-[12px] text-night outline-none focus:border-primary focus:ring-2 focus:ring-primary/20 disabled:bg-softStart ${
-                                lineStockValidation?.status === "issue" ? "border-rose-300" : lineStockValidation?.status === "ok" ? "border-emerald-300" : issue ? "border-red-300" : "border-borderSoft"
+                                lineStockValidation?.status === "missing"
+                                  ? "border-rose-300"
+                                  : lineStockValidation?.status === "partial"
+                                    ? "border-amber-300"
+                                    : lineStockValidation?.status === "ok"
+                                      ? "border-emerald-300"
+                                      : issue
+                                        ? "border-red-300"
+                                        : "border-borderSoft"
                               }`}
                             />
                           </td>
@@ -1720,7 +1875,19 @@ export function DeliveryExpeditionPage() {
                             <div className="mt-1 text-[11px] text-secondaryText">{formatMeasure(lineVolume, "m3", 4)}</div>
                           </td>
                           <td className="whitespace-nowrap px-3 py-2">
-                            <StatusBadge label={stockLabel} tone={stockToneValue} />
+                            <div className="grid gap-1">
+                              <StatusBadge label={stockLabel} tone={stockToneValue} />
+                              {lineStockValidation?.status === "partial" && (
+                                <button
+                                  type="button"
+                                  disabled={!canConfirmAvailableActiveDelivery || processing}
+                                  onClick={() => setAvailableConfirmation({ lineId: line.id })}
+                                  className="min-h-8 rounded border border-amber-300 bg-white px-2 text-[11px] font-semibold text-amber-800 transition hover:bg-amber-100 focus:outline-none focus:ring-2 focus:ring-amber-500/20 disabled:bg-softStart disabled:text-secondaryText"
+                                >
+                                  Entregar disponible
+                                </button>
+                              )}
+                            </div>
                           </td>
                         </tr>
                       );
@@ -1904,6 +2071,91 @@ export function DeliveryExpeditionPage() {
           </div>
         </aside>
       </section>
+      {availableConfirmation && activeStockValidation && (
+        <div
+          className="fixed inset-0 z-50 grid place-items-center bg-deep/45 px-4 py-6"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="available-confirmation-title"
+          aria-describedby="available-confirmation-description"
+          onKeyDown={(event) => {
+            if (event.key === "Escape" && !processing) {
+              setAvailableConfirmation(null);
+            }
+          }}
+        >
+          <div className="w-full max-w-2xl rounded border border-borderSoft bg-white shadow-panel">
+            <div className="border-b border-borderSoft px-4 py-3">
+              <p className="text-[11px] font-semibold uppercase text-amber-700">Confirmacion requerida</p>
+              <h2 id="available-confirmation-title" className="mt-1 text-[16px] font-semibold text-night">
+                Confirmar disponibles
+              </h2>
+            </div>
+            <div className="grid max-h-[70vh] gap-3 overflow-auto px-4 py-3">
+              <p id="available-confirmation-description" className="text-[13px] leading-5 text-secondaryText">
+                Se va a confirmar una entrega parcial con el stock disponible. Las lineas sin cantidad entregable quedan pendientes para otra entrega.
+              </p>
+              <section className="rounded border border-amber-200 bg-amber-50 px-3 py-2">
+                <h3 className="text-[12px] font-semibold text-amber-900">Se confirmara ahora</h3>
+                <div className="mt-2 grid gap-2">
+                  {availableLinesToConfirm.map((line) => (
+                    <div key={line.id} className="grid gap-1 rounded border border-amber-200 bg-white px-2 py-2 text-[12px] md:grid-cols-[minmax(160px,1fr)_auto]">
+                      <div className="min-w-0">
+                        <div className="font-mono font-semibold text-night">{line.itemRef}</div>
+                        <div className="truncate text-secondaryText">{line.itemName || "sin descripcion"}</div>
+                      </div>
+                      <div className="font-mono text-night">
+                        {formatQty(line.availableDeliveryQty, line.deliveryUom || line.uom)}
+                        {line.status === "partial" && (
+                          <span className="ml-2 text-amber-700">falta {formatQty(line.missingDeliveryQty, line.deliveryUom || line.uom)}</span>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                  {!availableLinesToConfirm.length && <div className="text-[12px] text-secondaryText">Sin lineas disponibles.</div>}
+                </div>
+              </section>
+              {!!availableLinesNotConfirmed.length && (
+                <section className="rounded border border-rose-200 bg-rose-50 px-3 py-2">
+                  <h3 className="text-[12px] font-semibold text-rose-900">No se entregara ahora</h3>
+                  <div className="mt-2 grid gap-2">
+                    {availableLinesNotConfirmed.map((line) => (
+                      <div key={line.id} className="grid gap-1 rounded border border-rose-200 bg-white px-2 py-2 text-[12px] md:grid-cols-[minmax(160px,1fr)_auto]">
+                        <div className="min-w-0">
+                          <div className="font-mono font-semibold text-night">{line.itemRef}</div>
+                          <div className="truncate text-secondaryText">{line.itemName || "sin descripcion"}</div>
+                        </div>
+                        <div className="font-mono text-rose-700">
+                          solicitado {formatQty(line.requestedDeliveryQty, line.deliveryUom || line.uom)} / disponible 0
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </section>
+              )}
+            </div>
+            <div className="flex flex-wrap justify-end gap-2 border-t border-borderSoft px-4 py-3">
+              <button
+                type="button"
+                disabled={processing}
+                onClick={() => setAvailableConfirmation(null)}
+                className="min-h-10 rounded border border-borderSoft bg-white px-3 text-[12px] font-semibold text-night transition hover:border-primary hover:text-primaryHover focus:outline-none focus:ring-2 focus:ring-primary/20 disabled:cursor-not-allowed disabled:bg-softStart disabled:text-secondaryText"
+              >
+                Cancelar
+              </button>
+              <button
+                ref={availableConfirmRef}
+                type="button"
+                disabled={processing || !availableLinesToConfirm.length}
+                onClick={() => void confirmAvailableActiveDelivery(availableConfirmation.lineId)}
+                className="min-h-10 rounded bg-amber-600 px-3 text-[12px] font-semibold text-white transition hover:bg-amber-700 focus:outline-none focus:ring-2 focus:ring-amber-500/30 disabled:cursor-not-allowed disabled:bg-softStart disabled:text-secondaryText"
+              >
+                {processing ? "Confirmando..." : "Confirmar Disponibles"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       {warehouseConflict && (
         <div
           className="fixed inset-0 z-50 grid place-items-center bg-deep/45 px-4 py-6"
@@ -1936,7 +2188,7 @@ export function DeliveryExpeditionPage() {
                 <dt className="font-semibold text-secondaryText">Entrega</dt>
                 <dd className="font-mono text-night">{warehouseConflict.deliveryNumber}</dd>
                 <dt className="font-semibold text-secondaryText">Estado</dt>
-                <dd className="font-mono text-night">{warehouseConflict.status || "confirmed"}</dd>
+                <dd className="font-mono text-night">{translateStatusLabel(warehouseConflict.status || "confirmed")}</dd>
               </dl>
             </div>
             <div className="flex flex-wrap justify-end gap-2 border-t border-borderSoft px-4 py-3">

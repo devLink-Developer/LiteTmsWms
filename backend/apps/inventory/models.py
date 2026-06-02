@@ -57,6 +57,7 @@ class InventoryLedgerEntry(TimestampedModel, LegacyReferenceModel):
         ADJUSTMENT = "adjustment", "Ajuste"
         TRANSFORMATION_IN = "transformation_in", "Transformacion entrada"
         TRANSFORMATION_OUT = "transformation_out", "Transformacion salida"
+        LOCATION_TRANSFER = "location_transfer", "Movimiento entre posiciones"
         WRITE_OFF = "write_off", "Baja de inventario"
         REVERSAL = "reversal", "Reversa"
 
@@ -68,6 +69,7 @@ class InventoryLedgerEntry(TimestampedModel, LegacyReferenceModel):
     direction = models.CharField(max_length=20, choices=Direction.choices)
     stock_state = models.CharField(max_length=30, choices=StockState.choices)
     location_ref = models.CharField(max_length=120, blank=True)
+    lot_ref = models.CharField(max_length=80, blank=True)
     quantity = models.DecimalField(max_digits=18, decimal_places=6, validators=[MinValueValidator(0)])
     uom = models.CharField(max_length=20)
     document_type = models.CharField(max_length=80)
@@ -179,6 +181,8 @@ class InventoryTransformationLine(TimestampedModel, LegacyReferenceModel):
         on_delete=models.CASCADE,
     )
     role = models.CharField(max_length=20, choices=LineRole.choices)
+    location_ref = models.CharField(max_length=120, blank=True)
+    lot_ref = models.CharField(max_length=80, blank=True)
     quantity = models.DecimalField(max_digits=18, decimal_places=6)
     uom = models.CharField(max_length=20)
     parent_line_ref = models.CharField(max_length=80, blank=True)
@@ -280,6 +284,8 @@ class PurchaseOrderReceiptLine(TimestampedModel, LegacyReferenceModel):
     expected_qty = models.DecimalField(max_digits=18, decimal_places=6)
     received_qty = models.DecimalField(max_digits=18, decimal_places=6, default=0)
     difference_qty = models.DecimalField(max_digits=18, decimal_places=6, default=0)
+    location_ref = models.CharField(max_length=120, blank=True)
+    lot_ref = models.CharField(max_length=80, blank=True)
     uom = models.CharField(max_length=20)
     incident_ref = models.CharField(max_length=80, blank=True)
 

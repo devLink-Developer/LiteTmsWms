@@ -1,4 +1,5 @@
 import type { StatusTone } from "../../types/operations";
+import { translateStatusLabel } from "../utils/statusLabels";
 
 const toneClasses: Record<StatusTone, string> = {
   neutral: "border-borderSoft bg-surface text-secondaryText",
@@ -16,7 +17,7 @@ type StatusBadgeProps = {
 export function StatusBadge({ label, tone = "neutral" }: StatusBadgeProps) {
   return (
     <span className={`inline-flex min-h-6 items-center rounded border px-2 text-[11px] font-semibold uppercase ${toneClasses[tone]}`}>
-      {label}
+      {translateStatusLabel(label)}
     </span>
   );
 }

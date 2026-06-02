@@ -1,7 +1,7 @@
 import { AlertTriangle, Boxes, ChevronLeft, ChevronRight, FilterX, Layers3, PackageSearch, RefreshCw, Search, Warehouse } from "lucide-react";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 
-import { fetchInventoryStockReport, type InventoryBalance, type InventoryStockReportRow } from "../../api/inventory";
+import { fetchInventoryStockReport, type InventoryStockReportRow } from "../../api/inventory";
 import { fetchWarehouseOptionsForStore, type WarehouseOption } from "../../api/routing";
 import { StatusBadge } from "../../shared/components/StatusBadge";
 import { notify } from "../../shared/components/toast";
@@ -29,32 +29,12 @@ type KpiTile = {
 
 const quantityColumns: QuantityColumn[] = [
   { key: "packed", label: "Disponible entrega", shortLabel: "Entrega", tone: "success" },
+  { key: "reserved", label: "Reservado", shortLabel: "Reservado", tone: "warning" },
+  { key: "picking", label: "En preparacion", shortLabel: "Preparacion", tone: "warning" },
   { key: "on_hand", label: "Disponible fisico", shortLabel: "Fisico", tone: "info" },
+  { key: "in_transit", label: "En transito", shortLabel: "Transito", tone: "info" },
+  { key: "scrapped", label: "Roto/Merma", shortLabel: "Merma", tone: "danger" },
 ];
-
-const stateLabels: Record<string, string> = {
-  on_hand: "Disponible",
-  reserved: "Reservado",
-  picking: "En preparacion",
-  packed: "Preparado",
-  in_transit: "En transito",
-  delivered: "Entregado",
-  adjusted: "Ajustado",
-  scrapped: "Roto",
-  converted: "Convertido",
-};
-
-const stateTones: Record<string, StatusTone> = {
-  on_hand: "success",
-  reserved: "warning",
-  picking: "warning",
-  packed: "info",
-  in_transit: "info",
-  delivered: "neutral",
-  adjusted: "neutral",
-  scrapped: "danger",
-  converted: "neutral",
-};
 
 const emptyFilters: StockFilters = {
   warehouse: "",
@@ -67,14 +47,6 @@ const emptyFilters: StockFilters = {
   quality: "",
   search: "",
 };
-
-function stateLabel(value: string) {
-  return stateLabels[value] ?? value;
-}
-
-function stateTone(value: string): StatusTone {
-  return stateTones[value] ?? "info";
-}
 
 function asNumber(value: string | number | undefined) {
   const parsed = Number(value ?? 0);
@@ -95,10 +67,6 @@ function compactValue(value?: string) {
 
 function rowLocation(row: InventoryStockReportRow) {
   return row.warehouse_location_ref || row.location_ref || "";
-}
-
-function rowAvailableQuantity(row: InventoryStockReportRow) {
-  return rowQuantity(row, "packed") + rowQuantity(row, "on_hand");
 }
 
 function rowCategory(row: InventoryStockReportRow) {
@@ -127,7 +95,7 @@ function rowTotal(row: InventoryStockReportRow) {
 }
 
 function buildKpis(rows: InventoryStockReportRow[], visibleRows: InventoryStockReportRow[], allowedWarehouses: string[]): KpiTile[] {
-  const totalAvailable = visibleRows.reduce((total, row) => total + rowAvailableQuantity(row), 0);
+  const totalStock = visibleRows.reduce((total, row) => total + rowTotal(row), 0);
   return [
     {
       label: "Posiciones",
@@ -142,15 +110,15 @@ function buildKpis(rows: InventoryStockReportRow[], visibleRows: InventoryStockR
       tone: "success",
     },
     {
-      label: "Disponible",
-      value: formatNumber(totalAvailable),
-      hint: "unidades visibles",
-      tone: totalAvailable ? "success" : "neutral",
+      label: "Stock total",
+      value: formatNumber(totalStock),
+      hint: "todos los estados",
+      tone: totalStock ? "success" : "neutral",
     },
     {
       label: "Ubicaciones",
       value: String(uniqueSorted(visibleRows.map(rowLocation)).length),
-      hint: "dispatchables",
+      hint: "visibles",
       tone: visibleRows.length ? "success" : "neutral",
     },
   ];
@@ -285,8 +253,32 @@ function QuantityCell({ value, uom, tone }: QuantityCellProps) {
   );
 }
 
-function balanceRows(row: InventoryStockReportRow): InventoryBalance[] {
-  return row.balances ?? [];
+function selectedItemLocationRows(rows: InventoryStockReportRow[], selectedRow: InventoryStockReportRow) {
+  return rows
+    .filter((row) => row.warehouse_ref === selectedRow.warehouse_ref && row.item_ref === selectedRow.item_ref)
+    .sort((left, right) => {
+      const locationCompare = rowLocation(left).localeCompare(rowLocation(right));
+      if (locationCompare) return locationCompare;
+      const lotCompare = (left.lot_ref || "").localeCompare(right.lot_ref || "");
+      if (lotCompare) return lotCompare;
+      return left.uom.localeCompare(right.uom);
+    });
+}
+
+function quantitySummary(rows: InventoryStockReportRow[], state: QuantityState) {
+  const grouped = new Map<string, number>();
+  rows.forEach((row) => {
+    grouped.set(row.uom, (grouped.get(row.uom) ?? 0) + rowQuantity(row, state));
+  });
+  return Array.from(grouped.entries()).map(([uom, value]) => ({ uom, value }));
+}
+
+function formatQuantitySummary(rows: InventoryStockReportRow[], state: QuantityState) {
+  const summary = quantitySummary(rows, state).filter((entry) => entry.value > 0);
+  if (!summary.length) {
+    return "-";
+  }
+  return summary.map((entry) => formatQuantity(entry.value, entry.uom)).join(" / ");
 }
 
 export function StockBalancesPage() {
@@ -320,8 +312,6 @@ export function StockBalancesPage() {
         lot: filters.lot,
         pallet: filters.pallet,
         quality: filters.quality,
-        state: "packed,on_hand",
-        locationScope: "available",
         search: serverSearch,
         limit: filters.item || filters.location || filters.supplier || filters.category || filters.lot || filters.pallet || filters.quality || serverSearch ? 500 : 300,
       });
@@ -367,7 +357,7 @@ export function StockBalancesPage() {
 
   const visibleRows = useMemo(() => applyFilters(rows, filters), [rows, filters]);
   const selectedRow = visibleRows.find((row) => row.id === selectedId) ?? visibleRows[0];
-  const selectedBalances = selectedRow ? balanceRows(selectedRow) : [];
+  const selectedLocationRows = selectedRow ? selectedItemLocationRows(rows, selectedRow) : [];
   const warehouseCodes = allowedWarehouses.length
     ? allowedWarehouses
     : uniqueSorted(warehouseOptions.map((warehouse) => warehouse.warehouse_code));
@@ -383,7 +373,7 @@ export function StockBalancesPage() {
   }
 
   return (
-    <div className={`grid h-full min-h-0 grid-cols-1 gap-2 overflow-hidden p-2 ${detailOpen ? "xl:grid-cols-[minmax(0,1fr)_320px]" : ""}`}>
+    <div className={`grid h-full min-h-0 grid-cols-1 gap-2 overflow-hidden p-2 ${detailOpen ? "xl:grid-cols-[minmax(0,1fr)_440px]" : ""}`}>
       <section className="flex min-h-0 min-w-0 flex-col gap-2 overflow-hidden">
         <header className="flex shrink-0 flex-wrap items-center justify-between gap-2">
           <div className="min-w-0">
@@ -521,7 +511,7 @@ export function StockBalancesPage() {
           </div>
 
           <div className="min-h-0 flex-1 overflow-auto">
-            <table className="w-full min-w-[1260px] border-collapse text-left text-[12px]">
+            <table className="w-full min-w-[1540px] border-collapse text-left text-[12px]">
               <thead className="sticky top-0 z-10 bg-deep text-white">
                 <tr>
                   <th className="w-[120px] px-2 py-2 font-semibold">Almacen</th>
@@ -577,7 +567,7 @@ export function StockBalancesPage() {
                 })}
                 {!visibleRows.length && (
                   <tr>
-                    <td colSpan={14} className="px-3 py-12 text-center text-[12px] text-secondaryText">
+                    <td colSpan={18} className="px-3 py-12 text-center text-[12px] text-secondaryText">
                       {loading ? "Cargando..." : hasActiveReportFilters ? "Sin stock." : "Sin filtros."}
                     </td>
                   </tr>
@@ -593,7 +583,7 @@ export function StockBalancesPage() {
           <div className="flex min-h-9 items-center justify-between border-b border-borderSoft px-3">
             <div className="flex items-center gap-2 text-[12px] font-semibold text-night">
               <Layers3 className="h-4 w-4 text-primaryHover" aria-hidden="true" />
-              Detalle compacto
+              Detalle por posiciones
             </div>
           </div>
           {selectedRow ? (
@@ -615,69 +605,77 @@ export function StockBalancesPage() {
                   <div className="rounded border border-borderSoft bg-softMid px-2 py-2">
                     <div className="flex items-center gap-2 text-[11px] font-semibold text-secondaryText">
                       <Boxes className="h-4 w-4" aria-hidden="true" />
-                      Total
+                      Posiciones
                     </div>
-                    <div className="mt-1 font-mono font-semibold text-night">{formatQuantity(rowTotal(selectedRow), selectedRow.uom)}</div>
+                    <div className="mt-1 font-mono font-semibold text-night">{selectedLocationRows.length}</div>
                   </div>
                 </div>
                 <dl className="grid grid-cols-2 gap-x-3 gap-y-1 text-[12px]">
-                  <dt className="font-semibold text-secondaryText">Ubicacion</dt>
-                  <dd className="font-mono text-night">{compactValue(rowLocation(selectedRow))}</dd>
-                  <dt className="font-semibold text-secondaryText">Nombre</dt>
-                  <dd className="text-night">{compactValue(selectedRow.location_name)}</dd>
-                  <dt className="font-semibold text-secondaryText">Zona / Pasillo</dt>
-                  <dd className="font-mono text-night">{compactValue(selectedRow.zone_ref)} / {compactValue(selectedRow.aisle)}</dd>
-                  <dt className="font-semibold text-secondaryText">Piso / Nivel / Pos.</dt>
-                  <dd className="font-mono text-night">{compactValue(selectedRow.floor)} / {compactValue(selectedRow.level)} / {compactValue(selectedRow.position)}</dd>
                   <dt className="font-semibold text-secondaryText">Rubro</dt>
                   <dd className="text-night">{compactValue(rowCategory(selectedRow))}</dd>
-                  <dt className="font-semibold text-secondaryText">Lote</dt>
-                  <dd className="font-mono text-night">{compactValue(selectedRow.lot_ref)}</dd>
+                  <dt className="font-semibold text-secondaryText">UOM seleccionada</dt>
+                  <dd className="font-mono text-night">{selectedRow.uom}</dd>
                 </dl>
               </section>
 
               <section className="grid gap-2 border-b border-borderSoft py-3">
-                <div className="text-[12px] font-semibold text-night">Saldo disponible</div>
+                <div className="text-[12px] font-semibold text-night">Resumen del articulo</div>
                 <div className="grid grid-cols-2 gap-2">
                   {quantityColumns.map((column) => (
                     <div key={column.key} className="rounded border border-borderSoft bg-white px-2 py-2">
                       <div className="flex items-center justify-between gap-2">
                         <span className="text-[11px] font-semibold text-secondaryText">{column.label}</span>
-                        <StatusBadge label={rowQuantity(selectedRow, column.key) > 0 ? "con saldo" : "cero"} tone={rowQuantity(selectedRow, column.key) > 0 ? column.tone : "neutral"} />
+                        <StatusBadge
+                          label={quantitySummary(selectedLocationRows, column.key).some((entry) => entry.value > 0) ? "con saldo" : "cero"}
+                          tone={quantitySummary(selectedLocationRows, column.key).some((entry) => entry.value > 0) ? column.tone : "neutral"}
+                        />
                       </div>
-                      <div className="mt-1 font-mono text-[15px] font-semibold text-night">{formatQuantity(rowQuantity(selectedRow, column.key), selectedRow.uom)}</div>
+                      <div className="mt-1 font-mono text-[14px] font-semibold text-night">{formatQuantitySummary(selectedLocationRows, column.key)}</div>
                     </div>
                   ))}
                 </div>
               </section>
 
-              <section className="min-h-0 py-3">
-                <div className="mb-2 text-[12px] font-semibold text-night">Movimientos base</div>
-                {selectedBalances.length ? (
-                  <div className="overflow-hidden rounded border border-borderSoft">
-                    <table className="w-full border-collapse text-left text-[12px]">
+              <section className="min-h-0 py-3" aria-label="Detalle por posiciones del articulo">
+                <div className="mb-2 flex items-center justify-between gap-2">
+                  <div className="text-[12px] font-semibold text-night">Ubicaciones del almacen</div>
+                  <StatusBadge label={`${selectedLocationRows.length} posiciones`} tone={selectedLocationRows.length ? "info" : "neutral"} />
+                </div>
+                {selectedLocationRows.length ? (
+                  <div className="overflow-auto rounded border border-borderSoft">
+                    <table className="w-full min-w-[720px] border-collapse text-left text-[12px]">
                       <thead className="bg-softMid text-secondaryText">
                         <tr>
-                          <th className="px-2 py-2 font-semibold">Estado</th>
-                          <th className="px-2 py-2 text-right font-semibold">Cantidad</th>
-                          <th className="px-2 py-2 text-right font-semibold">Version</th>
+                          <th className="px-2 py-2 font-semibold">Ubicacion</th>
+                          <th className="px-2 py-2 font-semibold">Nombre</th>
+                          <th className="px-2 py-2 font-semibold">Lote</th>
+                          {quantityColumns.map((column) => (
+                            <th key={column.key} className="px-2 py-2 text-right font-semibold">
+                              {column.shortLabel}
+                            </th>
+                          ))}
+                          <th className="px-2 py-2 text-right font-semibold">Total</th>
                         </tr>
                       </thead>
                       <tbody>
-                        {selectedBalances.map((balance) => (
-                          <tr key={balance.id} className="border-t border-borderSoft bg-white">
-                            <td className="px-2 py-2">
-                              <StatusBadge label={stateLabel(balance.stock_state)} tone={stateTone(balance.stock_state)} />
-                            </td>
-                            <td className="px-2 py-2 text-right font-mono text-night">{formatQuantity(balance.quantity, balance.uom)}</td>
-                            <td className="px-2 py-2 text-right font-mono text-secondaryText">{balance.version}</td>
+                        {selectedLocationRows.map((row) => (
+                          <tr key={row.id} className={`border-t border-borderSoft ${row.id === selectedRow.id ? "bg-blue-50" : "bg-white"}`}>
+                            <td className="whitespace-nowrap px-2 py-2 font-mono font-semibold text-night">{compactValue(rowLocation(row))}</td>
+                            <td className="px-2 py-2 text-secondaryText">{compactValue(row.location_name)}</td>
+                            <td className="whitespace-nowrap px-2 py-2 font-mono text-secondaryText">{compactValue(row.lot_ref)}</td>
+                            {quantityColumns.map((column) => (
+                              <td key={column.key} className="whitespace-nowrap px-2 py-2 text-right font-mono text-night">
+                                {rowQuantity(row, column.key) > 0 ? formatQuantity(rowQuantity(row, column.key), row.uom) : "-"}
+                              </td>
+                            ))}
+                            <td className="whitespace-nowrap px-2 py-2 text-right font-mono font-semibold text-night">{formatQuantity(rowTotal(row), row.uom)}</td>
                           </tr>
                         ))}
                       </tbody>
                     </table>
                   </div>
                 ) : (
-                  <div className="rounded border border-borderSoft bg-softMid px-3 py-2 text-[12px] text-secondaryText">Sin balances base.</div>
+                  <div className="rounded border border-borderSoft bg-softMid px-3 py-2 text-[12px] text-secondaryText">Sin posiciones para el articulo seleccionado.</div>
                 )}
               </section>
             </div>

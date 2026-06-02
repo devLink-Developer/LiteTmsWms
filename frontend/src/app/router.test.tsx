@@ -29,7 +29,11 @@ const authenticatedSession: SessionBootstrap = {
 function jsonResponse(payload: unknown) {
   return {
     ok: true,
+    status: 200,
+    statusText: "OK",
+    headers: new Headers({ "content-type": "application/json" }),
     json: async () => payload,
+    text: async () => JSON.stringify(payload),
   };
 }
 
@@ -111,8 +115,11 @@ describe("app router", () => {
     ["/maestros/choferes", "ABM de flota"],
     ["/maestros/almacenes", "Maestro de almacenes"],
     ["/ingresos/tr-depositos", "Transferencias entre sucursales"],
+    ["/ingresos/oc", "Ingresos por OC"],
     ["/ingresos/devoluciones", "Ingresos por devoluciones"],
     ["/stock/movimientos", "Movimientos de Stock"],
+    ["/operaciones/canje-lote-saldo", "Canje lote a saldo"],
+    ["/operaciones/alta-baja-articulos", "Alta y baja de articulos"],
     ["/operaciones/roturas-perdidas", "Roturas y perdidas"],
   ])("renders the operational route %s", async (path, heading) => {
     const router = renderRoute(path);
