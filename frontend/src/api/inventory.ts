@@ -461,8 +461,53 @@ export type InventoryLedgerEntry = {
   document_type: string;
   document_ref: string;
   reason?: string;
+  created_by?: string;
+  is_reversal?: boolean;
+  reversal_of?: string;
+  legacy_transaction_number?: string;
+  legacy_sales_order_number?: string;
+  legacy_line_id?: string;
   posted_at?: string;
 };
+
+export type InventoryLedgerFilters = {
+  search?: string;
+  warehouse?: string;
+  item?: string;
+  movementType?: string;
+  direction?: string;
+  stockState?: string;
+  location?: string;
+  lot?: string;
+  documentType?: string;
+  documentRef?: string;
+  dateFrom?: string;
+  dateTo?: string;
+  limit?: number;
+};
+
+function inventoryLedgerQuery(filters: InventoryLedgerFilters = {}) {
+  const params = new URLSearchParams();
+  if (filters.search) params.set("search", filters.search);
+  if (filters.warehouse) params.set("warehouse", filters.warehouse);
+  if (filters.item) params.set("item", filters.item);
+  if (filters.movementType) params.set("movement_type", filters.movementType);
+  if (filters.direction) params.set("direction", filters.direction);
+  if (filters.stockState) params.set("stock_state", filters.stockState);
+  if (filters.location) params.set("location", filters.location);
+  if (filters.lot) params.set("lot", filters.lot);
+  if (filters.documentType) params.set("document_type", filters.documentType);
+  if (filters.documentRef) params.set("document_ref", filters.documentRef);
+  if (filters.dateFrom) params.set("date_from", filters.dateFrom);
+  if (filters.dateTo) params.set("date_to", filters.dateTo);
+  if (filters.limit) params.set("limit", String(filters.limit));
+  const query = params.toString();
+  return query ? `?${query}` : "";
+}
+
+export async function fetchInventoryLedgerEntries(filters: InventoryLedgerFilters = {}) {
+  return requestJson<{ results?: InventoryLedgerEntry[] }>(`/api/v1/inventory/ledger/${inventoryLedgerQuery(filters)}`);
+}
 
 export type ManualStockAdjustmentPayload = {
   warehouse_ref: string;

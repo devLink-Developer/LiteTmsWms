@@ -40,6 +40,100 @@ button:disabled {
   opacity: 0.5;
 }
 
+th[data-sortable-table-header="true"] {
+  cursor: pointer;
+  user-select: none;
+}
+
+th[data-sortable-table-header="true"]:focus-visible {
+  outline: 2px solid rgb(31 107 180 / 55%);
+  outline-offset: -2px;
+}
+
+th[data-sortable-table-header="true"]::after {
+  content: "↕";
+  display: inline-block;
+  margin-left: 0.35rem;
+  font-size: 0.75em;
+  opacity: 0.7;
+}
+
+th[data-sortable-table-header="true"][data-sort-direction="asc"]::after {
+  content: "↑";
+  opacity: 1;
+}
+
+th[data-sortable-table-header="true"][data-sort-direction="desc"]::after {
+  content: "↓";
+  opacity: 1;
+}
+
+.delivery-expedition-table th,
+.delivery-expedition-table td {
+  padding: 0.375rem 0.5rem;
+}
+
+.delivery-expedition-table input {
+  height: 2rem;
+}
+
+.delivery-expedition-page {
+  overflow: auto;
+}
+
+.delivery-expedition-layout {
+  grid-template-areas:
+    "orders"
+    "main"
+    "side";
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(260px, auto) minmax(520px, auto) minmax(240px, auto);
+  overflow: visible;
+}
+
+.delivery-expedition-orders {
+  grid-area: orders;
+}
+
+.delivery-expedition-main {
+  grid-area: main;
+}
+
+.delivery-expedition-side {
+  grid-area: side;
+}
+
+@media (min-width: 1024px) {
+  .delivery-expedition-page {
+    overflow: hidden;
+  }
+
+  .delivery-expedition-layout {
+    grid-template-areas:
+      "orders main"
+      "orders side";
+    grid-template-columns: minmax(260px, 290px) minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) 46px;
+    overflow: hidden;
+  }
+
+  .delivery-expedition-layout--side-expanded {
+    grid-template-rows: minmax(0, 1fr) minmax(260px, 0.48fr);
+  }
+}
+
+@media (min-width: 1700px) {
+  .delivery-expedition-layout {
+    grid-template-areas: "orders main side";
+    grid-template-columns: 320px minmax(0, 1fr) 360px;
+    grid-template-rows: minmax(0, 1fr);
+  }
+
+  .delivery-expedition-side-toggle {
+    display: none;
+  }
+}
+
 ::selection {
   background: #1f6bb4;
   color: white;

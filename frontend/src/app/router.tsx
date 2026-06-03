@@ -17,6 +17,7 @@ import { RepartoConfirmationPage } from "../features/reparto/RepartoConfirmation
 import { RepartoPreparationPage } from "../features/reparto/RepartoPreparationPage";
 import { RoutePlanningPage } from "../features/routing/RoutePlanningPage";
 import { StockBalancesPage } from "../features/stock/StockBalancesPage";
+import { StockMovementsPage } from "../features/stock/StockMovementsPage";
 import { PreparationTasksPage } from "../features/tasks/PreparationTasksPage";
 import { TransfersPage } from "../features/transfers/TransfersPage";
 import { WarehouseMasterPage } from "../features/masters/WarehouseMasterPage";
@@ -63,6 +64,7 @@ export const appRoutes: RouteObject[] = [
       { path: "ingresos/oc", element: <PurchaseReceiptsPage /> },
       { path: "ingresos/tr-depositos", element: <TransfersPage /> },
       { path: "stock/almacenes", element: <StockBalancesPage /> },
+      { path: "stock/movimientos", element: <StockMovementsPage /> },
       { path: "operaciones/canje-lote-saldo", element: <InventoryExchangePage /> },
       { path: "operaciones/alta-baja-articulos", element: <ManualStockAdjustmentPage /> },
       { path: "operaciones/corte-chapas", element: <SheetCuttingPage /> },

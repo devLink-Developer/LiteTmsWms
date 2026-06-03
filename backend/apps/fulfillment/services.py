@@ -109,6 +109,21 @@ def _quantize_qty(value: Decimal) -> Decimal:
     return value.quantize(QTY_SCALE)
 
 
+def _display_qty(value) -> str:
+    qty = _to_decimal(value)
+    if qty == qty.to_integral_value():
+        return format(qty.quantize(ONE), "f")
+    return format(qty.normalize(), "f")
+
+
+def _ledger_idempotency_key(value: str) -> str:
+    key = str(value or "").strip()
+    if len(key) <= 120:
+        return key
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()
+    return f"ledger:{digest}"
+
+
 def _clean(value) -> str:
     return str(value or "").strip()
 
@@ -869,18 +884,18 @@ def _serialize_fulfillment_line(
         "prepared_qty": str(line.prepared_qty),
         "delivered_qty": str(line.delivered_qty),
         "cancelled_qty": str(line.cancelled_qty),
-        "returned_qty": str(returned_qty),
+        "returned_qty": _display_qty(returned_qty),
         "pending_qty": str(line.pending_qty),
-        "planned_qty": str(planned_qty),
-        "stock_available": str(packed_qty),
-        "max_dispatchable_qty": str(max_dispatchable_qty),
+        "planned_qty": _display_qty(planned_qty),
+        "stock_available": _display_qty(packed_qty),
+        "max_dispatchable_qty": _display_qty(max_dispatchable_qty),
         "uom": item_snapshot.get("sales_uom") or _display_uom(line.uom),
         "sap_uom": item_snapshot.get("sap_uom") or line.uom,
         "sales_uom": item_snapshot.get("sales_uom") or line.uom,
         "delivery_uom": item_snapshot.get("delivery_uom") or line.uom,
         "conversion_factor": str(conversion_factor),
-        "planned_delivery_unit_qty": str(planned_delivery_unit_qty),
-        "max_dispatchable_delivery_unit_qty": str(max_dispatchable_delivery_unit_qty),
+        "planned_delivery_unit_qty": _display_qty(planned_delivery_unit_qty),
+        "max_dispatchable_delivery_unit_qty": _display_qty(max_dispatchable_delivery_unit_qty),
         "unit_weight_kg": item_snapshot.get("unit_weight_kg", "0"),
         "unit_volume_m3": item_snapshot.get("unit_volume_m3", "0"),
         "planned_weight_kg": str(planned_weight_kg),
@@ -1657,67 +1672,6 @@ def _find_matching_fulfillment_line(fulfillment: FulfillmentOrder | None, legacy
     return queryset.order_by("legacy_line_id", "created_at").first()
 
 
-def _packed_location_for_decrease(*, warehouse_ref: str, item_ref: str, uom: str, quantity: Decimal, actor: str) -> str:
-    default_location = location_ref_for_purpose(warehouse_ref, "available", actor=actor)
-    balances = list(
-        InventoryBalance.objects.select_for_update()
-        .filter(
-            warehouse_ref=warehouse_ref,
-            item_ref=item_ref,
-            stock_state=StockState.PACKED,
-            uom=uom,
-            quantity__gt=ZERO,
-        )
-        .order_by("-location_ref", "created_at")
-    )
-    for preferred_ref in [default_location, ""]:
-        for balance in balances:
-            if balance.location_ref == preferred_ref and balance.quantity >= quantity:
-                return balance.location_ref
-    for balance in balances:
-        if balance.quantity >= quantity:
-            return balance.location_ref
-    return default_location
-
-
-def _post_impact_packed_decrease(
-    *,
-    impact: FulfillmentOrderImpact,
-    line: FulfillmentOrderImpactLine,
-    quantity: Decimal,
-    actor: str,
-) -> None:
-    if quantity <= ZERO:
-        return
-    warehouse_ref = line.warehouse_ref or impact.warehouse_ref
-    location_ref = _packed_location_for_decrease(
-        warehouse_ref=warehouse_ref,
-        item_ref=line.item_ref,
-        uom=line.uom,
-        quantity=quantity,
-        actor=actor,
-    )
-    post_ledger_entry(
-        LedgerCommand(
-            idempotency_key=f"legacy-impact:{impact.id}:{line.id}:annulment:{line.applied_qty}:{quantity}",
-            movement_type=InventoryLedgerEntry.MovementType.ADJUSTMENT,
-            direction=InventoryLedgerEntry.Direction.DECREASE,
-            warehouse_ref=warehouse_ref,
-            location_ref=location_ref,
-            item_ref=line.item_ref,
-            stock_state=StockState.PACKED,
-            quantity=quantity,
-            uom=line.uom,
-            document_type="legacy_annulment",
-            document_ref=impact.impact_sales_order_number or impact.source_pk,
-            actor=actor,
-            reason="Anulacion legacy",
-            legacy_sales_order_number=impact.legacy_sales_order_number,
-            legacy_line_id=line.legacy_line_id,
-        )
-    )
-
-
 def _post_return_stock_increase(
     *,
     impact: FulfillmentOrderImpact,
@@ -1730,7 +1684,7 @@ def _post_return_stock_increase(
     warehouse_ref = line.warehouse_ref or impact.warehouse_ref
     post_ledger_entry(
         LedgerCommand(
-            idempotency_key=f"legacy-impact:{impact.id}:{line.id}:return:{line.applied_qty}:{quantity}",
+            idempotency_key=_ledger_idempotency_key(f"legacy-impact:{impact.id}:{line.id}:return:{line.applied_qty}:{quantity}"),
             movement_type=InventoryLedgerEntry.MovementType.INBOUND_RECEIPT,
             direction=InventoryLedgerEntry.Direction.INCREASE,
             warehouse_ref=warehouse_ref,
@@ -1767,7 +1721,7 @@ def _release_reservation_line_for_annulment(
     target_location_ref = reservation_line.source_location_ref or location_ref_for_purpose(warehouse_ref, "available", actor=actor)
     post_ledger_entry(
         LedgerCommand(
-            idempotency_key=f"{idempotency_key}:source",
+            idempotency_key=_ledger_idempotency_key(f"{idempotency_key}:source"),
             movement_type=InventoryLedgerEntry.MovementType.RESERVATION_RELEASE,
             direction=InventoryLedgerEntry.Direction.DECREASE,
             warehouse_ref=warehouse_ref,
@@ -1786,7 +1740,7 @@ def _release_reservation_line_for_annulment(
     )
     post_ledger_entry(
         LedgerCommand(
-            idempotency_key=f"{idempotency_key}:packed",
+            idempotency_key=_ledger_idempotency_key(f"{idempotency_key}:packed"),
             movement_type=InventoryLedgerEntry.MovementType.RESERVATION_RELEASE,
             direction=InventoryLedgerEntry.Direction.INCREASE,
             warehouse_ref=warehouse_ref,
@@ -1948,7 +1902,6 @@ def _apply_order_impact(impact: FulfillmentOrderImpact, *, actor: str) -> Fulfil
             actor=actor,
             idempotency_key=f"legacy-impact:{impact.id}:{line.id}:release",
         )
-        _post_impact_packed_decrease(impact=impact, line=line, quantity=apply_qty, actor=actor)
         fulfillment_line.reserved_qty = max(ZERO, fulfillment_line.reserved_qty - reserved_released)
         fulfillment_line.prepared_qty = max(ZERO, fulfillment_line.prepared_qty - prepared_released)
         fulfillment_line.cancelled_qty += apply_qty
@@ -2187,6 +2140,20 @@ def process_legacy_impacts_for_order(*, sales_order_number: str, actor: str) -> 
             )
     except Exception:
         return
+
+
+def refresh_legacy_impacts_for_fulfillments(
+    fulfillments: list[FulfillmentOrder] | tuple[FulfillmentOrder, ...],
+    *,
+    actor: str,
+) -> None:
+    seen_order_numbers: set[str] = set()
+    for fulfillment in fulfillments:
+        order_number = str(fulfillment.legacy_sales_order_number or "").strip()
+        if not order_number or order_number in seen_order_numbers:
+            continue
+        seen_order_numbers.add(order_number)
+        process_legacy_impacts_for_order(sales_order_number=order_number, actor=actor)
 
 
 @transaction.atomic
@@ -3867,9 +3834,8 @@ def expedition_queue(
             filters |= Q(legacy_sales_order_number__in=fallback_order_numbers)
         fulfillments = list(fulfillment_queryset()[:100])
 
-    if sales_order_number:
-        for fulfillment in fulfillments:
-            process_legacy_impacts_for_order(sales_order_number=fulfillment.legacy_sales_order_number, actor="expedition.search")
+    if fulfillments:
+        refresh_legacy_impacts_for_fulfillments(fulfillments, actor="expedition.search")
         fulfillments = list(fulfillment_queryset()[:100])
 
     lines = [

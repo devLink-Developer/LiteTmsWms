@@ -434,8 +434,49 @@ class DeliveryPreparationFlowTests(TestCase):
         self.assertEqual(self.fulfillment_line.reserved_qty, Decimal("1"))
         self.assertEqual(self.delivery_line.planned_qty, Decimal("1"))
         self.assertEqual(reservation_line.reserved_qty, Decimal("1"))
-        self.assertEqual(packed.quantity, Decimal("2"))
+        self.assertEqual(packed.quantity, Decimal("4"))
         self.assertEqual(reserved.quantity, Decimal("1"))
+
+    def test_annulment_impact_cancels_pending_line_when_packed_stock_is_already_zero(self):
+        InventoryBalance.objects.filter(
+            warehouse_ref="W001",
+            item_ref="ITEM-1",
+            stock_state=StockState.PACKED,
+        ).update(quantity=Decimal("0"))
+        impact = FulfillmentOrderImpact.objects.create(
+            fulfillment=self.fulfillment,
+            impact_type=FulfillmentOrderImpact.ImpactType.ANNULMENT,
+            status=FulfillmentOrderImpact.ImpactStatus.PENDING,
+            impact_sales_order_number="ANU-SO-1",
+            impact_transaction_number="TX-ANU-1",
+            legacy_sales_order_number="SO-1",
+            warehouse_ref="W001",
+            source_table="transactions_orders_transaction",
+            source_pk="ANU-SO-1",
+            created_by="tester",
+        )
+        impact_line = FulfillmentOrderImpactLine.objects.create(
+            impact=impact,
+            fulfillment_line=self.fulfillment_line,
+            item_ref="ITEM-1",
+            warehouse_ref="W001",
+            legacy_sales_order_number="SO-1",
+            legacy_line_id="10",
+            source_table="transactions_orders_retailLineItem",
+            source_pk="ANU-SO-1-L1",
+            quantity=Decimal("1"),
+            uom="UN",
+        )
+
+        _apply_order_impact(impact, actor="tester")
+
+        self.fulfillment_line.refresh_from_db()
+        impact.refresh_from_db()
+        impact_line.refresh_from_db()
+        self.assertEqual(self.fulfillment_line.cancelled_qty, Decimal("1"))
+        self.assertEqual(impact_line.applied_qty, Decimal("1"))
+        self.assertEqual(impact.status, FulfillmentOrderImpact.ImpactStatus.APPLIED)
+        self.assertFalse(InventoryLedgerEntry.objects.filter(document_ref="ANU-SO-1").exists())
 
     def test_return_impact_posts_packed_stock_in_received_warehouse(self):
         impact = FulfillmentOrderImpact.objects.create(
@@ -524,6 +565,19 @@ class DeliveryPreparationFlowTests(TestCase):
 
         self.assertEqual([row["sales_order_number"] for row in by_order], ["SO-1"])
         self.assertEqual([row["customer_ref"] for row in by_customer], ["CUST-1"])
+
+    def test_expedition_queue_refreshes_legacy_impacts_for_customer_search(self):
+        customer = {"customer_ref": "CUST-1", "name": "Cliente Test", "document_number": "", "address": {}}
+        with (
+            patch("apps.fulfillment.services.process_legacy_impacts_for_order") as process_impacts,
+            patch("apps.fulfillment.services._resolve_customer_snapshots", return_value={"CUST-1": customer}),
+        ):
+            expedition_queue(customer_ref="cust-1", authorized_warehouses=["W001"])
+
+        process_impacts.assert_called_once_with(
+            sales_order_number="SO-1",
+            actor="expedition.search",
+        )
 
     def test_reassign_confirmed_delivery_moves_reservation_to_target_warehouse(self):
         validate_delivery_stock(

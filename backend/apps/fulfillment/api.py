@@ -24,10 +24,12 @@ from apps.fulfillment.services import (
     physical_delivery_lines_from_snapshots,
     physical_fulfillment_lines_from_snapshots,
     reassign_confirmed_delivery_warehouse,
+    refresh_legacy_impacts_for_fulfillments,
     send_delivery_to_prepare,
     split_fulfillment_delivery,
     validate_delivery_stock,
     _capacity_totals,
+    _delivery_unit_qty_from_commercial,
     _delivery_line_operational_qty,
     _delivery_line_snapshot,
     _display_uom,
@@ -504,6 +506,12 @@ def reparto_confirmation_queue(request):
 
     results = []
     delivery_rows = list(delivery_qs[:100])
+    if delivery_rows:
+        refresh_legacy_impacts_for_fulfillments(
+            [row.fulfillment for row in delivery_rows],
+            actor="reparto.confirmation",
+        )
+        delivery_rows = list(delivery_qs[:100])
     delivery_lines = [line for row in delivery_rows for line in list(row.lines.all())]
     delivery_snapshots = _resolve_line_item_snapshots([line.fulfillment_line for line in delivery_lines])
     for row in delivery_rows:
@@ -531,6 +539,12 @@ def reparto_confirmation_queue(request):
                 | Q(customer_ref__icontains=query)
             )
         fulfillment_rows = list(fulfillment_qs[:100])
+        if fulfillment_rows:
+            refresh_legacy_impacts_for_fulfillments(
+                fulfillment_rows,
+                actor="reparto.confirmation",
+            )
+            fulfillment_rows = list(fulfillment_qs[:100])
         fulfillment_lines = [line for row in fulfillment_rows for line in list(row.lines.all())]
         fulfillment_snapshots = _resolve_line_item_snapshots(fulfillment_lines)
         physical_lines = physical_fulfillment_lines_from_snapshots(fulfillment_lines, fulfillment_snapshots)

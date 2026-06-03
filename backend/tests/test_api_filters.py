@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import date
+from datetime import datetime
 from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -405,6 +406,52 @@ class ApiFilterTests(TestCase):
 
         self.assertEqual([row["document_ref"] for row in results], ["TR-100"])
 
+    def test_inventory_ledger_filters_by_posted_datetime_range(self):
+        current_tz = timezone.get_current_timezone()
+        self._create_ledger_entry(
+            idempotency_key="ledger-before-hour",
+            movement_type=InventoryLedgerEntry.MovementType.DISPATCH,
+            direction=InventoryLedgerEntry.Direction.DECREASE,
+            warehouse_ref="WH-A",
+            item_ref="ITEM-1",
+            stock_state=StockState.PACKED,
+            document_type="delivery_document",
+            document_ref="DOC-BEFORE",
+            posted_at=timezone.make_aware(datetime(2026, 6, 2, 9, 59), current_tz),
+        )
+        self._create_ledger_entry(
+            idempotency_key="ledger-hour-match",
+            movement_type=InventoryLedgerEntry.MovementType.DISPATCH,
+            direction=InventoryLedgerEntry.Direction.DECREASE,
+            warehouse_ref="WH-A",
+            item_ref="ITEM-1",
+            stock_state=StockState.PACKED,
+            document_type="delivery_document",
+            document_ref="DOC-MATCH",
+            posted_at=timezone.make_aware(datetime(2026, 6, 2, 10, 30), current_tz),
+        )
+        self._create_ledger_entry(
+            idempotency_key="ledger-after-hour",
+            movement_type=InventoryLedgerEntry.MovementType.DISPATCH,
+            direction=InventoryLedgerEntry.Direction.DECREASE,
+            warehouse_ref="WH-A",
+            item_ref="ITEM-1",
+            stock_state=StockState.PACKED,
+            document_type="delivery_document",
+            document_ref="DOC-AFTER",
+            posted_at=timezone.make_aware(datetime(2026, 6, 2, 12, 1), current_tz),
+        )
+
+        results = self._results(
+            "/api/v1/inventory/ledger/",
+            {
+                "date_from": "2026-06-02T10:00",
+                "date_to": "2026-06-02T12:00",
+            },
+        )
+
+        self.assertEqual([row["document_ref"] for row in results], ["DOC-MATCH"])
+
     def test_inventory_ledger_supports_reference_and_state_aliases(self):
         now = timezone.now()
         self._create_ledger_entry(
@@ -440,6 +487,53 @@ class ApiFilterTests(TestCase):
         )
 
         self.assertEqual([row["document_ref"] for row in results], ["RCPT-1"])
+
+    def test_inventory_ledger_supports_search_and_single_posted_date_alias(self):
+        now = timezone.now()
+        today = timezone.localdate(now).isoformat()
+        self._create_ledger_entry(
+            idempotency_key="ledger-search-match",
+            movement_type=InventoryLedgerEntry.MovementType.DISPATCH,
+            direction=InventoryLedgerEntry.Direction.DECREASE,
+            warehouse_ref="WH-A",
+            item_ref="100100",
+            stock_state=StockState.PACKED,
+            document_type="delivery_document",
+            document_ref="DOC-100100",
+            posted_at=now,
+        )
+        self._create_ledger_entry(
+            idempotency_key="ledger-search-old",
+            movement_type=InventoryLedgerEntry.MovementType.DISPATCH,
+            direction=InventoryLedgerEntry.Direction.DECREASE,
+            warehouse_ref="WH-A",
+            item_ref="100100",
+            stock_state=StockState.PACKED,
+            document_type="delivery_document",
+            document_ref="DOC-OLD",
+            posted_at=now - timedelta(days=1),
+        )
+        self._create_ledger_entry(
+            idempotency_key="ledger-search-other",
+            movement_type=InventoryLedgerEntry.MovementType.DISPATCH,
+            direction=InventoryLedgerEntry.Direction.DECREASE,
+            warehouse_ref="WH-A",
+            item_ref="200200",
+            stock_state=StockState.PACKED,
+            document_type="delivery_document",
+            document_ref="DOC-OTHER",
+            posted_at=now,
+        )
+
+        results = self._results(
+            "/api/v1/inventory/ledger/",
+            {
+                "q": "100100",
+                "planned_date": today,
+            },
+        )
+
+        self.assertEqual([row["document_ref"] for row in results], ["DOC-100100"])
 
     def test_inventory_receipts_filter_by_purchase_order_warehouse_status_and_item(self):
         receipt = PurchaseOrderReceipt.objects.create(
@@ -635,6 +729,42 @@ class ApiFilterTests(TestCase):
         self.assertEqual(results[0]["address_snapshot"]["address_id"], "ADDR-1")
         self.assertEqual(results[0]["address_snapshot"]["street"], "Uruguay")
         self.assertEqual(results[0]["lines"][0]["split_qty"], "2.000000")
+
+    @patch("apps.fulfillment.api.employee_delivery_permissions")
+    def test_reparto_confirmation_queue_refreshes_impacts_before_serializing_uncreated(self, employee_delivery_permissions):
+        employee_delivery_permissions.return_value = {"authorized_warehouses": ["WH-A"]}
+        planned_date = timezone.localdate()
+        fulfillment = FulfillmentOrder.objects.create(
+            fulfillment_number="FUL-102",
+            customer_ref="CUST-1",
+            delivery_mode="Repart Prg",
+            warehouse_ref="WH-A",
+            requested_date=planned_date,
+            legacy_sales_order_number="VENT8-102",
+        )
+        line = fulfillment.lines.create(
+            ordered_qty=Decimal("2"),
+            uom="UN",
+            item_ref="ITEM-1",
+            warehouse_ref="WH-A",
+            legacy_sales_order_number="VENT8-102",
+            legacy_line_id="10",
+        )
+
+        def cancel_fulfillment_lines(fulfillments, *, actor):
+            self.assertEqual(actor, "reparto.confirmation")
+            self.assertEqual([row.legacy_sales_order_number for row in fulfillments], ["VENT8-102"])
+            line.cancelled_qty = line.ordered_qty
+            line.save(update_fields=["cancelled_qty", "updated_at"])
+
+        with patch("apps.fulfillment.api.refresh_legacy_impacts_for_fulfillments", side_effect=cancel_fulfillment_lines) as refresh_impacts:
+            results = self._results(
+                "/api/v1/fulfillment/reparto-confirmation/",
+                {"planned_date": planned_date.isoformat()},
+            )
+
+        refresh_impacts.assert_called_once()
+        self.assertEqual(results, [])
 
     @patch("apps.fulfillment.api.employee_delivery_permissions")
     def test_reparto_confirmation_queue_filters_authorized_warehouse(self, employee_delivery_permissions):

@@ -193,7 +193,6 @@ export const routedOperationModules = [
   "transfers",
   "returns",
   "routes",
-  "stock-movements",
   "audits",
   "shipping",
 ].map(operationModuleByKey);

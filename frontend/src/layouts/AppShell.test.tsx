@@ -51,7 +51,7 @@ describe("AppShell", () => {
 
   function renderShell() {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
-    render(
+    return render(
       <QueryClientProvider client={client}>
         <MemoryRouter initialEntries={["/reparto/confirmacion"]}>
           <AppShell />
@@ -59,6 +59,18 @@ describe("AppShell", () => {
       </QueryClientProvider>,
     );
   }
+
+  it("starts with the desktop sidebar collapsed and opens on hover", async () => {
+    renderShell();
+
+    await waitFor(() => expect(screen.getByText("Contexto operativo PS003MT")).toBeInTheDocument());
+    const sidebar = screen.getByLabelText("Menu principal");
+    expect(sidebar).toHaveClass("w-3");
+
+    fireEvent.mouseEnter(sidebar);
+
+    expect(sidebar).toHaveClass("w-60");
+  });
 
   it("renders the grouped operations menu without Despacho tienda", async () => {
     renderShell();

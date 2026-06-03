@@ -15,6 +15,7 @@ describe("DeliveryExpeditionPage", () => {
   let activeLineStockIssue: boolean;
   let activeLinePartialStockIssue: boolean;
   let orderImpacts: boolean;
+  let cancellationScenario: "none" | "full" | "partial";
   let lastStockCheckBody: Record<string, unknown>;
   let lastSplitBody: Record<string, unknown>;
   let lastConfirmBody: Record<string, unknown>;
@@ -31,6 +32,7 @@ describe("DeliveryExpeditionPage", () => {
     activeLineStockIssue = false;
     activeLinePartialStockIssue = false;
     orderImpacts = false;
+    cancellationScenario = "none";
     lastStockCheckBody = {};
     lastSplitBody = {};
     lastConfirmBody = {};
@@ -564,21 +566,21 @@ describe("DeliveryExpeditionPage", () => {
                     coverage_group: "STK",
                     warehouse_ref: "PS003MT",
                     ordered_qty: fullRemittedOrder ? "1.44" : "18",
-                    reserved_qty: orderFullyAllocated || fullRemittedOrder ? "0" : "18",
-                    prepared_qty: orderFullyAllocated ? "18" : fullRemittedOrder ? "0" : "14",
-                    delivered_qty: fullRemittedOrder ? "0" : "6",
-                    cancelled_qty: orderImpacts ? "2.88" : "0",
+                    reserved_qty: orderFullyAllocated || fullRemittedOrder || cancellationScenario !== "none" ? "0" : "18",
+                    prepared_qty: orderFullyAllocated ? "18" : fullRemittedOrder || cancellationScenario !== "none" ? "0" : "14",
+                    delivered_qty: fullRemittedOrder || cancellationScenario !== "none" ? "0" : "6",
+                    cancelled_qty: cancellationScenario !== "none" ? "18" : orderImpacts ? "2.88" : "0",
                     returned_qty: orderImpacts ? "1.44" : "0",
-                    pending_qty: fullRemittedOrder ? "1.44" : "12",
-                    planned_qty: orderFullyAllocated ? "18" : fullRemittedOrder ? "1.44" : "10",
+                    pending_qty: cancellationScenario !== "none" ? "0" : fullRemittedOrder ? "1.44" : "12",
+                    planned_qty: cancellationScenario !== "none" ? "0" : orderFullyAllocated ? "18" : fullRemittedOrder ? "1.44" : "10",
                     stock_available: "14",
-                    max_dispatchable_qty: orderFullyAllocated || fullRemittedOrder ? "0" : "4",
+                    max_dispatchable_qty: orderFullyAllocated || fullRemittedOrder || cancellationScenario !== "none" ? "0" : "4",
                     uom: "m2",
                     sales_uom: "m2",
                     delivery_uom: "caja",
                     conversion_factor: "1.44",
                     planned_delivery_unit_qty: fullRemittedOrder ? "1" : "6.94",
-                    max_dispatchable_delivery_unit_qty: orderFullyAllocated || fullRemittedOrder ? "0" : "2",
+                    max_dispatchable_delivery_unit_qty: orderFullyAllocated || fullRemittedOrder || cancellationScenario !== "none" ? "0" : "2",
                     unit_weight_kg: "15",
                     unit_volume_m3: "0.02",
                     planned_weight_kg: "150",
@@ -597,8 +599,8 @@ describe("DeliveryExpeditionPage", () => {
                     reserved_qty: "0",
                     prepared_qty: "0",
                     delivered_qty: "0",
-                    cancelled_qty: "0",
-                    pending_qty: fullRemittedOrder ? "0" : "1",
+                    cancelled_qty: cancellationScenario === "full" ? "1" : "0",
+                    pending_qty: fullRemittedOrder || cancellationScenario === "full" ? "0" : "1",
                     planned_qty: "0",
                     stock_available: "0",
                     max_dispatchable_qty: "0",
@@ -614,121 +616,124 @@ describe("DeliveryExpeditionPage", () => {
                     planned_volume_m3: "0",
                   },
                 ],
-                deliveries: [
-                  {
-                    id: "del-184-1",
-                    delivery_number: "ENT-000184-1",
-                    status: deliveryStatus,
-                    delivery_mode: "Reparto programado",
-                    planned_date: "2026-04-24",
-                    warehouse_ref: "PS003MT",
-                    route_sheet: routeLocked
-                      ? {
-                          id: "route-1",
-                          route_number: "HR-000000123",
-                          status: "draft",
-                          stop_id: "stop-1",
-                          stop_status: "planned",
-                        }
-                      : null,
-                    documents: [],
-                    movements: [
-                      {
-                        key: "delivery:del-184-1:created",
-                        at: "2026-04-24T08:30:00Z",
-                        label: "Entrega creada",
-                        status: deliveryStatus,
-                        detail: "ENT-000184-1",
-                        actor: "operario-1",
-                        source_type: "delivery_order",
-                        source_ref: "del-184-1",
-                      },
-                    ],
-                    lines: [
-                      {
-                        id: "dl-1",
-                        fulfillment_line_id: "184-1",
-                        item_ref: "CER-104",
-                        planned_qty: "8.64",
-                        delivery_unit_qty: "6",
-                        delivery_uom: "caja",
-                        conversion_factor: "1.44",
-                        uom: "m2",
-                        warehouse_ref: "PS003MT",
-                      },
-                    ],
-                  },
-                  {
-                    id: "del-184-2",
-                    delivery_number: "ENT-000184-2",
-                    status: "planned",
-                    delivery_mode: "Reparto programado",
-                    planned_date: "2026-04-25",
-                    warehouse_ref: "PS003MT",
-                    documents: [],
-                    movements: [],
-                    lines: [
-                      {
-                        id: "dl-2",
-                        fulfillment_line_id: "184-1",
-                        item_ref: "CER-104",
-                        planned_qty: "5.76",
-                        delivery_unit_qty: "4",
-                        delivery_uom: "caja",
-                        conversion_factor: "1.44",
-                        uom: "m2",
-                        warehouse_ref: "PS003MT",
-                      },
-                    ],
-                  },
-                  {
-                    id: "del-184-3",
-                    delivery_number: "ENT-000184-3",
-                    status: "delivered_complete",
-                    delivery_mode: "Reparto programado",
-                    planned_date: "2026-04-24",
-                    warehouse_ref: "PS003MT",
-                    address_snapshot: {
-                      receiver: "Autorizado Remito",
-                      reference: "Retiro remito",
-                    },
-                    documents: [
-                      {
-                        id: "doc-184-3",
-                        document_number: "R-ENT-000184-3",
-                        document_type: "remito",
-                        status: "issued",
-                        issued_at: "2026-04-24T12:46:00Z",
-                      },
-                    ],
-                    movements: [
-                      {
-                        key: "delivery:del-184-3:delivered",
-                        at: "2026-04-24T12:46:00Z",
-                        label: "Remito emitido",
-                        status: "delivered_complete",
-                        detail: "R-ENT-000184-3",
-                        actor: "operario-1",
-                        source_type: "delivery_order",
-                        source_ref: "del-184-3",
-                        document_number: "R-ENT-000184-3",
-                      },
-                    ],
-                    lines: [
-                      {
-                        id: "dl-3",
-                        fulfillment_line_id: "184-1",
-                        item_ref: "CER-104",
-                        planned_qty: "1.44",
-                        delivery_unit_qty: "1",
-                        delivery_uom: "caja",
-                        conversion_factor: "1.44",
-                        uom: "m2",
-                        warehouse_ref: "PS003MT",
-                      },
-                    ],
-                  },
-                ],
+                deliveries:
+                  cancellationScenario !== "none"
+                    ? []
+                    : [
+                        {
+                          id: "del-184-1",
+                          delivery_number: "ENT-000184-1",
+                          status: deliveryStatus,
+                          delivery_mode: "Reparto programado",
+                          planned_date: "2026-04-24",
+                          warehouse_ref: "PS003MT",
+                          route_sheet: routeLocked
+                            ? {
+                                id: "route-1",
+                                route_number: "HR-000000123",
+                                status: "draft",
+                                stop_id: "stop-1",
+                                stop_status: "planned",
+                              }
+                            : null,
+                          documents: [],
+                          movements: [
+                            {
+                              key: "delivery:del-184-1:created",
+                              at: "2026-04-24T08:30:00Z",
+                              label: "Entrega creada",
+                              status: deliveryStatus,
+                              detail: "ENT-000184-1",
+                              actor: "operario-1",
+                              source_type: "delivery_order",
+                              source_ref: "del-184-1",
+                            },
+                          ],
+                          lines: [
+                            {
+                              id: "dl-1",
+                              fulfillment_line_id: "184-1",
+                              item_ref: "CER-104",
+                              planned_qty: "8.64",
+                              delivery_unit_qty: "6",
+                              delivery_uom: "caja",
+                              conversion_factor: "1.44",
+                              uom: "m2",
+                              warehouse_ref: "PS003MT",
+                            },
+                          ],
+                        },
+                        {
+                          id: "del-184-2",
+                          delivery_number: "ENT-000184-2",
+                          status: "planned",
+                          delivery_mode: "Reparto programado",
+                          planned_date: "2026-04-25",
+                          warehouse_ref: "PS003MT",
+                          documents: [],
+                          movements: [],
+                          lines: [
+                            {
+                              id: "dl-2",
+                              fulfillment_line_id: "184-1",
+                              item_ref: "CER-104",
+                              planned_qty: "5.76",
+                              delivery_unit_qty: "4",
+                              delivery_uom: "caja",
+                              conversion_factor: "1.44",
+                              uom: "m2",
+                              warehouse_ref: "PS003MT",
+                            },
+                          ],
+                        },
+                        {
+                          id: "del-184-3",
+                          delivery_number: "ENT-000184-3",
+                          status: "delivered_complete",
+                          delivery_mode: "Reparto programado",
+                          planned_date: "2026-04-24",
+                          warehouse_ref: "PS003MT",
+                          address_snapshot: {
+                            receiver: "Autorizado Remito",
+                            reference: "Retiro remito",
+                          },
+                          documents: [
+                            {
+                              id: "doc-184-3",
+                              document_number: "R-ENT-000184-3",
+                              document_type: "remito",
+                              status: "issued",
+                              issued_at: "2026-04-24T12:46:00Z",
+                            },
+                          ],
+                          movements: [
+                            {
+                              key: "delivery:del-184-3:delivered",
+                              at: "2026-04-24T12:46:00Z",
+                              label: "Remito emitido",
+                              status: "delivered_complete",
+                              detail: "R-ENT-000184-3",
+                              actor: "operario-1",
+                              source_type: "delivery_order",
+                              source_ref: "del-184-3",
+                              document_number: "R-ENT-000184-3",
+                            },
+                          ],
+                          lines: [
+                            {
+                              id: "dl-3",
+                              fulfillment_line_id: "184-1",
+                              item_ref: "CER-104",
+                              planned_qty: "1.44",
+                              delivery_unit_qty: "1",
+                              delivery_uom: "caja",
+                              conversion_factor: "1.44",
+                              uom: "m2",
+                              warehouse_ref: "PS003MT",
+                            },
+                          ],
+                        },
+                      ],
                 customer: {
                   customer_ref: "CLI-10924",
                   name: "Ricardo Ortigoza",
@@ -838,6 +843,29 @@ describe("DeliveryExpeditionPage", () => {
     expect(screen.queryByText("parcial")).not.toBeInTheDocument();
   });
 
+  it("labels a fully annulled order as anulada instead of pendiente", async () => {
+    cancellationScenario = "full";
+    render(<DeliveryExpeditionPage />);
+
+    fireEvent.change(screen.getByLabelText("Busqueda"), { target: { value: "PED-000184" } });
+    fireEvent.click(screen.getByRole("button", { name: "Buscar pedido" }));
+
+    await waitFor(() => expect(screen.getAllByText("anulada").length).toBeGreaterThan(0));
+    expect(screen.queryByText("pendiente")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Agregar entrega" })).toBeDisabled();
+  });
+
+  it("keeps a partially annulled order pending when another line remains open", async () => {
+    cancellationScenario = "partial";
+    render(<DeliveryExpeditionPage />);
+
+    fireEvent.change(screen.getByLabelText("Busqueda"), { target: { value: "PED-000184" } });
+    fireEvent.click(screen.getByRole("button", { name: "Buscar pedido" }));
+
+    await waitFor(() => expect(screen.getAllByText("pendiente").length).toBeGreaterThan(0));
+    expect(screen.queryByText("anulada")).not.toBeInTheDocument();
+  });
+
   it("labels a confirmed split delivery as parcial confirmada with the remaining balance", async () => {
     render(<DeliveryExpeditionPage />);
 
@@ -939,6 +967,9 @@ describe("DeliveryExpeditionPage", () => {
     const blockedInput = screen.getByLabelText("Cantidad a entregar SIN-001") as HTMLInputElement;
     expect(qtyInput.value).toBe("0");
     expect(blockedInput).toBeDisabled();
+    expect(screen.getByRole("columnheader", { name: "Pendiente" })).toBeInTheDocument();
+    const blockedRowCells = within(screen.getByText("SIN-001").closest("tr") as HTMLElement).getAllByRole("cell");
+    expect(blockedRowCells[5]).toHaveTextContent("1 Un");
     expect(screen.getByRole("button", { name: "Confirmar entrega" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Entregar todo" })).not.toBeDisabled();
 

@@ -1875,6 +1875,12 @@ def serialize_ledger_entry(entry: InventoryLedgerEntry) -> dict:
         "document_type": entry.document_type,
         "document_ref": entry.document_ref,
         "reason": entry.reason,
+        "created_by": entry.created_by,
+        "is_reversal": entry.is_reversal,
+        "reversal_of": str(entry.reversal_of) if entry.reversal_of else "",
+        "legacy_transaction_number": entry.legacy_transaction_number,
+        "legacy_sales_order_number": entry.legacy_sales_order_number,
+        "legacy_line_id": entry.legacy_line_id,
         "posted_at": entry.posted_at.isoformat(),
     }
 

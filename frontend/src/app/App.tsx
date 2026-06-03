@@ -4,10 +4,13 @@ import { RouterProvider } from "react-router-dom";
 import { router } from "./router";
 import { GlobalLoadingOverlay } from "../shared/components/GlobalLoadingOverlay";
 import { LoadingScreen } from "../shared/components/LoadingScreen";
+import { useGlobalTableSorting } from "../shared/components/SortableTables";
 import { ToastViewport } from "../shared/components/toast";
 import { useSessionStore } from "../stores/useSessionStore";
 
 export function App() {
+  useGlobalTableSorting();
+
   const bootstrap = useSessionStore((state) => state.bootstrap);
   const error = useSessionStore((state) => state.error);
   const hydrate = useSessionStore((state) => state.hydrate);

@@ -4,7 +4,8 @@ from decimal import Decimal
 
 from django.db.models import Q, Sum
 from django.http import HttpRequest
-from django.utils.dateparse import parse_date
+from django.utils import timezone
+from django.utils.dateparse import parse_date, parse_datetime
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET, require_POST, require_http_methods
 
@@ -56,6 +57,17 @@ def _limit(value: str | None, default: int = 500, maximum: int = 2000) -> int:
     except ValueError:
         parsed = default
     return min(max(parsed, 1), maximum)
+
+
+def _parse_local_datetime(value: str):
+    if "T" not in value and " " not in value:
+        return None
+    parsed = parse_datetime(value)
+    if parsed is None:
+        return None
+    if timezone.is_naive(parsed):
+        return timezone.make_aware(parsed, timezone.get_current_timezone())
+    return parsed
 
 
 def _iso_datetime(value) -> str | None:
@@ -541,6 +553,23 @@ def ledger(request: HttpRequest):
         return error_response("master_data_unavailable", str(exc), status=503)
     if forbidden is not None:
         return forbidden
+    if search := _query_alias(request, "q", "search").strip():
+        qs = qs.filter(
+            Q(item_ref__icontains=search)
+            | Q(warehouse_ref__icontains=search)
+            | Q(location_ref__icontains=search)
+            | Q(lot_ref__icontains=search)
+            | Q(stock_state__icontains=search)
+            | Q(movement_type__icontains=search)
+            | Q(direction__icontains=search)
+            | Q(document_type__icontains=search)
+            | Q(document_ref__icontains=search)
+            | Q(reason__icontains=search)
+            | Q(created_by__icontains=search)
+            | Q(legacy_transaction_number__icontains=search)
+            | Q(legacy_sales_order_number__icontains=search)
+            | Q(legacy_line_id__icontains=search)
+        )
     if movement_type := request.GET.get("movement_type"):
         qs = qs.filter(movement_type=movement_type)
     if direction := request.GET.get("direction"):
@@ -559,34 +588,28 @@ def ledger(request: HttpRequest):
         qs = qs.filter(document_type=document_type)
     if document_ref := _query_alias(request, "document_ref", "reference_id"):
         qs = qs.filter(document_ref=document_ref)
-    if date_from := request.GET.get("date_from"):
-        parsed = parse_date(date_from)
-        if parsed is None:
-            return error_response("validation_error", "date_from debe tener formato YYYY-MM-DD.", status=400)
-        qs = qs.filter(posted_at__date__gte=parsed)
-    if date_to := request.GET.get("date_to"):
-        parsed = parse_date(date_to)
-        if parsed is None:
-            return error_response("validation_error", "date_to debe tener formato YYYY-MM-DD.", status=400)
-        qs = qs.filter(posted_at__date__lte=parsed)
-    data = [
-        {
-            "id": str(row.id),
-            "movement_type": row.movement_type,
-            "direction": row.direction,
-            "warehouse_ref": row.warehouse_ref,
-            "location_ref": row.location_ref,
-            "lot_ref": row.lot_ref,
-            "item_ref": row.item_ref,
-            "stock_state": row.stock_state,
-            "quantity": _decimal(row.quantity),
-            "uom": row.uom,
-            "document_type": row.document_type,
-            "document_ref": row.document_ref,
-            "posted_at": row.posted_at.isoformat(),
-        }
-        for row in qs[: _limit(request.GET.get("limit"))]
-    ]
+    single_date = _query_alias(request, "date", "posted_date", "planned_date", "fecha")
+    date_from = request.GET.get("date_from") or single_date
+    date_to = request.GET.get("date_to") or single_date
+    if date_from:
+        parsed_datetime = _parse_local_datetime(date_from)
+        if parsed_datetime is not None:
+            qs = qs.filter(posted_at__gte=parsed_datetime)
+        else:
+            parsed_date = parse_date(date_from)
+            if parsed_date is None:
+                return error_response("validation_error", "date_from debe tener formato YYYY-MM-DD o YYYY-MM-DDTHH:mm.", status=400)
+            qs = qs.filter(posted_at__date__gte=parsed_date)
+    if date_to:
+        parsed_datetime = _parse_local_datetime(date_to)
+        if parsed_datetime is not None:
+            qs = qs.filter(posted_at__lte=parsed_datetime)
+        else:
+            parsed_date = parse_date(date_to)
+            if parsed_date is None:
+                return error_response("validation_error", "date_to debe tener formato YYYY-MM-DD o YYYY-MM-DDTHH:mm.", status=400)
+            qs = qs.filter(posted_at__date__lte=parsed_date)
+    data = [serialize_ledger_entry(row) for row in qs[: _limit(request.GET.get("limit"))]]
     return json_response({"results": data})
 
 

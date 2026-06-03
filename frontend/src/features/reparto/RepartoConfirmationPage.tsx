@@ -19,7 +19,6 @@ import { formatIdentifier } from "../../shared/utils/identifierFormat";
 import {
   classifyStockAvailability,
   hasConfirmableStock,
-  type StockAvailabilityLine,
 } from "../../shared/utils/stockAvailability";
 import type { StatusTone } from "../../types/operations";
 

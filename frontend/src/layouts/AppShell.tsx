@@ -33,7 +33,7 @@ export function AppShell() {
   const logout = useSessionStore((state) => state.logout);
   const navigate = useNavigate();
   const [contextError, setContextError] = useState<string | null>(null);
-  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   const [isLoggingOut, setIsLoggingOut] = useState(false);
   const [switchingWarehouse, setSwitchingWarehouse] = useState(false);
   const sidebarTimerRef = useRef<number | null>(null);
