@@ -247,11 +247,16 @@ def is_virtual_delivery_line(line: DeliveryOrderLine) -> bool:
     return is_virtual_item_snapshot(_delivery_line_snapshot(line))
 
 
-def _mark_pos_freight_snapshot(snapshot: dict, *, item_ref: str, store_ref: str) -> dict:
+def _pos_freight_refs_for_store(store_ref: str) -> set[str]:
     try:
-        freight_refs = pos_freight_product_refs(store_ref) | pos_freight_product_refs("")
+        return pos_freight_product_refs(store_ref) | pos_freight_product_refs("")
     except MasterDataSourceError:
-        freight_refs = set()
+        return set()
+
+
+def _mark_pos_freight_snapshot(snapshot: dict, *, item_ref: str, store_ref: str, freight_refs: set[str] | None = None) -> dict:
+    if freight_refs is None:
+        freight_refs = _pos_freight_refs_for_store(store_ref)
     if item_ref in freight_refs:
         snapshot = dict(snapshot)
         snapshot["freight_product"] = True
@@ -640,6 +645,7 @@ def _resolve_line_item_snapshots(lines: list[FulfillmentOrderLine]) -> dict:
 
     for store_ref, store_lines in lines_by_store.items():
         item_refs = {_clean(line.item_ref) for line in store_lines if _clean(line.item_ref)}
+        freight_refs = _pos_freight_refs_for_store(store_ref)
         parquet_results = {}
         try:
             parquet_results = material_snapshots_for_items(store=store_ref, item_refs=item_refs).get("results", {})
@@ -654,6 +660,7 @@ def _resolve_line_item_snapshots(lines: list[FulfillmentOrderLine]) -> dict:
                 _normalize_item_snapshot(raw, item_ref=line.item_ref, sales_uom=line.uom),
                 item_ref=line.item_ref,
                 store_ref=store_ref,
+                freight_refs=freight_refs,
             )
             missing_item_refs.discard(_clean(line.item_ref))
         legacy_results = _legacy_item_snapshots(missing_item_refs, sales_uom_by_item)
@@ -664,6 +671,7 @@ def _resolve_line_item_snapshots(lines: list[FulfillmentOrderLine]) -> dict:
                 legacy_results.get(_clean(line.item_ref), _default_item_snapshot(line.item_ref, line.uom)),
                 item_ref=line.item_ref,
                 store_ref=store_ref,
+                freight_refs=freight_refs,
             )
     return snapshots
 
@@ -715,6 +723,7 @@ def _resolve_legacy_line_item_snapshots(lines: list[LegacyOrderLine]) -> dict[st
 
     for store_ref, store_lines in lines_by_store.items():
         item_refs = {_clean(line.item_number) for line in store_lines if _clean(line.item_number)}
+        freight_refs = _pos_freight_refs_for_store(store_ref)
         parquet_results = {}
         try:
             parquet_results = material_snapshots_for_items(store=store_ref, item_refs=item_refs).get("results", {})
@@ -727,7 +736,12 @@ def _resolve_legacy_line_item_snapshots(lines: list[LegacyOrderLine]) -> dict[st
                 snapshot = _normalize_item_snapshot(raw, item_ref=item_ref, sales_uom=line.sales_unit_symbol)
             else:
                 snapshot = _default_item_snapshot(item_ref, line.sales_unit_symbol)
-            snapshots[str(line.retail_line_item_id)] = _mark_pos_freight_snapshot(snapshot, item_ref=item_ref, store_ref=store_ref)
+            snapshots[str(line.retail_line_item_id)] = _mark_pos_freight_snapshot(
+                snapshot,
+                item_ref=item_ref,
+                store_ref=store_ref,
+                freight_refs=freight_refs,
+            )
     return snapshots
 
 
@@ -778,6 +792,22 @@ def _max_dispatchable_from_values(
     return min(remaining_qty, packed_remaining)
 
 
+def _effective_pending_qty(fulfillment_line: FulfillmentOrderLine, *, open_remito_qty: Decimal = ZERO) -> Decimal:
+    documented_qty = max(fulfillment_line.delivered_qty, open_remito_qty)
+    return max(ZERO, fulfillment_line.ordered_qty - documented_qty - fulfillment_line.cancelled_qty)
+
+
+def _max_dispatchable_from_effective_pending(
+    *,
+    effective_pending_qty: Decimal,
+    already_planned: Decimal,
+    packed_qty: Decimal,
+) -> Decimal:
+    remaining_qty = max(ZERO, effective_pending_qty - already_planned)
+    packed_remaining = max(ZERO, packed_qty - already_planned)
+    return min(remaining_qty, packed_remaining)
+
+
 def _active_delivery_lines_queryset():
     return DeliveryOrderLine.objects.exclude(
         delivery__documents__document_type=DeliveryDocument.DocumentType.REMITO,
@@ -814,6 +844,17 @@ def _line_metrics(lines: list[FulfillmentOrderLine], *, target_warehouse_ref: st
         .values("fulfillment_line_id")
         .annotate(total=Sum("applied_qty"))
     }
+    open_remito_by_line = {
+        row["delivery_line__fulfillment_line_id"]: row["total"] or Decimal("0")
+        for row in DeliveryDocumentLine.objects.filter(
+            delivery_line__fulfillment_line_id__in=line_ids,
+            document__document_type=DeliveryDocument.DocumentType.REMITO,
+            document__status=DeliveryDocument.DocumentStatus.OPEN,
+        )
+        .exclude(document__delivery__status__in=[DeliveryOrder.DeliveryStatus.RETURNED, DeliveryOrder.DeliveryStatus.CANCELLED])
+        .values("delivery_line__fulfillment_line_id")
+        .annotate(total=Sum("quantity"))
+    }
 
     packed_by_key = _packed_quantities_for_keys(
         {
@@ -827,6 +868,7 @@ def _line_metrics(lines: list[FulfillmentOrderLine], *, target_warehouse_ref: st
             "planned_qty": planned_by_line.get(line.id, Decimal("0")),
             "packed_qty": packed_by_key.get((stock_warehouse_ref or line.warehouse_ref, line.item_ref, line.uom), Decimal("0")),
             "returned_qty": returned_by_line.get(line.id, Decimal("0")),
+            "open_remito_qty": open_remito_by_line.get(line.id, Decimal("0")),
             "stock_warehouse_ref": stock_warehouse_ref or line.warehouse_ref,
         }
         for line in lines
@@ -855,14 +897,16 @@ def _serialize_fulfillment_line(
         planned_qty = metric["planned_qty"]
         packed_qty = metric["packed_qty"]
         returned_qty = metric.get("returned_qty", Decimal("0"))
+    open_remito_qty = metric.get("open_remito_qty", ZERO) if metric is not None else _open_remito_qty_for_fulfillment_line(line)
+    effective_pending_qty = _effective_pending_qty(line, open_remito_qty=open_remito_qty)
     item_snapshot = _with_display_uom(item_snapshot or _default_item_snapshot(line.item_ref, line.uom), fallback_uom=line.uom)
     conversion_factor = _item_conversion_factor(item_snapshot)
     planned_delivery_unit_qty = _delivery_unit_qty_from_commercial(planned_qty, item_snapshot)
     if _target_warehouse(target_warehouse_ref):
-        max_dispatchable_qty = min(max(Decimal("0"), line.pending_qty - planned_qty), max(Decimal("0"), packed_qty))
+        max_dispatchable_qty = min(max(Decimal("0"), effective_pending_qty - planned_qty), max(Decimal("0"), packed_qty))
     else:
-        max_dispatchable_qty = _max_dispatchable_from_values(
-            line,
+        max_dispatchable_qty = _max_dispatchable_from_effective_pending(
+            effective_pending_qty=effective_pending_qty,
             already_planned=planned_qty,
             packed_qty=packed_qty,
         )
@@ -885,7 +929,7 @@ def _serialize_fulfillment_line(
         "delivered_qty": str(line.delivered_qty),
         "cancelled_qty": str(line.cancelled_qty),
         "returned_qty": _display_qty(returned_qty),
-        "pending_qty": str(line.pending_qty),
+        "pending_qty": str(effective_pending_qty),
         "planned_qty": _display_qty(planned_qty),
         "stock_available": _display_qty(packed_qty),
         "max_dispatchable_qty": _display_qty(max_dispatchable_qty),
@@ -1058,6 +1102,22 @@ def _movement_context_histories(context: dict | None, entity_type: str, entity_i
     for entity_id in entity_ids:
         rows.extend(histories.get((entity_type, entity_id), []))
     return sorted(rows, key=lambda history: history.created_at)
+
+
+def _route_assignment_payload(route_stop) -> dict:
+    return {
+        "id": str(route_stop.route_id),
+        "route_number": route_stop.route.route_number,
+        "status": route_stop.route.status,
+        "stop_id": str(route_stop.id),
+        "stop_status": route_stop.status,
+    }
+
+
+def _route_assignment_from_context(delivery_id: str, movement_context: dict | None) -> dict | None:
+    if movement_context is None:
+        return None
+    return movement_context.get("route_assignments_by_delivery", {}).get(str(delivery_id))
 
 
 def _delivery_movements(delivery: DeliveryOrder, *, movement_context: dict | None = None) -> list[dict]:
@@ -1471,6 +1531,7 @@ def _build_movement_context(fulfillments: list[FulfillmentOrder]) -> dict:
             histories_by_entity[(history.entity_type, history.entity_id)].append(history)
 
     route_stops_by_delivery: dict[str, list] = defaultdict(list)
+    route_assignments_by_delivery: dict[str, dict] = {}
     route_numbers: dict[str, str] = {}
     try:
         from apps.routes.models import RouteSheet, RouteStop, RouteStopLine
@@ -1488,17 +1549,42 @@ def _build_movement_context(fulfillments: list[FulfillmentOrder]) -> dict:
             .order_by("route__created_at", "sequence")
         )
         stops_by_id = {stop.id: stop for stop in direct_stops + line_stops}
+        direct_stops_by_delivery: dict[str, list] = defaultdict(list)
+        line_stops_by_delivery: dict[str, list] = defaultdict(list)
         for stop in direct_stops:
-            route_stops_by_delivery[str(stop.source_ref)].append(stop)
+            delivery_ref = str(stop.source_ref)
+            direct_stops_by_delivery[delivery_ref].append(stop)
+            route_stops_by_delivery[delivery_ref].append(stop)
         for row in line_links:
             stop = stops_by_id.get(row["stop_id"])
             if stop is not None:
-                route_stops_by_delivery[str(row["delivery_ref"])].append(stop)
+                delivery_ref = str(row["delivery_ref"])
+                line_stops_by_delivery[delivery_ref].append(stop)
+                route_stops_by_delivery[delivery_ref].append(stop)
         for delivery_id, stops in list(route_stops_by_delivery.items()):
             route_stops_by_delivery[delivery_id] = sorted(
                 {stop.id: stop for stop in stops}.values(),
                 key=lambda stop: (stop.route.created_at, stop.sequence),
             )
+        for delivery_id in set(direct_stops_by_delivery) | set(line_stops_by_delivery):
+            direct_candidates = [
+                stop
+                for stop in direct_stops_by_delivery.get(delivery_id, [])
+                if stop.status != RouteStop.StopStatus.CANCELLED and stop.route.status != RouteSheet.RouteStatus.CANCELLED
+            ]
+            line_candidates = [
+                stop
+                for stop in line_stops_by_delivery.get(delivery_id, [])
+                if stop.status != RouteStop.StopStatus.CANCELLED and stop.route.status != RouteSheet.RouteStatus.CANCELLED
+            ]
+            candidates = direct_candidates or line_candidates
+            if candidates:
+                route_stop = sorted(
+                    candidates,
+                    key=lambda stop: (stop.route.created_at, stop.created_at),
+                    reverse=True,
+                )[0]
+                route_assignments_by_delivery[delivery_id] = _route_assignment_payload(route_stop)
         stop_ids = [str(stop.id) for stop in stops_by_id.values()]
         route_ids = [str(stop.route_id) for stop in stops_by_id.values()]
         if route_ids:
@@ -1515,11 +1601,13 @@ def _build_movement_context(fulfillments: list[FulfillmentOrder]) -> dict:
                 histories_by_entity[(history.entity_type, history.entity_id)].append(history)
     except Exception:
         route_stops_by_delivery = defaultdict(list)
+        route_assignments_by_delivery = {}
         route_numbers = {}
 
     return {
         "histories_by_entity": histories_by_entity,
         "route_stops_by_delivery": route_stops_by_delivery,
+        "route_assignments_by_delivery": route_assignments_by_delivery,
         "route_numbers": route_numbers,
     }
 
@@ -1555,6 +1643,9 @@ def _serialize_fulfillment(
 
     def serialize_delivery(delivery: DeliveryOrder) -> dict:
         delivery_lines = physical_delivery_lines_from_snapshots(list(delivery.lines.all()), item_snapshots)
+        route_assignment = _route_assignment_from_context(str(delivery.id), movement_context)
+        if route_assignment is None and (movement_context is None or "route_assignments_by_delivery" not in movement_context):
+            route_assignment = _delivery_route_assignment(str(delivery.id))
         return {
             "id": str(delivery.id),
             "created_at": delivery.created_at.isoformat(),
@@ -1566,7 +1657,7 @@ def _serialize_fulfillment(
             "warehouse_ref": delivery.warehouse_ref,
             "store_ref": delivery.store_ref,
             "address_snapshot": delivery.address_snapshot,
-            "route_sheet": _delivery_route_assignment(str(delivery.id)),
+            "route_sheet": route_assignment,
             "documents": [
                 {
                     "id": str(document.id),
@@ -1922,6 +2013,27 @@ def _apply_order_impact(impact: FulfillmentOrderImpact, *, actor: str) -> Fulfil
     return impact
 
 
+def _legacy_impact_source_version(order: LegacyOrder) -> str:
+    return str(order.modified_datetime or order.invoice_date or "")
+
+
+def _legacy_impact_source_key(order: LegacyOrder) -> tuple[str, str]:
+    return (str(order.transaction_id), _legacy_impact_source_version(order))
+
+
+def _applied_legacy_impact_source_keys(orders: list[LegacyOrder]) -> set[tuple[str, str]]:
+    source_pks = {str(order.transaction_id) for order in orders if str(order.transaction_id)}
+    if not source_pks:
+        return set()
+    return set(
+        FulfillmentOrderImpact.objects.filter(
+            source_table="transactions_orders_transaction",
+            source_pk__in=source_pks,
+            status=FulfillmentOrderImpact.ImpactStatus.APPLIED,
+        ).values_list("source_pk", "source_version")
+    )
+
+
 @transaction.atomic
 def process_legacy_order_impact(*, sales_order_number: str, idempotency_key: str, actor: str) -> IdempotentResult:
     command_payload = {"sales_order_number": sales_order_number}
@@ -2004,7 +2116,7 @@ def process_legacy_order_impact(*, sales_order_number: str, idempotency_key: str
             "warehouse_ref": order.warehouse,
             "store_ref": order.store_id or "",
             "source_hash": source_hash,
-            "source_version": str(order.modified_datetime or ""),
+            "source_version": _legacy_impact_source_version(order),
             "payload": safe_source_payload,
             "created_by": actor,
         },
@@ -2021,7 +2133,7 @@ def process_legacy_order_impact(*, sales_order_number: str, idempotency_key: str
         impact.warehouse_ref = order.warehouse
         impact.store_ref = order.store_id or ""
         impact.source_hash = source_hash
-        impact.source_version = str(order.modified_datetime or "")
+        impact.source_version = _legacy_impact_source_version(order)
         impact.payload = safe_source_payload
         impact.updated_by = actor
         impact.save(
@@ -2119,10 +2231,39 @@ def process_legacy_order_impact(*, sales_order_number: str, idempotency_key: str
     return _finish_idempotent_command(idempotency, result)
 
 
-def process_legacy_impacts_for_order(*, sales_order_number: str, actor: str) -> None:
+def _process_legacy_impact_order(order: LegacyOrder, *, actor: str) -> None:
+    source_version = _legacy_impact_source_version(order)
+    source_hash = hashlib.sha1(source_version.encode("utf-8")).hexdigest()[:10]
+    process_legacy_order_impact(
+        sales_order_number=order.sales_order_number,
+        idempotency_key=f"legacy-impact-link:{order.sales_order_number}:{source_hash}",
+        actor=actor,
+    )
+
+
+def _legacy_impact_orders_for_order_numbers(order_numbers: set[str]) -> list[LegacyOrder]:
+    clean_order_numbers = {str(order_number or "").strip() for order_number in order_numbers if str(order_number or "").strip()}
+    if not clean_order_numbers:
+        return []
+    try:
+        return list(
+            LegacyOrder.objects.using("litecore")
+            .filter(sales_order_number_orig__in=clean_order_numbers)
+            .filter(
+                Q(sales_order_type__iexact=LEGACY_ORDER_TYPE_ANNULMENT)
+                | Q(sales_order_type__iexact=LEGACY_ORDER_TYPE_RETURN)
+            )
+            .order_by("sales_order_number_orig", "modified_datetime", "invoice_date", "sales_order_number")
+        )
+    except Exception:
+        return []
+
+
+def process_legacy_impacts_for_order(*, sales_order_number: str, actor: str) -> int:
     order_number = str(sales_order_number or "").strip()
     if not order_number:
-        return
+        return 0
+    processed = 0
     try:
         queryset = LegacyOrder.objects.using("litecore").filter(
             sales_order_number_orig=order_number,
@@ -2130,30 +2271,52 @@ def process_legacy_impacts_for_order(*, sales_order_number: str, actor: str) -> 
             Q(sales_order_type__iexact=LEGACY_ORDER_TYPE_ANNULMENT)
             | Q(sales_order_type__iexact=LEGACY_ORDER_TYPE_RETURN)
         )
-        for order in queryset.order_by("modified_datetime", "invoice_date", "sales_order_number")[:50]:
-            source_version = str(order.modified_datetime or order.invoice_date or "")
-            source_hash = hashlib.sha1(source_version.encode("utf-8")).hexdigest()[:10]
-            process_legacy_order_impact(
-                sales_order_number=order.sales_order_number,
-                idempotency_key=f"legacy-impact-link:{order.sales_order_number}:{source_hash}",
-                actor=actor,
-            )
+        orders = list(queryset.order_by("modified_datetime", "invoice_date", "sales_order_number")[:50])
+        applied_source_keys = _applied_legacy_impact_source_keys(orders)
+        for order in orders:
+            if _legacy_impact_source_key(order) in applied_source_keys:
+                continue
+            _process_legacy_impact_order(order, actor=actor)
+            processed += 1
     except Exception:
-        return
+        return processed
+    return processed
 
 
 def refresh_legacy_impacts_for_fulfillments(
     fulfillments: list[FulfillmentOrder] | tuple[FulfillmentOrder, ...],
     *,
     actor: str,
-) -> None:
+) -> int:
     seen_order_numbers: set[str] = set()
     for fulfillment in fulfillments:
         order_number = str(fulfillment.legacy_sales_order_number or "").strip()
         if not order_number or order_number in seen_order_numbers:
             continue
         seen_order_numbers.add(order_number)
-        process_legacy_impacts_for_order(sales_order_number=order_number, actor=actor)
+    if not seen_order_numbers:
+        return 0
+    if len(seen_order_numbers) == 1:
+        order_number = next(iter(seen_order_numbers))
+        return process_legacy_impacts_for_order(sales_order_number=order_number, actor=actor)
+
+    impact_orders = _legacy_impact_orders_for_order_numbers(seen_order_numbers)
+    applied_source_keys = _applied_legacy_impact_source_keys(impact_orders)
+    processed = 0
+    processed_by_original: dict[str, int] = defaultdict(int)
+    for order in impact_orders:
+        original_order_number = str(order.sales_order_number_orig or "").strip()
+        if not original_order_number or processed_by_original[original_order_number] >= 50:
+            continue
+        if _legacy_impact_source_key(order) in applied_source_keys:
+            continue
+        try:
+            _process_legacy_impact_order(order, actor=actor)
+        except Exception:
+            continue
+        processed_by_original[original_order_number] += 1
+        processed += 1
+    return processed
 
 
 @transaction.atomic
@@ -2392,6 +2555,19 @@ def _remitted_qty_for_fulfillment_line(fulfillment_line: FulfillmentOrderLine) -
     )
 
 
+def _open_remito_qty_for_fulfillment_line(fulfillment_line: FulfillmentOrderLine) -> Decimal:
+    return (
+        DeliveryDocumentLine.objects.filter(
+            delivery_line__fulfillment_line=fulfillment_line,
+            document__status=DeliveryDocument.DocumentStatus.OPEN,
+            document__document_type=DeliveryDocument.DocumentType.REMITO,
+        )
+        .exclude(document__delivery__status__in=[DeliveryOrder.DeliveryStatus.RETURNED, DeliveryOrder.DeliveryStatus.CANCELLED])
+        .aggregate(total=Sum("quantity"))["total"]
+        or ZERO
+    )
+
+
 def _max_dispatchable(fulfillment_line: FulfillmentOrderLine, exclude_delivery_id: str | None = None) -> Decimal:
     already_planned = _planned_elsewhere(fulfillment_line, exclude_delivery_id)
     return _max_dispatchable_from_values(
@@ -2498,16 +2674,20 @@ def split_fulfillment_delivery(
         _ensure_warehouse_authorized(line_warehouse_ref, authorized_warehouses)
         metric = line_metrics.get(fulfillment_line.id, {})
         already_planned = metric.get("planned_qty", ZERO) + planned_in_this_delivery[fulfillment_line.id]
+        effective_pending_qty = _effective_pending_qty(
+            fulfillment_line,
+            open_remito_qty=metric.get("open_remito_qty", ZERO),
+        )
         if target_warehouse_ref:
             packed_qty = _packed_quantity_for_key(
                 warehouse_ref=line_warehouse_ref,
                 item_ref=fulfillment_line.item_ref,
                 uom=fulfillment_line.uom,
             )
-            max_qty = min(max(ZERO, fulfillment_line.pending_qty - already_planned), packed_qty)
+            max_qty = min(max(ZERO, effective_pending_qty - already_planned), packed_qty)
         else:
-            max_qty = _max_dispatchable_from_values(
-                fulfillment_line,
+            max_qty = _max_dispatchable_from_effective_pending(
+                effective_pending_qty=effective_pending_qty,
                 already_planned=already_planned,
                 packed_qty=metric.get("packed_qty", ZERO),
             )
@@ -2543,7 +2723,7 @@ def split_fulfillment_delivery(
             split_qty=split_qty,
             remaining_after_split=max(
                 Decimal("0"),
-                fulfillment_line.pending_qty - (metric.get("planned_qty", ZERO) + planned_in_this_delivery[fulfillment_line.id]),
+                effective_pending_qty - (metric.get("planned_qty", ZERO) + planned_in_this_delivery[fulfillment_line.id]),
             ),
             reason=reason,
             legacy_sales_order_number=fulfillment_line.legacy_sales_order_number,
@@ -2807,11 +2987,15 @@ def check_fulfillment_stock_for_split(
         key = (warehouse_ref, fulfillment_line.item_ref, fulfillment_line.uom)
         requested_by_bucket[key] += requested_qty
         metric = metrics.get(fulfillment_line.id, {})
+        effective_pending_qty = _effective_pending_qty(
+            fulfillment_line,
+            open_remito_qty=metric.get("open_remito_qty", ZERO),
+        )
         if target_warehouse_ref:
-            max_qty = min(max(ZERO, fulfillment_line.pending_qty - metric.get("planned_qty", ZERO)), packed_by_key.get(key, ZERO))
+            max_qty = min(max(ZERO, effective_pending_qty - metric.get("planned_qty", ZERO)), packed_by_key.get(key, ZERO))
         else:
-            max_qty = _max_dispatchable_from_values(
-                fulfillment_line,
+            max_qty = _max_dispatchable_from_effective_pending(
+                effective_pending_qty=effective_pending_qty,
                 already_planned=metric.get("planned_qty", ZERO),
                 packed_qty=metric.get("packed_qty", ZERO),
             )
@@ -3835,8 +4019,9 @@ def expedition_queue(
         fulfillments = list(fulfillment_queryset()[:100])
 
     if fulfillments:
-        refresh_legacy_impacts_for_fulfillments(fulfillments, actor="expedition.search")
-        fulfillments = list(fulfillment_queryset()[:100])
+        processed_impacts = refresh_legacy_impacts_for_fulfillments(fulfillments, actor="expedition.search")
+        if processed_impacts:
+            fulfillments = list(fulfillment_queryset()[:100])
 
     lines = [
         line

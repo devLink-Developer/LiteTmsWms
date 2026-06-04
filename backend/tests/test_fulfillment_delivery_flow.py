@@ -11,6 +11,7 @@ from apps.core.models import StatusHistory
 from apps.core.sequences import SequenceConfigError, allocate_sequence_number
 from apps.fulfillment.models import (
     DeliveryDocument,
+    DeliveryDocumentLine,
     DeliveryExecution,
     DeliveryOrder,
     DeliveryOrderLine,
@@ -566,6 +567,28 @@ class DeliveryPreparationFlowTests(TestCase):
         self.assertEqual([row["sales_order_number"] for row in by_order], ["SO-1"])
         self.assertEqual([row["customer_ref"] for row in by_customer], ["CUST-1"])
 
+    def test_line_item_snapshots_reuse_pos_freight_refs_per_store(self):
+        second_line = FulfillmentOrderLine.objects.create(
+            fulfillment=self.fulfillment,
+            ordered_qty=Decimal("2"),
+            uom="UN",
+            item_ref="ITEM-2",
+            warehouse_ref="W001",
+            legacy_sales_order_number="SO-1",
+            legacy_line_id="20",
+        )
+
+        with (
+            patch("apps.fulfillment.services.material_snapshots_for_items", return_value={"results": {}}),
+            patch("apps.fulfillment.services._legacy_item_snapshots", return_value={}),
+            patch("apps.fulfillment.services.pos_freight_product_refs", return_value=set()) as pos_refs,
+        ):
+            from apps.fulfillment.services import _resolve_line_item_snapshots
+
+            _resolve_line_item_snapshots([self.fulfillment_line, second_line])
+
+        self.assertEqual([call.args[0] for call in pos_refs.call_args_list], ["W001", ""])
+
     def test_expedition_queue_refreshes_legacy_impacts_for_customer_search(self):
         customer = {"customer_ref": "CUST-1", "name": "Cliente Test", "document_number": "", "address": {}}
         with (
@@ -578,6 +601,78 @@ class DeliveryPreparationFlowTests(TestCase):
             sales_order_number="SO-1",
             actor="expedition.search",
         )
+
+    def test_expedition_queue_refreshes_legacy_impacts_in_bulk_for_customer_search(self):
+        second = FulfillmentOrder.objects.create(
+            fulfillment_number="FUL-2",
+            status=FulfillmentOrder.FulfillmentStatus.PENDING,
+            customer_ref="CUST-1",
+            delivery_mode="home",
+            warehouse_ref="W001",
+            legacy_sales_order_number="SO-2",
+        )
+        FulfillmentOrderLine.objects.create(
+            fulfillment=second,
+            ordered_qty=Decimal("2"),
+            uom="UN",
+            item_ref="ITEM-2",
+            warehouse_ref="W001",
+            legacy_sales_order_number="SO-2",
+            legacy_line_id="20",
+        )
+        customer = {"customer_ref": "CUST-1", "name": "Cliente Test", "document_number": "", "address": {}}
+
+        with (
+            patch("apps.fulfillment.services.process_legacy_impacts_for_order") as process_impacts,
+            patch("apps.fulfillment.services._legacy_impact_orders_for_order_numbers", return_value=[]) as bulk_impacts,
+            patch("apps.fulfillment.services._resolve_customer_snapshots", return_value={"CUST-1": customer}),
+        ):
+            result = expedition_queue(customer_ref="cust-1", authorized_warehouses=["W001"])
+
+        self.assertEqual({row["sales_order_number"] for row in result}, {"SO-1", "SO-2"})
+        process_impacts.assert_not_called()
+        bulk_impacts.assert_called_once()
+        self.assertEqual(bulk_impacts.call_args.args[0], {"SO-1", "SO-2"})
+
+    def test_refresh_legacy_impacts_skips_applied_same_source_version(self):
+        second = FulfillmentOrder.objects.create(
+            fulfillment_number="FUL-2",
+            status=FulfillmentOrder.FulfillmentStatus.PENDING,
+            customer_ref="CUST-1",
+            delivery_mode="home",
+            warehouse_ref="W001",
+            legacy_sales_order_number="SO-2",
+        )
+        FulfillmentOrderImpact.objects.create(
+            fulfillment=self.fulfillment,
+            impact_type=FulfillmentOrderImpact.ImpactType.RETURN,
+            status=FulfillmentOrderImpact.ImpactStatus.APPLIED,
+            impact_sales_order_number="DEV-SO-1",
+            impact_transaction_number="TX-DEV-1",
+            legacy_sales_order_number="SO-1",
+            warehouse_ref="W001",
+            source_table="transactions_orders_transaction",
+            source_pk="TX-SKIP",
+            source_version="version-1",
+            created_by="tester",
+        )
+        impact_order = SimpleNamespace(
+            transaction_id="TX-SKIP",
+            modified_datetime="version-1",
+            invoice_date=None,
+            sales_order_number="DEV-SO-1",
+            sales_order_number_orig="SO-1",
+        )
+
+        with (
+            patch("apps.fulfillment.services._legacy_impact_orders_for_order_numbers", return_value=[impact_order]),
+            patch("apps.fulfillment.services._process_legacy_impact_order") as process_impact,
+        ):
+            from apps.fulfillment.services import refresh_legacy_impacts_for_fulfillments
+
+            refresh_legacy_impacts_for_fulfillments([self.fulfillment, second], actor="expedition.search")
+
+        process_impact.assert_not_called()
 
     def test_reassign_confirmed_delivery_moves_reservation_to_target_warehouse(self):
         validate_delivery_stock(
@@ -882,6 +977,49 @@ class DeliveryPreparationFlowTests(TestCase):
         self.assertEqual(result[0]["status"], FulfillmentOrder.FulfillmentStatus.DELIVERED)
         self.assertEqual(result[0]["deliveries"][0]["status"], DeliveryOrder.DeliveryStatus.DELIVERED_COMPLETE)
 
+    def test_expedition_queue_treats_open_remito_lines_as_not_pending(self):
+        self.fulfillment_line.ordered_qty = Decimal("3")
+        self.fulfillment_line.prepared_qty = Decimal("3")
+        self.fulfillment_line.save(update_fields=["ordered_qty", "prepared_qty", "updated_at"])
+        document = DeliveryDocument.objects.create(
+            delivery=self.delivery,
+            document_number="R-OPEN-1",
+            document_type=DeliveryDocument.DocumentType.REMITO,
+            status=DeliveryDocument.DocumentStatus.OPEN,
+            issued_at=timezone.now(),
+            customer_ref=self.fulfillment.customer_ref,
+            legacy_sales_order_number="SO-1",
+            warehouse_ref="W001",
+            created_by="tester",
+        )
+        DeliveryDocumentLine.objects.create(
+            document=document,
+            delivery_line=self.delivery_line,
+            item_ref=self.delivery_line.item_ref,
+            quantity=Decimal("3"),
+            delivery_unit_qty=Decimal("3"),
+            uom=self.delivery_line.uom,
+            legacy_sales_order_number="SO-1",
+            legacy_line_id=self.delivery_line.legacy_line_id,
+            warehouse_ref="W001",
+            created_by="tester",
+        )
+        customer = {"customer_ref": "CUST-1", "name": "Cliente Test", "address": {}, "source": "test"}
+
+        with patch("apps.fulfillment.services._resolve_customer_snapshots", return_value={"CUST-1": customer}):
+            result = expedition_queue(sales_order_number="SO-1", authorized_warehouses=["W001"])
+            stock_check = check_fulfillment_stock_for_split(
+                fulfillment_id=str(self.fulfillment.id),
+                lines=[{"fulfillment_line_id": str(self.fulfillment_line.id), "split_qty": "1"}],
+                authorized_warehouses=["W001"],
+            )
+
+        line = result[0]["lines"][0]
+        self.assertEqual(Decimal(line["pending_qty"]), Decimal("0"))
+        self.assertEqual(Decimal(line["max_dispatchable_qty"]), Decimal("0"))
+        self.assertFalse(stock_check["can_confirm"])
+        self.assertEqual(Decimal(stock_check["lines"][0]["available_qty"]), Decimal("0"))
+
     def test_expedition_queue_ingests_invoiced_legacy_order_when_missing_locally(self):
         legacy_order = SimpleNamespace(
             sales_order_number="SO-LEGACY",
@@ -1028,6 +1166,39 @@ class DeliveryPreparationFlowTests(TestCase):
         order_labels = {movement["label"] for movement in result[0]["movements"]}
         self.assertIn("Pedido ingresado a TMS/WMS", order_labels)
         self.assertIn("Ejecucion de reparto", order_labels)
+
+    def test_expedition_queue_uses_prefetched_route_assignment_context(self):
+        route = RouteSheet.objects.create(
+            route_number="HR-BULK-1",
+            status=RouteSheet.RouteStatus.IN_TRANSIT,
+            branch_ref="BR-1",
+            warehouse_ref="W001",
+            planned_date=timezone.localdate(),
+            created_by="planner",
+        )
+        RouteStop.objects.create(
+            route=route,
+            sequence=1,
+            status=RouteStop.StopStatus.PLANNED,
+            source_type="delivery_order",
+            source_ref=str(self.delivery.id),
+            customer_ref=self.fulfillment.customer_ref,
+            created_by="planner",
+        )
+        customer = {"customer_ref": "CUST-1", "name": "Cliente Test", "address": {}, "source": "test"}
+
+        with (
+            patch("apps.fulfillment.services._resolve_customer_snapshots", return_value={"CUST-1": customer}),
+            patch(
+                "apps.fulfillment.services._delivery_route_assignment",
+                side_effect=AssertionError("expedition queue must not query route assignment per delivery"),
+            ),
+        ):
+            result = expedition_queue(sales_order_number="SO-1", authorized_warehouses=["W001"])
+
+        route_sheet = result[0]["deliveries"][0]["route_sheet"]
+        self.assertEqual(route_sheet["route_number"], "HR-BULK-1")
+        self.assertEqual(route_sheet["stop_status"], RouteStop.StopStatus.PLANNED)
 
     def test_preparation_task_flow_marks_delivery_prepared_and_allows_remito(self):
         validate_delivery_stock(

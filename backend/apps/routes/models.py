@@ -98,6 +98,7 @@ class RouteStop(TimestampedModel, LegacyReferenceModel):
             models.Index(fields=["status", "sequence"]),
             models.Index(fields=["customer_ref"]),
             models.Index(fields=["legacy_sales_order_number"]),
+            models.Index(fields=["source_type", "source_ref"], name="routestop_source_ref_idx"),
         ]
 
 
