@@ -1,10 +1,13 @@
 from decimal import Decimal
+from io import StringIO
 from types import SimpleNamespace
 from unittest.mock import patch
 from uuid import uuid4
 
-from django.db import connection
+from django.core.management import call_command
+from django.db import connection, connections
 from django.test import TestCase
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
 from apps.core.models import StatusHistory
@@ -32,6 +35,7 @@ from apps.fulfillment.services import (
     ingest_legacy_order,
     issue_remito,
     mark_preparation_task_prepared,
+    process_legacy_order_impact,
     reassign_confirmed_delivery_warehouse,
     _line_delivery_date,
     send_delivery_to_prepare,
@@ -613,6 +617,261 @@ class DeliveryPreparationFlowTests(TestCase):
                 authorized_warehouses=["W001"],
             )
 
+    def test_process_legacy_return_impact_applies_local_rows_before_search(self):
+        legacy_order = SimpleNamespace(
+            sales_order_number="DEV-SO-1",
+            sales_order_number_orig="SO-1",
+            sales_order_type="D",
+            transaction_id="TX-DEV-SYNC",
+            transaction_number="TX-DEV-1",
+            invoice_number="INV-DEV-1",
+            invoice_date=timezone.now(),
+            modified_datetime=timezone.now(),
+            warehouse="W001",
+            store_id="STORE-1",
+            rec_id="ORDER-DEV-REC",
+        )
+        legacy_line = SimpleNamespace(
+            retail_line_item_id="10",
+            sales_order_line_rec_id="",
+            rec_id="LINE-DEV-REC",
+            item_number="ITEM-1",
+            ordered_sales_quantity=Decimal("1"),
+            remain_sales_physical=Decimal("0"),
+            sales_quantity_delivered=Decimal("0"),
+            sales_unit_symbol="UN",
+            shipping_warehouse_id="W001",
+            fulfillment_store_id="STORE-1",
+            warehouse="W001",
+        )
+        item_snapshot = {
+            "item_ref": "ITEM-1",
+            "name": "Producto Devuelto",
+            "sales_uom": "UN",
+            "delivery_uom": "UN",
+            "conversion_factor": "1.000000",
+            "unit_weight_kg": "1.000000",
+            "unit_volume_m3": "0.001000",
+            "virtual_product": False,
+        }
+
+        class FakeOrderManager:
+            def get(self, **_kwargs):
+                return legacy_order
+
+        class FakeLineManager:
+            def filter(self, **_kwargs):
+                return self
+
+            def order_by(self, *_args):
+                return [legacy_line]
+
+        with (
+            patch("apps.fulfillment.services.LegacyOrder.objects.using", return_value=FakeOrderManager()),
+            patch("apps.fulfillment.services.LegacyOrderLine.objects.using", return_value=FakeLineManager()),
+            patch("apps.fulfillment.services._resolve_legacy_line_item_snapshots", return_value={"10": item_snapshot}),
+        ):
+            process_legacy_order_impact(
+                sales_order_number="DEV-SO-1",
+                idempotency_key="sync-return-impact",
+                actor="legacy-order-sync",
+            )
+
+        impact = FulfillmentOrderImpact.objects.get(source_pk="TX-DEV-SYNC")
+        impact_line = impact.lines.get()
+        self.assertEqual(impact.status, FulfillmentOrderImpact.ImpactStatus.APPLIED)
+        self.assertEqual(impact.impact_type, FulfillmentOrderImpact.ImpactType.RETURN)
+        self.assertEqual(impact_line.fulfillment_line, self.fulfillment_line)
+        self.assertEqual(impact_line.applied_qty, Decimal("1"))
+        self.assertTrue(InventoryLedgerEntry.objects.filter(document_type="legacy_return", document_ref="DEV-SO-1").exists())
+
+        with patch("apps.fulfillment.services.refresh_legacy_impacts_for_fulfillments") as refresh_impacts:
+            result = expedition_queue(sales_order_number="SO-1", authorized_warehouses=["W001"])
+
+        self.assertEqual(result[0]["lines"][0]["returned_qty"], "1")
+        refresh_impacts.assert_not_called()
+
+    def test_ingest_legacy_order_materializes_customer_and_item_snapshots(self):
+        legacy_order = SimpleNamespace(
+            sales_order_number="SO-SNAP",
+            transaction_number="TX-SNAP",
+            transaction_id="TX-SNAP-ID",
+            invoice_number="INV-SNAP",
+            invoice_date=timezone.now(),
+            order_status="FACTURADO",
+            sales_order_type="P",
+            sales_order_number_orig="",
+            warehouse="W001",
+            rec_id="ORDER-REC",
+            store_id="STORE-1",
+            customer_account="CUST-SNAP",
+            sales_order_name="Cliente Snapshot",
+        )
+        legacy_line = SimpleNamespace(
+            retail_line_item_id="10",
+            sales_order_line_rec_id="LINE-REC",
+            rec_id="LINE-LEGACY-REC",
+            item_number="ITEM-SNAP",
+            ordered_sales_quantity=Decimal("2"),
+            remain_sales_physical=Decimal("2"),
+            sales_quantity_delivered=Decimal("0"),
+            sales_unit_symbol="UN",
+            shipping_warehouse_id="W001",
+            fulfillment_store_id="STORE-1",
+            warehouse="W001",
+            delivery_mode_code="home",
+            line_delivery_date=timezone.now(),
+            requested_shipping_date=None,
+            delivery_address_location_id="ADDR-1",
+            delivery_address_country_region_iso_code="ARG",
+            delivery_address_state_id="MN",
+            delivery_address_city="Posadas",
+            delivery_address_street="Uruguay",
+            delivery_address_street_number="3947",
+            delivery_address_zip_code="3300",
+            delivery_address_description="Casa",
+            delivery_address_latitude=None,
+            delivery_address_longitude=None,
+        )
+        item_snapshot = {
+            "item_ref": "ITEM-SNAP",
+            "name": "Producto Snapshot",
+            "long_name": "Producto Snapshot Largo",
+            "sales_uom": "Un",
+            "delivery_uom": "Un",
+            "conversion_factor": "1.000000",
+            "unit_weight_kg": "3.500000",
+            "unit_volume_m3": "0.250000",
+            "source": "test",
+        }
+        customer_snapshot = {
+            "customer_ref": "CUST-SNAP",
+            "name": "Cliente Snapshot",
+            "document_type": "DNI",
+            "document_number": "12.345.678",
+            "phone": "123",
+            "email": "cliente@example.com",
+            "address": {"street": "Uruguay"},
+            "address_text": "Uruguay",
+            "source": "test",
+        }
+
+        class FakeOrderManager:
+            def get(self, **_kwargs):
+                return legacy_order
+
+        class FakeLineManager:
+            def filter(self, **_kwargs):
+                return self
+
+            def order_by(self, *_args):
+                return [legacy_line]
+
+        with (
+            patch("apps.fulfillment.services.LegacyOrder.objects.using", return_value=FakeOrderManager()),
+            patch("apps.fulfillment.services.LegacyOrderLine.objects.using", return_value=FakeLineManager()),
+            patch("apps.fulfillment.services._order_is_effectively_invoiced", return_value=True),
+            patch("apps.fulfillment.services._resolve_legacy_line_item_snapshots", return_value={"10": item_snapshot}),
+            patch("apps.fulfillment.services._resolve_customer_snapshots", return_value={"CUST-SNAP": customer_snapshot}),
+            patch("apps.fulfillment.services._resolve_customer_address_for_line", return_value=None),
+            patch("apps.fulfillment.services.process_legacy_impacts_for_order", return_value=0),
+        ):
+            ingest_legacy_order(
+                sales_order_number="SO-SNAP",
+                idempotency_key="ingest-snapshots",
+                actor="tester",
+            )
+
+        fulfillment = FulfillmentOrder.objects.get(legacy_sales_order_number="SO-SNAP")
+        line = fulfillment.lines.get()
+        self.assertEqual(fulfillment.customer_snapshot["name"], "Cliente Snapshot")
+        self.assertEqual(fulfillment.customer_snapshot["document_number"], "12.345.678")
+        self.assertEqual(fulfillment.customer_document, "12345678")
+        self.assertEqual(line.item_snapshot["name"], "Producto Snapshot")
+        self.assertEqual(line.item_snapshot["unit_weight_kg"], "3.500000")
+
+    def test_backfill_fulfillment_snapshots_command_materializes_local_defaults(self):
+        out = StringIO()
+
+        call_command(
+            "backfill_fulfillment_snapshots",
+            sales_order_number="SO-1",
+            stdout=out,
+        )
+
+        self.fulfillment.refresh_from_db()
+        self.fulfillment_line.refresh_from_db()
+        self.assertEqual(self.fulfillment.customer_snapshot["customer_ref"], "CUST-1")
+        self.assertEqual(self.fulfillment.customer_snapshot["source"], "local_backfill")
+        self.assertEqual(self.fulfillment_line.item_snapshot["item_ref"], "ITEM-1")
+        self.assertEqual(self.fulfillment_line.item_snapshot["source"], "local_backfill")
+        self.assertIn("fulfillment_orders=1", out.getvalue())
+        self.assertIn("fulfillment_lines=1", out.getvalue())
+
+    def test_backfill_fulfillment_snapshots_command_enriches_from_legacy_sources(self):
+        self.fulfillment.customer_snapshot = {
+            "customer_ref": "CUST-1",
+            "name": "CUST-1",
+            "document_number": "",
+            "address": {},
+            "source": "local_backfill",
+        }
+        self.fulfillment.customer_document = ""
+        self.fulfillment.save(update_fields=["customer_snapshot", "customer_document", "updated_at"])
+        self.fulfillment_line.item_snapshot = {
+            "item_ref": "ITEM-1",
+            "name": "ITEM-1",
+            "sales_uom": "UN",
+            "delivery_uom": "UN",
+            "conversion_factor": "1.000000",
+            "source": "local_backfill",
+        }
+        self.fulfillment_line.save(update_fields=["item_snapshot", "updated_at"])
+        out = StringIO()
+        customer_snapshot = {
+            "customer_ref": "CUST-1",
+            "name": "Cliente Real",
+            "document_number": "12.345.678",
+            "address": {},
+            "source": "legacy",
+        }
+        item_snapshot = {
+            "item_ref": "ITEM-1",
+            "name": "Producto Real",
+            "sales_uom": "UN",
+            "delivery_uom": "UN",
+            "conversion_factor": "1.000000",
+            "unit_weight_kg": "2.000000",
+            "unit_volume_m3": "0.010000",
+            "source": "legacy",
+        }
+
+        with (
+            patch(
+                "apps.fulfillment.management.commands.backfill_fulfillment_snapshots._resolve_customer_snapshots",
+                return_value={"CUST-1": customer_snapshot},
+            ),
+            patch(
+                "apps.fulfillment.management.commands.backfill_fulfillment_snapshots._resolve_line_item_snapshots",
+                return_value={self.fulfillment_line.id: item_snapshot},
+            ),
+        ):
+            call_command(
+                "backfill_fulfillment_snapshots",
+                sales_order_number="SO-1",
+                source="legacy",
+                all=True,
+                stdout=out,
+            )
+
+        self.fulfillment.refresh_from_db()
+        self.fulfillment_line.refresh_from_db()
+        self.assertEqual(self.fulfillment.customer_snapshot["name"], "Cliente Real")
+        self.assertEqual(self.fulfillment.customer_document, "12345678")
+        self.assertEqual(self.fulfillment_line.item_snapshot["name"], "Producto Real")
+        self.assertEqual(self.fulfillment_line.item_snapshot["unit_weight_kg"], "2.000000")
+        self.assertIn("source=legacy", out.getvalue())
+
     def test_expedition_queue_matches_normalized_indexed_filters(self):
         customer = {"customer_ref": "CUST-1", "name": "Cliente Test", "document_number": "", "address": {}}
         with patch("apps.fulfillment.services._resolve_customer_snapshots", return_value={"CUST-1": customer}):
@@ -621,6 +880,80 @@ class DeliveryPreparationFlowTests(TestCase):
 
         self.assertEqual([row["sales_order_number"] for row in by_order], ["SO-1"])
         self.assertEqual([row["customer_ref"] for row in by_customer], ["CUST-1"])
+
+    def test_expedition_queue_uses_materialized_snapshots_without_litecore_or_parquet(self):
+        self.fulfillment.customer_snapshot = {
+            "customer_ref": "CUST-1",
+            "name": "Cliente Local",
+            "document_number": "12.345.678",
+            "address": {},
+        }
+        self.fulfillment.customer_document = "12345678"
+        self.fulfillment.save(update_fields=["customer_snapshot", "customer_document", "updated_at"])
+        self.fulfillment_line.item_snapshot = {
+            "item_ref": "ITEM-1",
+            "name": "Producto Local",
+            "long_name": "Producto Local Largo",
+            "sales_uom": "Un",
+            "delivery_uom": "Un",
+            "conversion_factor": "1.000000",
+            "unit_weight_kg": "1.000000",
+            "unit_volume_m3": "0.100000",
+        }
+        self.fulfillment_line.save(update_fields=["item_snapshot", "updated_at"])
+
+        with (
+            patch("apps.fulfillment.services._ensure_legacy_orders_available_for_expedition") as ensure_legacy,
+            patch("apps.fulfillment.services.refresh_legacy_impacts_for_fulfillments") as refresh_impacts,
+            patch("apps.fulfillment.services._resolve_customer_snapshots") as customer_snapshots,
+            patch("apps.fulfillment.services.material_snapshots_for_items") as parquet_materials,
+            patch("apps.fulfillment.services._legacy_item_snapshots") as legacy_items,
+        ):
+            by_order = expedition_queue(sales_order_number="SO-1", authorized_warehouses=["W001"])
+            by_dni = expedition_queue(customer_dni="12.345.678", authorized_warehouses=["W001"])
+
+        self.assertEqual(by_order[0]["customer"]["name"], "Cliente Local")
+        self.assertEqual(by_order[0]["lines"][0]["item_name"], "Producto Local")
+        self.assertEqual([row["sales_order_number"] for row in by_dni], ["SO-1"])
+        ensure_legacy.assert_not_called()
+        refresh_impacts.assert_not_called()
+        customer_snapshots.assert_not_called()
+        parquet_materials.assert_not_called()
+        legacy_items.assert_not_called()
+
+    def test_expedition_queue_exact_local_search_executes_no_litecore_queries(self):
+        self.fulfillment.customer_snapshot = {
+            "customer_ref": "CUST-1",
+            "name": "Cliente Local",
+            "document_number": "12.345.678",
+            "address": {},
+        }
+        self.fulfillment.customer_document = "12345678"
+        self.fulfillment.save(update_fields=["customer_snapshot", "customer_document", "updated_at"])
+        self.fulfillment_line.item_snapshot = {
+            "item_ref": "ITEM-1",
+            "name": "Producto Local",
+            "sales_uom": "Un",
+            "delivery_uom": "Un",
+            "conversion_factor": "1.000000",
+            "unit_weight_kg": "1.000000",
+            "unit_volume_m3": "0.100000",
+        }
+        self.fulfillment_line.save(update_fields=["item_snapshot", "updated_at"])
+
+        with (
+            CaptureQueriesContext(connections["default"]) as default_queries,
+            patch.object(
+                connections["litecore"],
+                "ensure_connection",
+                side_effect=AssertionError("expedition queue must not query litecore"),
+            ) as litecore_connection,
+        ):
+            result = expedition_queue(sales_order_number="SO-1", authorized_warehouses=["W001"])
+
+        self.assertEqual([row["sales_order_number"] for row in result], ["SO-1"])
+        self.assertGreater(len(default_queries), 0)
+        litecore_connection.assert_not_called()
 
     def test_line_item_snapshots_reuse_pos_freight_refs_per_store(self):
         second_line = FulfillmentOrderLine.objects.create(
@@ -644,20 +977,20 @@ class DeliveryPreparationFlowTests(TestCase):
 
         self.assertEqual([call.args[0] for call in pos_refs.call_args_list], ["W001", ""])
 
-    def test_expedition_queue_refreshes_legacy_impacts_for_customer_search(self):
-        customer = {"customer_ref": "CUST-1", "name": "Cliente Test", "document_number": "", "address": {}}
+    def test_expedition_queue_does_not_refresh_legacy_impacts_for_customer_search(self):
         with (
             patch("apps.fulfillment.services.process_legacy_impacts_for_order") as process_impacts,
-            patch("apps.fulfillment.services._resolve_customer_snapshots", return_value={"CUST-1": customer}),
+            patch("apps.fulfillment.services.refresh_legacy_impacts_for_fulfillments") as refresh_impacts,
+            patch("apps.fulfillment.services._resolve_customer_snapshots") as customer_snapshots,
         ):
-            expedition_queue(customer_ref="cust-1", authorized_warehouses=["W001"])
+            result = expedition_queue(customer_ref="cust-1", authorized_warehouses=["W001"])
 
-        process_impacts.assert_called_once_with(
-            sales_order_number="SO-1",
-            actor="expedition.search",
-        )
+        self.assertEqual([row["sales_order_number"] for row in result], ["SO-1"])
+        process_impacts.assert_not_called()
+        refresh_impacts.assert_not_called()
+        customer_snapshots.assert_not_called()
 
-    def test_expedition_queue_refreshes_legacy_impacts_in_bulk_for_customer_search(self):
+    def test_expedition_queue_customer_search_uses_local_rows_without_bulk_legacy_refresh(self):
         second = FulfillmentOrder.objects.create(
             fulfillment_number="FUL-2",
             status=FulfillmentOrder.FulfillmentStatus.PENDING,
@@ -675,19 +1008,18 @@ class DeliveryPreparationFlowTests(TestCase):
             legacy_sales_order_number="SO-2",
             legacy_line_id="20",
         )
-        customer = {"customer_ref": "CUST-1", "name": "Cliente Test", "document_number": "", "address": {}}
 
         with (
             patch("apps.fulfillment.services.process_legacy_impacts_for_order") as process_impacts,
             patch("apps.fulfillment.services._legacy_impact_orders_for_order_numbers", return_value=[]) as bulk_impacts,
-            patch("apps.fulfillment.services._resolve_customer_snapshots", return_value={"CUST-1": customer}),
+            patch("apps.fulfillment.services._resolve_customer_snapshots") as customer_snapshots,
         ):
             result = expedition_queue(customer_ref="cust-1", authorized_warehouses=["W001"])
 
         self.assertEqual({row["sales_order_number"] for row in result}, {"SO-1", "SO-2"})
         process_impacts.assert_not_called()
-        bulk_impacts.assert_called_once()
-        self.assertEqual(bulk_impacts.call_args.args[0], {"SO-1", "SO-2"})
+        bulk_impacts.assert_not_called()
+        customer_snapshots.assert_not_called()
 
     def test_refresh_legacy_impacts_skips_applied_same_source_version(self):
         second = FulfillmentOrder.objects.create(
@@ -897,22 +1229,23 @@ class DeliveryPreparationFlowTests(TestCase):
             "source": "test",
         }
         customer = {"customer_ref": "CUST-1", "name": "Cliente Test", "address": {}, "source": "test"}
-        with (
-            patch("apps.fulfillment.services._resolve_line_item_snapshots", return_value={self.fulfillment_line.id: snapshot}),
-            patch("apps.fulfillment.services._resolve_customer_snapshots", return_value={"CUST-1": customer}),
-        ):
-            result = split_fulfillment_delivery(
-                fulfillment_id=str(self.fulfillment.id),
-                lines=[{"fulfillment_line_id": str(self.fulfillment_line.id), "delivery_unit_qty": "1"}],
-                delivery_mode="home",
-                planned_date=None,
-                reason="Entrega por cajas",
-                idempotency_key="split-delivery-units",
-                actor="tester",
-                authorized_warehouses=["W001"],
-                receiver="Cliente autorizado",
-                reference="Retira con DNI",
-            )
+        self.fulfillment.customer_snapshot = customer
+        self.fulfillment.save(update_fields=["customer_snapshot", "updated_at"])
+        self.fulfillment_line.item_snapshot = snapshot
+        self.fulfillment_line.save(update_fields=["item_snapshot", "updated_at"])
+
+        result = split_fulfillment_delivery(
+            fulfillment_id=str(self.fulfillment.id),
+            lines=[{"fulfillment_line_id": str(self.fulfillment_line.id), "delivery_unit_qty": "1"}],
+            delivery_mode="home",
+            planned_date=None,
+            reason="Entrega por cajas",
+            idempotency_key="split-delivery-units",
+            actor="tester",
+            authorized_warehouses=["W001"],
+            receiver="Cliente autorizado",
+            reference="Retira con DNI",
+        )
 
         delivery_line = DeliveryOrderLine.objects.get(delivery_id=result.payload["result"]["id"])
         self.assertEqual(delivery_line.delivery_unit_qty, Decimal("1.000000"))
@@ -961,20 +1294,24 @@ class DeliveryPreparationFlowTests(TestCase):
             },
         }
 
-        with patch("apps.fulfillment.services._resolve_line_item_snapshots", return_value=snapshots):
-            result = split_fulfillment_delivery(
-                fulfillment_id=str(self.fulfillment.id),
-                lines=[
-                    {"fulfillment_line_id": str(self.fulfillment_line.id), "split_qty": "2"},
-                    {"fulfillment_line_id": str(service_line.id), "split_qty": "1"},
-                ],
-                delivery_mode="home",
-                planned_date=None,
-                reason="Entrega sin virtuales",
-                idempotency_key="split-skip-virtual-lines",
-                actor="tester",
-                authorized_warehouses=["W001"],
-            )
+        self.fulfillment_line.item_snapshot = snapshots[self.fulfillment_line.id]
+        self.fulfillment_line.save(update_fields=["item_snapshot", "updated_at"])
+        service_line.item_snapshot = snapshots[service_line.id]
+        service_line.save(update_fields=["item_snapshot", "updated_at"])
+
+        result = split_fulfillment_delivery(
+            fulfillment_id=str(self.fulfillment.id),
+            lines=[
+                {"fulfillment_line_id": str(self.fulfillment_line.id), "split_qty": "2"},
+                {"fulfillment_line_id": str(service_line.id), "split_qty": "1"},
+            ],
+            delivery_mode="home",
+            planned_date=None,
+            reason="Entrega sin virtuales",
+            idempotency_key="split-skip-virtual-lines",
+            actor="tester",
+            authorized_warehouses=["W001"],
+        )
 
         delivery_id = result.payload["result"]["id"]
         delivery_lines = DeliveryOrderLine.objects.filter(delivery_id=delivery_id)
@@ -1003,12 +1340,10 @@ class DeliveryPreparationFlowTests(TestCase):
             "unit_weight_kg": "0.000000",
             "unit_volume_m3": "0.000000",
         }
-        customer = {"customer_ref": "CUST-1", "name": "Cliente Test", "address": {}, "source": "test"}
-        with (
-            patch("apps.fulfillment.services._resolve_line_item_snapshots", return_value={self.fulfillment_line.id: snapshot}),
-            patch("apps.fulfillment.services._resolve_customer_snapshots", return_value={"CUST-1": customer}),
-        ):
-            result = expedition_queue(sales_order_number="SO-1", authorized_warehouses=["W001"])
+        self.fulfillment_line.item_snapshot = snapshot
+        self.fulfillment_line.save(update_fields=["item_snapshot", "updated_at"])
+
+        result = expedition_queue(sales_order_number="SO-1", authorized_warehouses=["W001"])
 
         line = result[0]["lines"][0]
         self.assertEqual(line["uom"], "Un")
@@ -1075,56 +1410,16 @@ class DeliveryPreparationFlowTests(TestCase):
         self.assertFalse(stock_check["can_confirm"])
         self.assertEqual(Decimal(stock_check["lines"][0]["available_qty"]), Decimal("0"))
 
-    def test_expedition_queue_ingests_invoiced_legacy_order_when_missing_locally(self):
-        legacy_order = SimpleNamespace(
-            sales_order_number="SO-LEGACY",
-            modified_datetime=timezone.now(),
-            invoice_date=timezone.now(),
-        )
-
-        def fake_ingest(**kwargs):
-            fulfillment = FulfillmentOrder.objects.create(
-                fulfillment_number="FUL-SO-LEGACY",
-                status=FulfillmentOrder.FulfillmentStatus.PENDING,
-                customer_ref="CUST-2",
-                delivery_mode="home",
-                warehouse_ref="W002",
-                legacy_sales_order_number=kwargs["sales_order_number"],
-                created_by=kwargs["actor"],
-            )
-            FulfillmentOrderLine.objects.create(
-                fulfillment=fulfillment,
-                ordered_qty=Decimal("2"),
-                uom="UN",
-                item_ref="ITEM-2",
-                warehouse_ref="W002",
-                legacy_sales_order_number=kwargs["sales_order_number"],
-                legacy_line_id="20",
-            )
-
-        def snapshots(lines):
-            return {
-                line.id: {
-                    "item_ref": line.item_ref,
-                    "name": "Producto legacy",
-                    "sales_uom": "UN",
-                    "delivery_uom": "UN",
-                    "conversion_factor": "1.000000",
-                }
-                for line in lines
-            }
-
+    def test_expedition_queue_returns_empty_when_order_has_not_been_synced_locally(self):
         with (
-            patch("apps.fulfillment.services._legacy_orders_for_expedition_search", return_value=[legacy_order]),
-            patch("apps.fulfillment.services.ingest_legacy_order", side_effect=fake_ingest),
-            patch("apps.fulfillment.services._resolve_line_item_snapshots", side_effect=snapshots),
-            patch("apps.fulfillment.services._resolve_customer_snapshots", return_value={"CUST-2": {"name": "Cliente Legacy", "address": {}}}),
+            patch("apps.fulfillment.services._legacy_orders_for_expedition_search") as legacy_search,
+            patch("apps.fulfillment.services.ingest_legacy_order") as ingest_order,
         ):
             result = expedition_queue(sales_order_number="INV-LEGACY", authorized_warehouses=["W002"])
 
-        self.assertEqual(len(result), 1)
-        self.assertEqual(result[0]["sales_order_number"], "SO-LEGACY")
-        self.assertEqual(result[0]["warehouse_ref"], "W002")
+        self.assertEqual(result, [])
+        legacy_search.assert_not_called()
+        ingest_order.assert_not_called()
 
     def test_expedition_queue_uses_target_warehouse_for_stock_availability(self):
         InventoryBalance.objects.create(
@@ -1281,6 +1576,8 @@ class DeliveryPreparationFlowTests(TestCase):
         self.delivery.refresh_from_db()
         self.assertEqual(task.assigned_to, "EMP-1")
         self.assertEqual(self.delivery.status, DeliveryOrder.DeliveryStatus.PREPARING)
+        queue = expedition_queue(sales_order_number="SO-1", authorized_warehouses=["W001"])
+        self.assertEqual(queue[0]["lines"][0]["preparing_qty"], "3")
 
         mark_preparation_task_prepared(
             task_id=str(task.id),

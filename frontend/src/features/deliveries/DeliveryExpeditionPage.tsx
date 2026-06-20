@@ -97,6 +97,7 @@ type ExpeditionLine = {
   coverageGroup: string;
   orderedQty: number;
   reservedQty: number;
+  preparingQty: number;
   preparedQty: number;
   deliveredQty: number;
   cancelledQty: number;
@@ -517,6 +518,10 @@ function getCommittedQty(line: ExpeditionLine) {
   return Math.max(line.reservedQty, line.plannedQty);
 }
 
+function getReservedDisplayQty(line: ExpeditionLine) {
+  return Math.max(0, getCommittedQty(line) - line.preparingQty - line.preparedQty);
+}
+
 function orderImpactBadges(order: ExpeditionOrder | undefined) {
   if (!order) {
     return [];
@@ -781,6 +786,7 @@ function orderFromApi(order: ApiFulfillmentOrder): ExpeditionOrder {
         coverageGroup: line.coverage_group || "",
         orderedQty: asNumber(line.ordered_qty),
         reservedQty: asNumber(line.reserved_qty),
+        preparingQty: asNumber(line.preparing_qty),
         preparedQty: asNumber(line.prepared_qty),
         deliveredQty: asNumber(line.delivered_qty),
         cancelledQty: asNumber(line.cancelled_qty),
@@ -1789,13 +1795,14 @@ export function DeliveryExpeditionPage() {
               )}
 
               <div className="min-h-0 flex-1 overflow-auto">
-                <table className="delivery-expedition-table min-w-[860px] w-full border-collapse text-left text-[12px]">
+                <table className="delivery-expedition-table min-w-[940px] w-full border-collapse text-left text-[12px]">
                   <thead className="sticky top-0 z-10 bg-deep text-white">
                     <tr>
                       <th className="px-3 py-2 font-semibold">Producto</th>
                       <th className="px-3 py-2 font-semibold">Unidad</th>
                       <th className="px-3 py-2 font-semibold">Pedido</th>
                       <th className="px-3 py-2 font-semibold">Reservado</th>
+                      <th className="px-3 py-2 font-semibold">En prep.</th>
                       <th className="px-3 py-2 font-semibold">Preparado</th>
                       <th className="px-3 py-2 font-semibold">Pendiente</th>
                       <th className="px-3 py-2 font-semibold">A entregar</th>
@@ -1870,7 +1877,8 @@ export function DeliveryExpeditionPage() {
                             {line.cancelledQty > 0 && <div className="mt-1 text-[11px] text-rose-700">Anulado {formatQty(line.cancelledQty, line.uom)}</div>}
                             {line.returnedQty > 0 && <div className="mt-1 text-[11px] text-amber-700">Devuelto {formatQty(line.returnedQty, line.uom)}</div>}
                           </td>
-                          <td className="whitespace-nowrap px-3 py-2 font-mono text-night">{formatQty(getCommittedQty(line), line.uom)}</td>
+                          <td className="whitespace-nowrap px-3 py-2 font-mono text-night">{formatQty(getReservedDisplayQty(line), line.uom)}</td>
+                          <td className="whitespace-nowrap px-3 py-2 font-mono text-night">{formatQty(line.preparingQty, line.uom)}</td>
                           <td className="whitespace-nowrap px-3 py-2 font-mono text-night">{formatQty(line.preparedQty, line.uom)}</td>
                           <td className={`whitespace-nowrap px-3 py-2 font-mono ${pendingClass}`}>
                             <div>{formatQty(line.pendingQty, line.uom)}</div>
@@ -1977,143 +1985,164 @@ export function DeliveryExpeditionPage() {
               </button>
             </div>
           </div>
-          <div className="min-h-0 flex-1 overflow-auto">
-            {visibleDeliveries.length ? (
-              visibleDeliveries.map((delivery) => {
-                const partialInfo = getPartialConfirmedInfo(activeOrder, delivery, visibleDeliveries);
-                const badgeLabel = delivery.source === "draft" ? "borrador local" : partialInfo ? "parcial confirmada" : statusLabel[delivery.status];
-                const badgeTone = partialInfo ? "warning" : statusTone[delivery.status];
-                return (
-                  <button
-                    key={delivery.id}
-                    type="button"
-                    onClick={() => {
-                      if (delivery.status !== "remito") {
-                        setActiveDeliveryId(delivery.id);
-                      }
-                      setSummaryDeliveryId(delivery.id);
-                      setMessage(null);
-                    }}
-                    className={`block w-full border-b border-borderSoft px-3 py-3 text-left transition hover:bg-softStart focus:outline-none focus:ring-2 focus:ring-inset focus:ring-primary/30 ${
-                      delivery.id === summaryDelivery?.id ? "bg-white" : "bg-surface"
-                    }`}
-                  >
-                    <div className="flex items-start justify-between gap-2">
-                      <div>
-                        <div className="font-mono text-[13px] font-semibold text-night">{delivery.number}</div>
-                        <div className="mt-1 text-[11px] text-secondaryText">
-                          {delivery.issuedAt ? formatAppDateTime(delivery.issuedAt) : formatAppDate(delivery.plannedDate)} / {delivery.mode}
-                        </div>
-                      </div>
-                      <StatusBadge label={badgeLabel} tone={badgeTone} />
-                    </div>
-                    <div className="mt-2 grid grid-cols-2 gap-2 text-[11px] text-secondaryText">
-                      <div>
-                        <span className="font-semibold">Cantidad</span>
-                        <div className="font-mono text-night">{formatDeliveryQty(activeOrder, delivery)}</div>
-                      </div>
-                      <div>
-                        <span className="font-semibold">Remito</span>
-                        <div className="font-mono text-night">{delivery.remitoNumber ?? "pendiente"}</div>
-                      </div>
-                      {partialInfo && (
-                        <div className="col-span-2">
-                          <span className="font-semibold">Saldo</span>
-                          <div className="font-mono text-amber-700">{partialInfo.remainingText}</div>
-                        </div>
-                      )}
-                      {delivery.preparationAssignee && (
-                        <div className="col-span-2">
-                          <span className="font-semibold">Preparador</span>
-                          <div className="font-mono text-night">{delivery.preparationAssignee}</div>
-                        </div>
-                      )}
-                      {delivery.routeSheet && (
-                        <div className="col-span-2 rounded border border-blue-200 bg-blue-50 px-2 py-1 text-blue-800">
-                          En hoja de ruta <span className="font-mono font-semibold">{delivery.routeSheet.routeNumber}</span>
-                        </div>
-                      )}
-                    </div>
-                  </button>
-                );
-              })
-            ) : (
-              <div className="px-3 py-6 text-[12px] text-secondaryText">Sin entregas.</div>
+          <div className="delivery-expedition-side-body min-h-0 flex-1 overflow-auto">
+            {summaryDelivery && (
+              <section className="delivery-summary-panel border-b border-borderSoft bg-white px-3 py-3" aria-labelledby="delivery-summary-title">
+                <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-2">
+                  <h3 id="delivery-summary-title" className="text-[12px] font-semibold uppercase text-secondaryText">
+                    {summaryHasRemito ? "Resumen de remito" : "Resumen de entrega"}
+                  </h3>
+                  <div className="min-w-0 text-left sm:text-right">
+                    <div className="text-[10px] font-semibold uppercase text-secondaryText">Remito</div>
+                    <div className="mt-0.5 break-words font-mono text-[12px] font-semibold text-night">{summaryDelivery.remitoNumber ?? "no emitido"}</div>
+                  </div>
+                </div>
+                <dl className="delivery-summary-meta mt-3 grid gap-2 text-[12px]">
+                  <div className="min-w-0">
+                    <dt className="font-semibold text-secondaryText">Entrega</dt>
+                    <dd className="mt-0.5 font-mono text-night">{summaryDelivery.number}</dd>
+                  </div>
+                  <div className="min-w-0">
+                    <dt className="font-semibold text-secondaryText">Fecha</dt>
+                    <dd className="mt-0.5 font-mono text-night">{formatAppDateTime(summaryDelivery.issuedAt || summaryDelivery.plannedDate)}</dd>
+                  </div>
+                  <div className="min-w-0">
+                    <dt className="font-semibold text-secondaryText">Autorizado</dt>
+                    <dd className="mt-0.5 min-w-0 break-words text-night">{summaryDelivery.receiver || "sin informar"}</dd>
+                  </div>
+                  <div className="min-w-0">
+                    <dt className="font-semibold text-secondaryText">Almacen retiro</dt>
+                    <dd className="mt-0.5 font-mono text-night">{summaryDeliveryWarehouse}</dd>
+                  </div>
+                  <div className="min-w-0">
+                    <dt className="font-semibold text-secondaryText">Unidades</dt>
+                    <dd className="mt-0.5 font-mono text-night">{formatQty(summaryDeliveryTotals.deliveryUnits)}</dd>
+                  </div>
+                  <div className="min-w-0">
+                    <dt className="font-semibold text-secondaryText">Peso</dt>
+                    <dd className="mt-0.5 font-mono text-night">{formatMeasure(summaryDeliveryTotals.weightKg, "kg")}</dd>
+                  </div>
+                  <div className="min-w-0">
+                    <dt className="font-semibold text-secondaryText">Volumen</dt>
+                    <dd className="mt-0.5 font-mono text-night">{formatMeasure(summaryDeliveryTotals.volumeM3, "m3", 4)}</dd>
+                  </div>
+                  <div className="min-w-0">
+                    <dt className="font-semibold text-secondaryText">Preparador</dt>
+                    <dd className="mt-0.5 min-w-0 break-words font-mono text-night">{summaryDelivery.preparationAssignee ?? "sin asignar"}</dd>
+                  </div>
+                </dl>
+                <div className="mt-3 border-t border-borderSoft pt-3">
+                  <h4 className="text-[11px] font-semibold uppercase text-secondaryText">
+                    {summaryHasRemito ? "Articulos del remito" : "Articulos de la entrega"}
+                  </h4>
+                  <div className="mt-2 overflow-x-auto">
+                    <table className="delivery-summary-lines-table w-full border-collapse text-left text-[11px]">
+                      <thead className="bg-softMid text-secondaryText">
+                        <tr>
+                          <th className="px-2 py-1 font-semibold">Articulo</th>
+                          <th className="px-2 py-1 font-semibold">Cantidad</th>
+                          <th className="px-2 py-1 font-semibold">Almacen</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {summaryDeliveryLines.map((line) => (
+                          <tr key={line.id} className="border-t border-borderSoft">
+                            <td className="px-2 py-1 text-night">
+                              <div className="font-mono font-semibold">{line.itemRef}</div>
+                              <div className="mt-0.5 leading-4">{line.itemName}</div>
+                            </td>
+                            <td className="px-2 py-1 font-mono text-night">
+                              <div>{formatQty(line.deliveryQty, line.deliveryUom)}</div>
+                              {line.conversionFactor !== 1 && (
+                                <div className="mt-0.5 text-secondaryText">{formatQty(line.commercialQty, line.commercialUom)}</div>
+                              )}
+                            </td>
+                            <td className="px-2 py-1 font-mono text-night">{line.warehouse || "s/d"}</td>
+                          </tr>
+                        ))}
+                        {!summaryDeliveryLines.length && (
+                          <tr>
+                            <td className="px-2 py-2 text-secondaryText" colSpan={3}>
+                              Sin articulos.
+                            </td>
+                          </tr>
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </section>
             )}
+            <div className="delivery-expedition-delivery-list">
+              {visibleDeliveries.length ? (
+                visibleDeliveries.map((delivery) => {
+                  const partialInfo = getPartialConfirmedInfo(activeOrder, delivery, visibleDeliveries);
+                  const badgeLabel = delivery.source === "draft" ? "borrador local" : partialInfo ? "parcial confirmada" : statusLabel[delivery.status];
+                  const badgeTone = partialInfo ? "warning" : statusTone[delivery.status];
+                  return (
+                    <button
+                      key={delivery.id}
+                      type="button"
+                      onClick={() => {
+                        if (delivery.status !== "remito") {
+                          setActiveDeliveryId(delivery.id);
+                        }
+                        setSummaryDeliveryId(delivery.id);
+                        setMessage(null);
+                      }}
+                      className={`block w-full border-b border-borderSoft px-3 py-3 text-left transition hover:bg-softStart focus:outline-none focus:ring-2 focus:ring-inset focus:ring-primary/30 ${
+                        delivery.id === summaryDelivery?.id ? "bg-white" : "bg-surface"
+                      }`}
+                    >
+                      <div className="flex items-start justify-between gap-2">
+                        <div>
+                          <div className="font-mono text-[13px] font-semibold text-night">{delivery.number}</div>
+                          <div className="mt-1 text-[11px] text-secondaryText">
+                            {delivery.issuedAt ? formatAppDateTime(delivery.issuedAt) : formatAppDate(delivery.plannedDate)} / {delivery.mode}
+                          </div>
+                        </div>
+                        <StatusBadge label={badgeLabel} tone={badgeTone} />
+                      </div>
+                      <div className="mt-2 grid grid-cols-2 gap-2 text-[11px] text-secondaryText">
+                        <div>
+                          <span className="font-semibold">Cantidad</span>
+                          <div className="font-mono text-night">{formatDeliveryQty(activeOrder, delivery)}</div>
+                        </div>
+                        <div>
+                          <span className="font-semibold">Remito</span>
+                          <div className="font-mono text-night">{delivery.remitoNumber ?? "pendiente"}</div>
+                        </div>
+                        {partialInfo && (
+                          <div className="col-span-2">
+                            <span className="font-semibold">Saldo</span>
+                            <div className="font-mono text-amber-700">{partialInfo.remainingText}</div>
+                          </div>
+                        )}
+                        {delivery.preparationAssignee && (
+                          <div className="col-span-2">
+                            <span className="font-semibold">Preparador</span>
+                            <div className="font-mono text-night">{delivery.preparationAssignee}</div>
+                          </div>
+                        )}
+                        {delivery.routeSheet && (
+                          <div className="col-span-2 rounded border border-blue-200 bg-blue-50 px-2 py-1 text-blue-800">
+                            En hoja de ruta <span className="font-mono font-semibold">{delivery.routeSheet.routeNumber}</span>
+                          </div>
+                        )}
+                      </div>
+                    </button>
+                  );
+                })
+              ) : (
+                <div className="px-3 py-6 text-[12px] text-secondaryText">Sin entregas.</div>
+              )}
+            </div>
             {activeOrder && (
-              <div className="border-t border-borderSoft bg-surface p-3">
+              <div className="delivery-expedition-traceability border-t border-borderSoft bg-surface p-3">
                 <TraceabilitySection events={orderTimelineEvents} recordRef={activeOrder.orderNumber} />
               </div>
             )}
           </div>
-
-          {summaryDelivery && (
-          <div className="shrink-0 border-t border-borderSoft bg-white px-3 py-3">
-            <div className="flex items-start justify-between gap-3">
-              <h3 className="text-[12px] font-semibold uppercase text-secondaryText">{summaryHasRemito ? "Resumen de remito" : "Resumen de entrega"}</h3>
-              <div className="text-right">
-                <div className="text-[10px] font-semibold uppercase text-secondaryText">Remito</div>
-                <div className="mt-0.5 font-mono text-[12px] font-semibold text-night">{summaryDelivery.remitoNumber ?? "no emitido"}</div>
-              </div>
-            </div>
-            <dl className="mt-3 grid grid-cols-[7rem_minmax(0,1fr)] gap-x-3 gap-y-2 text-[12px]">
-              <dt className="font-semibold text-secondaryText">Entrega</dt>
-              <dd className="font-mono text-night">{summaryDelivery.number}</dd>
-              <dt className="font-semibold text-secondaryText">Fecha</dt>
-              <dd className="font-mono text-night">{formatAppDateTime(summaryDelivery.issuedAt || summaryDelivery.plannedDate)}</dd>
-              <dt className="font-semibold text-secondaryText">Autorizado</dt>
-              <dd className="min-w-0 break-words text-night">{summaryDelivery.receiver || "sin informar"}</dd>
-              <dt className="font-semibold text-secondaryText">Almacen retiro</dt>
-              <dd className="font-mono text-night">{summaryDeliveryWarehouse}</dd>
-              <dt className="font-semibold text-secondaryText">Unidades</dt>
-              <dd className="font-mono text-night">{formatQty(summaryDeliveryTotals.deliveryUnits)}</dd>
-              <dt className="font-semibold text-secondaryText">Peso</dt>
-              <dd className="font-mono text-night">{formatMeasure(summaryDeliveryTotals.weightKg, "kg")}</dd>
-              <dt className="font-semibold text-secondaryText">Volumen</dt>
-              <dd className="font-mono text-night">{formatMeasure(summaryDeliveryTotals.volumeM3, "m3", 4)}</dd>
-              <dt className="font-semibold text-secondaryText">Preparador</dt>
-              <dd className="font-mono text-night">{summaryDelivery.preparationAssignee ?? "sin asignar"}</dd>
-            </dl>
-            <div className="mt-3 border-t border-borderSoft pt-3">
-              <h4 className="text-[11px] font-semibold uppercase text-secondaryText">
-                {summaryHasRemito ? "Articulos del remito" : "Articulos de la entrega"}
-              </h4>
-              <table className="mt-2 w-full border-collapse text-left text-[11px]">
-                <thead className="bg-softMid text-secondaryText">
-                  <tr>
-                    <th className="px-2 py-1 font-semibold">Articulo</th>
-                    <th className="px-2 py-1 font-semibold">Cantidad</th>
-                    <th className="px-2 py-1 font-semibold">Almacen</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {summaryDeliveryLines.map((line) => (
-                    <tr key={line.id} className="border-t border-borderSoft">
-                      <td className="px-2 py-1 text-night">
-                        <div className="font-mono font-semibold">{line.itemRef}</div>
-                        <div className="mt-0.5 leading-4">{line.itemName}</div>
-                      </td>
-                      <td className="px-2 py-1 font-mono text-night">
-                        <div>{formatQty(line.deliveryQty, line.deliveryUom)}</div>
-                        {line.conversionFactor !== 1 && (
-                          <div className="mt-0.5 text-secondaryText">{formatQty(line.commercialQty, line.commercialUom)}</div>
-                        )}
-                      </td>
-                      <td className="px-2 py-1 font-mono text-night">{line.warehouse || "s/d"}</td>
-                    </tr>
-                  ))}
-                  {!summaryDeliveryLines.length && (
-                    <tr>
-                      <td className="px-2 py-2 text-secondaryText" colSpan={3}>
-                        Sin articulos.
-                      </td>
-                    </tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
-          </div>
-          )}
         </aside>
       </section>
       {availableConfirmation && activeStockValidation && (

@@ -11,6 +11,7 @@ export type ApiFulfillmentLine = {
   warehouse_ref: string;
   ordered_qty: string;
   reserved_qty: string;
+  preparing_qty?: string;
   prepared_qty: string;
   delivered_qty: string;
   cancelled_qty: string;

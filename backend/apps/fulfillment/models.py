@@ -20,9 +20,11 @@ class FulfillmentOrder(TimestampedModel, LegacyReferenceModel):
     fulfillment_number = models.CharField(max_length=40, unique=True)
     status = models.CharField(max_length=30, choices=FulfillmentStatus.choices, default=FulfillmentStatus.PENDING)
     customer_ref = models.CharField(max_length=80)
+    customer_document = models.CharField(max_length=80, blank=True)
     delivery_mode = models.CharField(max_length=60)
     requested_date = models.DateField(null=True, blank=True)
     address_snapshot = models.JSONField(default=dict, blank=True)
+    customer_snapshot = models.JSONField(default=dict, blank=True)
 
     class Meta:
         indexes = [
@@ -31,6 +33,7 @@ class FulfillmentOrder(TimestampedModel, LegacyReferenceModel):
             models.Index(fields=["delivery_mode", "status", "requested_date"], name="ful_order_mode_st_req_idx"),
             models.Index(fields=["legacy_sales_order_number"]),
             models.Index(fields=["customer_ref"]),
+            models.Index(fields=["customer_document"]),
             models.Index(fields=["legacy_sales_order_number", "-updated_at", "-created_at"], name="ful_order_so_recent_idx"),
             models.Index(fields=["legacy_transaction_number", "-updated_at", "-created_at"], name="ful_order_tx_recent_idx"),
             models.Index(fields=["customer_ref", "-updated_at", "-created_at"], name="ful_order_cust_recent_idx"),
@@ -45,6 +48,7 @@ class FulfillmentOrderLine(TimestampedModel, LegacyReferenceModel):
     delivered_qty = models.DecimalField(max_digits=18, decimal_places=6, default=0)
     cancelled_qty = models.DecimalField(max_digits=18, decimal_places=6, default=0)
     uom = models.CharField(max_length=20)
+    item_snapshot = models.JSONField(default=dict, blank=True)
 
     @property
     def pending_qty(self):

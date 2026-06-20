@@ -737,7 +737,7 @@ class ApiFilterTests(TestCase):
         self.assertEqual(results[0]["lines"][0]["split_qty"], "2.000000")
 
     @patch("apps.fulfillment.api.employee_delivery_permissions")
-    def test_reparto_confirmation_queue_refreshes_impacts_before_serializing_uncreated(self, employee_delivery_permissions):
+    def test_reparto_confirmation_queue_uses_local_impacts_without_refreshing_legacy(self, employee_delivery_permissions):
         employee_delivery_permissions.return_value = {"authorized_warehouses": ["WH-A"]}
         planned_date = timezone.localdate()
         fulfillment = FulfillmentOrder.objects.create(
@@ -756,20 +756,14 @@ class ApiFilterTests(TestCase):
             legacy_sales_order_number="VENT8-102",
             legacy_line_id="10",
         )
+        line.cancelled_qty = line.ordered_qty
+        line.save(update_fields=["cancelled_qty", "updated_at"])
 
-        def cancel_fulfillment_lines(fulfillments, *, actor):
-            self.assertEqual(actor, "reparto.confirmation")
-            self.assertEqual([row.legacy_sales_order_number for row in fulfillments], ["VENT8-102"])
-            line.cancelled_qty = line.ordered_qty
-            line.save(update_fields=["cancelled_qty", "updated_at"])
+        results = self._results(
+            "/api/v1/fulfillment/reparto-confirmation/",
+            {"planned_date": planned_date.isoformat()},
+        )
 
-        with patch("apps.fulfillment.api.refresh_legacy_impacts_for_fulfillments", side_effect=cancel_fulfillment_lines) as refresh_impacts:
-            results = self._results(
-                "/api/v1/fulfillment/reparto-confirmation/",
-                {"planned_date": planned_date.isoformat()},
-            )
-
-        refresh_impacts.assert_called_once()
         self.assertEqual(results, [])
 
     @patch("apps.fulfillment.api.employee_delivery_permissions")
@@ -816,11 +810,10 @@ class ApiFilterTests(TestCase):
             uom="UN",
         )
 
-        with patch("apps.fulfillment.api.refresh_legacy_impacts_for_fulfillments", return_value=0):
-            results = self._results(
-                "/api/v1/fulfillment/reparto-confirmation/",
-                {"planned_date": planned_date.isoformat()},
-            )
+        results = self._results(
+            "/api/v1/fulfillment/reparto-confirmation/",
+            {"planned_date": planned_date.isoformat()},
+        )
 
         self.assertEqual(results, [])
 

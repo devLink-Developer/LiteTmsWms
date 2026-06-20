@@ -26,7 +26,6 @@ from apps.fulfillment.services import (
     physical_delivery_lines_from_snapshots,
     physical_fulfillment_lines_from_snapshots,
     reassign_confirmed_delivery_warehouse,
-    refresh_legacy_impacts_for_fulfillments,
     send_delivery_to_prepare,
     split_fulfillment_delivery,
     validate_delivery_stock,
@@ -38,7 +37,7 @@ from apps.fulfillment.services import (
     _display_uom,
     _line_metrics,
     _max_dispatchable_from_effective_pending,
-    _resolve_line_item_snapshots,
+    _stored_line_item_snapshots,
     _with_display_uom,
 )
 from apps.integrations.legacy.models import LegacyOrder
@@ -262,7 +261,7 @@ def delivery_orders(request):
         )
     rows = list(qs[:100])
     all_delivery_lines = [line for row in rows for line in list(row.lines.all())]
-    item_snapshots = _resolve_line_item_snapshots([line.fulfillment_line for line in all_delivery_lines])
+    item_snapshots = _stored_line_item_snapshots([line.fulfillment_line for line in all_delivery_lines])
     results = []
     for row in rows:
         lines = physical_delivery_lines_from_snapshots(list(row.lines.all()), item_snapshots)
@@ -348,7 +347,7 @@ def _forbidden_for_fulfillment_id(fulfillment_id, planned_date=None):
 def _serialize_reparto_delivery(row: DeliveryOrder, *, item_snapshots: dict | None = None) -> dict:
     all_lines = list(row.lines.all())
     if item_snapshots is None:
-        item_snapshots = _resolve_line_item_snapshots([line.fulfillment_line for line in all_lines])
+        item_snapshots = _stored_line_item_snapshots([line.fulfillment_line for line in all_lines])
     lines = physical_delivery_lines_from_snapshots(all_lines, item_snapshots)
     serialized_lines = []
     for line in lines:
@@ -403,7 +402,7 @@ def _serialize_reparto_fulfillment(
 ) -> dict:
     all_lines = list(row.lines.all())
     if item_snapshots is None:
-        item_snapshots = _resolve_line_item_snapshots(all_lines)
+        item_snapshots = _stored_line_item_snapshots(all_lines)
     physical_lines = physical_fulfillment_lines_from_snapshots(all_lines, item_snapshots)
     snapshots = item_snapshots
     metrics = line_metrics if line_metrics is not None else _line_metrics(physical_lines)
@@ -518,14 +517,8 @@ def reparto_confirmation_queue(request):
 
     results = []
     delivery_rows = list(delivery_qs[:100])
-    if delivery_rows:
-        refresh_legacy_impacts_for_fulfillments(
-            [row.fulfillment for row in delivery_rows],
-            actor="reparto.confirmation",
-        )
-        delivery_rows = list(delivery_qs[:100])
     delivery_lines = [line for row in delivery_rows for line in list(row.lines.all())]
-    delivery_snapshots = _resolve_line_item_snapshots([line.fulfillment_line for line in delivery_lines])
+    delivery_snapshots = _stored_line_item_snapshots([line.fulfillment_line for line in delivery_lines])
     for row in delivery_rows:
         serialized = _serialize_reparto_delivery(row, item_snapshots=delivery_snapshots)
         if serialized["lines_count"] > 0:
@@ -551,14 +544,8 @@ def reparto_confirmation_queue(request):
                 | Q(customer_ref__icontains=query)
             )
         fulfillment_rows = list(fulfillment_qs[:100])
-        if fulfillment_rows:
-            refresh_legacy_impacts_for_fulfillments(
-                fulfillment_rows,
-                actor="reparto.confirmation",
-            )
-            fulfillment_rows = list(fulfillment_qs[:100])
         fulfillment_lines = [line for row in fulfillment_rows for line in list(row.lines.all())]
-        fulfillment_snapshots = _resolve_line_item_snapshots(fulfillment_lines)
+        fulfillment_snapshots = _stored_line_item_snapshots(fulfillment_lines)
         physical_lines = physical_fulfillment_lines_from_snapshots(fulfillment_lines, fulfillment_snapshots)
         fulfillment_metrics = _line_metrics(physical_lines)
         for row in fulfillment_rows:
@@ -609,7 +596,7 @@ def preparation_tasks(request):
 
         task_rows = list(rows[:200])
         task_delivery_lines = [line for task in task_rows for line in list(task.delivery.lines.all())]
-        task_snapshots = _resolve_line_item_snapshots([line.fulfillment_line for line in task_delivery_lines])
+        task_snapshots = _stored_line_item_snapshots([line.fulfillment_line for line in task_delivery_lines])
         results = []
         for task in task_rows:
             delivery = task.delivery

@@ -567,6 +567,7 @@ describe("DeliveryExpeditionPage", () => {
                     warehouse_ref: "PS003MT",
                     ordered_qty: fullRemittedOrder ? "1.44" : "18",
                     reserved_qty: orderFullyAllocated || fullRemittedOrder || cancellationScenario !== "none" ? "0" : "18",
+                    preparing_qty: deliveryStatus === "preparing" ? "8.64" : "0",
                     prepared_qty: orderFullyAllocated ? "18" : fullRemittedOrder || cancellationScenario !== "none" ? "0" : "14",
                     delivered_qty: fullRemittedOrder || cancellationScenario !== "none" ? "0" : "6",
                     cancelled_qty: cancellationScenario !== "none" ? "18" : orderImpacts ? "2.88" : "0",
@@ -597,6 +598,7 @@ describe("DeliveryExpeditionPage", () => {
                     warehouse_ref: "PS003MT",
                     ordered_qty: fullRemittedOrder ? "0" : "1",
                     reserved_qty: "0",
+                    preparing_qty: "0",
                     prepared_qty: "0",
                     delivered_qty: "0",
                     cancelled_qty: cancellationScenario === "full" ? "1" : "0",
@@ -890,6 +892,8 @@ describe("DeliveryExpeditionPage", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Enviar a preparar" }));
     await waitFor(() => expect(screen.getByText(/ENT-000184-1 enviada a preparar./)).toBeInTheDocument());
+    expect(screen.getByText("En prep.")).toBeInTheDocument();
+    await waitFor(() => expect(screen.getAllByText("8,64 m2").length).toBeGreaterThan(0));
     expect(screen.getByRole("button", { name: "Marcar preparada" })).not.toBeDisabled();
     expect(screen.getByRole("button", { name: "Generar remito" })).toBeDisabled();
 
@@ -969,7 +973,7 @@ describe("DeliveryExpeditionPage", () => {
     expect(blockedInput).toBeDisabled();
     expect(screen.getByRole("columnheader", { name: "Pendiente" })).toBeInTheDocument();
     const blockedRowCells = within(screen.getByText("SIN-001").closest("tr") as HTMLElement).getAllByRole("cell");
-    expect(blockedRowCells[5]).toHaveTextContent("1 Un");
+    expect(blockedRowCells[6]).toHaveTextContent("1 Un");
     expect(screen.getByRole("button", { name: "Confirmar entrega" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Entregar todo" })).not.toBeDisabled();
 

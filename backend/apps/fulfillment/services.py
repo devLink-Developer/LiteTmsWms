@@ -48,7 +48,7 @@ from apps.inventory.services import (
     release_inventory_reservation,
     reserve_inventory,
 )
-from apps.logistics.parquet_master_data import MasterDataSourceError, customer_refs_for_dni, material_snapshots_for_items, pos_freight_product_refs
+from apps.logistics.parquet_master_data import MasterDataSourceError, material_snapshots_for_items, pos_freight_product_refs
 
 
 DELIVERY_SEQUENCE_NAME = "Entregas"
@@ -126,6 +126,10 @@ def _ledger_idempotency_key(value: str) -> str:
 
 def _clean(value) -> str:
     return str(value or "").strip()
+
+
+def _digits(value) -> str:
+    return "".join(char for char in str(value or "") if char.isdigit())
 
 
 def _coordinate_text(value) -> str:
@@ -471,6 +475,24 @@ def _default_customer_snapshot(customer_ref: str) -> dict:
     }
 
 
+def _customer_document_from_snapshot(snapshot: dict) -> str:
+    return _digits(snapshot.get("document_number") or snapshot.get("customer_document") or snapshot.get("dni"))
+
+
+def _stored_customer_snapshot(fulfillment: FulfillmentOrder) -> dict:
+    snapshot = dict(fulfillment.customer_snapshot or {})
+    fallback = _default_customer_snapshot(fulfillment.customer_ref)
+    snapshot = {**fallback, **snapshot} if snapshot else fallback
+    snapshot["customer_ref"] = snapshot.get("customer_ref") or fulfillment.customer_ref
+    if not snapshot.get("document_number") and fulfillment.customer_document:
+        snapshot["document_number"] = fulfillment.customer_document
+    if not snapshot.get("address") and fulfillment.address_snapshot:
+        snapshot["address"] = fulfillment.address_snapshot
+    if not snapshot.get("address_text") and snapshot.get("address"):
+        snapshot["address_text"] = _address_text(snapshot["address"])
+    return snapshot
+
+
 def _serialize_customer_address(address: LegacyCustomerAddress | None) -> dict:
     if address is None:
         return {}
@@ -639,6 +661,9 @@ def _resolve_line_item_snapshots(lines: list[FulfillmentOrderLine]) -> dict:
         item_ref = _clean(line.item_ref)
         if not item_ref:
             continue
+        if line.item_snapshot:
+            snapshots[line.id] = _with_display_uom(dict(line.item_snapshot), fallback_uom=line.uom)
+            continue
         store_ref = _clean(line.store_ref or line.warehouse_ref)
         lines_by_store[store_ref].append(line)
         sales_uom_by_item[item_ref] = line.uom
@@ -676,8 +701,18 @@ def _resolve_line_item_snapshots(lines: list[FulfillmentOrderLine]) -> dict:
     return snapshots
 
 
+def _stored_line_item_snapshots(lines: list[FulfillmentOrderLine]) -> dict:
+    return {
+        line.id: _with_display_uom(
+            dict(line.item_snapshot or _default_item_snapshot(line.item_ref, line.uom)),
+            fallback_uom=line.uom,
+        )
+        for line in lines
+    }
+
+
 def physical_fulfillment_lines(lines: list[FulfillmentOrderLine]) -> list[FulfillmentOrderLine]:
-    snapshots = _resolve_line_item_snapshots(lines)
+    snapshots = _stored_line_item_snapshots(lines)
     return physical_fulfillment_lines_from_snapshots(lines, snapshots)
 
 
@@ -689,7 +724,7 @@ def physical_fulfillment_lines_from_snapshots(
 
 
 def physical_delivery_lines(lines: list[DeliveryOrderLine]) -> list[DeliveryOrderLine]:
-    snapshots = _resolve_line_item_snapshots([line.fulfillment_line for line in lines])
+    snapshots = _stored_line_item_snapshots([line.fulfillment_line for line in lines])
     return physical_delivery_lines_from_snapshots(lines, snapshots)
 
 
@@ -706,7 +741,7 @@ def physical_delivery_lines_from_snapshots(
 
 def _physical_delivery_lines_for_delivery(delivery: DeliveryOrder) -> list[DeliveryOrderLine]:
     lines = list(delivery.lines.all())
-    snapshots = _resolve_line_item_snapshots([line.fulfillment_line for line in lines])
+    snapshots = _stored_line_item_snapshots([line.fulfillment_line for line in lines])
     return physical_delivery_lines_from_snapshots(lines, snapshots)
 
 
@@ -840,6 +875,16 @@ def _line_metrics(lines: list[FulfillmentOrderLine], *, target_warehouse_ref: st
         .values("fulfillment_line_id")
         .annotate(total=Sum("planned_qty"))
     }
+    preparing_by_line = {
+        row["fulfillment_line_id"]: row["total"] or Decimal("0")
+        for row in _active_delivery_lines_queryset()
+        .filter(
+            fulfillment_line_id__in=line_ids,
+            delivery__status=DeliveryOrder.DeliveryStatus.PREPARING,
+        )
+        .values("fulfillment_line_id")
+        .annotate(total=Sum("planned_qty"))
+    }
     returned_by_line = {
         row["fulfillment_line_id"]: row["total"] or Decimal("0")
         for row in FulfillmentOrderImpactLine.objects.filter(
@@ -871,6 +916,7 @@ def _line_metrics(lines: list[FulfillmentOrderLine], *, target_warehouse_ref: st
     return {
         line.id: {
             "planned_qty": planned_by_line.get(line.id, Decimal("0")),
+            "preparing_qty": preparing_by_line.get(line.id, Decimal("0")),
             "packed_qty": packed_by_key.get((stock_warehouse_ref or line.warehouse_ref, line.item_ref, line.uom), Decimal("0")),
             "returned_qty": returned_by_line.get(line.id, Decimal("0")),
             "open_remito_qty": open_remito_by_line.get(line.id, Decimal("0")),
@@ -890,6 +936,15 @@ def _serialize_fulfillment_line(
     metric = metrics.get(line.id)
     if metric is None:
         planned_qty = _planned_elsewhere(line)
+        preparing_qty = (
+            _active_delivery_lines_queryset()
+            .filter(
+                fulfillment_line=line,
+                delivery__status=DeliveryOrder.DeliveryStatus.PREPARING,
+            )
+            .aggregate(total=Sum("planned_qty"))["total"]
+            or ZERO
+        )
         packed_qty = _packed_balance_quantity(line)
         returned_qty = (
             FulfillmentOrderImpactLine.objects.filter(
@@ -900,6 +955,7 @@ def _serialize_fulfillment_line(
         )
     else:
         planned_qty = metric["planned_qty"]
+        preparing_qty = metric.get("preparing_qty", ZERO)
         packed_qty = metric["packed_qty"]
         returned_qty = metric.get("returned_qty", Decimal("0"))
     open_remito_qty = metric.get("open_remito_qty", ZERO) if metric is not None else _open_remito_qty_for_fulfillment_line(line)
@@ -930,6 +986,7 @@ def _serialize_fulfillment_line(
         "warehouse_ref": line.warehouse_ref,
         "ordered_qty": str(line.ordered_qty),
         "reserved_qty": str(line.reserved_qty),
+        "preparing_qty": _display_qty(preparing_qty),
         "prepared_qty": str(line.prepared_qty),
         "delivered_qty": str(line.delivered_qty),
         "cancelled_qty": str(line.cancelled_qty),
@@ -1642,8 +1699,8 @@ def _serialize_fulfillment(
         )
     )
     metrics = line_metrics or {}
-    customer_snapshot = customer_snapshot or _default_customer_snapshot(fulfillment.customer_ref)
-    item_snapshots = item_snapshots if item_snapshots is not None else _resolve_line_item_snapshots(lines)
+    customer_snapshot = customer_snapshot or _stored_customer_snapshot(fulfillment)
+    item_snapshots = item_snapshots if item_snapshots is not None else _stored_line_item_snapshots(lines)
     physical_lines = physical_fulfillment_lines_from_snapshots(lines, item_snapshots)
 
     def serialize_delivery(delivery: DeliveryOrder) -> dict:
@@ -1697,8 +1754,8 @@ def _serialize_fulfillment(
         "source_hash": fulfillment.source_hash,
         "address_snapshot": fulfillment.address_snapshot,
         "customer": customer_snapshot,
-        "customer_dni": customer_snapshot.get("document_number", ""),
-        "customer_document": customer_snapshot.get("document_number", ""),
+        "customer_dni": customer_snapshot.get("document_number", "") or fulfillment.customer_document,
+        "customer_document": customer_snapshot.get("document_number", "") or fulfillment.customer_document,
         "pickup_authorization": _pickup_authorization(fulfillment, deliveries, customer_snapshot),
         "lines": [
             _serialize_fulfillment_line(
@@ -2408,6 +2465,13 @@ def ingest_legacy_order(*, sales_order_number: str, idempotency_key: str, actor:
     address_snapshot = _address_snapshot(first_line, customer_address=customer_address)
     address_snapshot["customer_ref"] = order.customer_account
     address_snapshot.setdefault("receiver", order.sales_order_name or order.customer_account)
+    customer_snapshot = _resolve_customer_snapshots({order.customer_account}).get(
+        _clean(order.customer_account),
+        _default_customer_snapshot(order.customer_account),
+    )
+    if order.sales_order_name and customer_snapshot.get("name") == order.customer_account:
+        customer_snapshot["name"] = order.sales_order_name
+    customer_document = _customer_document_from_snapshot(customer_snapshot)
 
     fulfillment, created = FulfillmentOrder.objects.get_or_create(
         fulfillment_number=f"FUL-{order.sales_order_number}",
@@ -2421,9 +2485,11 @@ def ingest_legacy_order(*, sales_order_number: str, idempotency_key: str, actor:
             "warehouse_ref": order.warehouse,
             "store_ref": order.store_id or "",
             "customer_ref": order.customer_account,
+            "customer_document": customer_document,
             "delivery_mode": first_line.delivery_mode_code,
             "requested_date": delivery_date,
             "address_snapshot": address_snapshot,
+            "customer_snapshot": customer_snapshot,
             "created_by": actor,
         },
     )
@@ -2431,9 +2497,11 @@ def ingest_legacy_order(*, sales_order_number: str, idempotency_key: str, actor:
         fulfillment.source_hash = source_hash
         fulfillment.legacy_transaction_number = order.transaction_number
         fulfillment.customer_ref = order.customer_account
+        fulfillment.customer_document = customer_document
         fulfillment.delivery_mode = first_line.delivery_mode_code
         fulfillment.requested_date = delivery_date
         fulfillment.address_snapshot = address_snapshot
+        fulfillment.customer_snapshot = customer_snapshot
         fulfillment.warehouse_ref = order.warehouse
         fulfillment.updated_by = actor
         fulfillment.save(
@@ -2441,14 +2509,34 @@ def ingest_legacy_order(*, sales_order_number: str, idempotency_key: str, actor:
                 "source_hash",
                 "legacy_transaction_number",
                 "customer_ref",
+                "customer_document",
                 "delivery_mode",
                 "requested_date",
                 "address_snapshot",
+                "customer_snapshot",
                 "warehouse_ref",
                 "updated_by",
                 "updated_at",
             ]
         )
+    elif not created:
+        update_fields = []
+        existing_snapshot = dict(fulfillment.customer_snapshot or {})
+        can_refresh_snapshot = customer_snapshot and (
+            not existing_snapshot
+            or existing_snapshot.get("source") == "local_backfill"
+            or existing_snapshot.get("source") == "fallback"
+        )
+        if customer_document and fulfillment.customer_document != customer_document:
+            fulfillment.customer_document = customer_document
+            update_fields.append("customer_document")
+        if can_refresh_snapshot and existing_snapshot != customer_snapshot:
+            fulfillment.customer_snapshot = customer_snapshot
+            update_fields.append("customer_snapshot")
+        if update_fields:
+            fulfillment.updated_by = actor
+            update_fields.extend(["updated_by", "updated_at"])
+            fulfillment.save(update_fields=update_fields)
 
     operable_lines = 0
     for legacy_line in legacy_lines:
@@ -2476,6 +2564,7 @@ def ingest_legacy_order(*, sales_order_number: str, idempotency_key: str, actor:
                 "delivered_qty": legacy_delivered_qty,
                 "cancelled_qty": Decimal("0"),
                 "uom": legacy_line.sales_unit_symbol,
+                "item_snapshot": line_snapshot,
                 "source_hash": source_hash,
                 "created_by": actor,
             },
@@ -2492,6 +2581,7 @@ def ingest_legacy_order(*, sales_order_number: str, idempotency_key: str, actor:
             fulfillment_line.ordered_qty = legacy_line.ordered_sales_quantity
             fulfillment_line.delivered_qty = max(legacy_delivered_qty, _remitted_qty_for_fulfillment_line(fulfillment_line))
             fulfillment_line.uom = legacy_line.sales_unit_symbol
+            fulfillment_line.item_snapshot = line_snapshot
             fulfillment_line.source_hash = source_hash
             fulfillment_line.updated_by = actor
             fulfillment_line.save(
@@ -2507,6 +2597,7 @@ def ingest_legacy_order(*, sales_order_number: str, idempotency_key: str, actor:
                     "ordered_qty",
                     "delivered_qty",
                     "uom",
+                    "item_snapshot",
                     "source_hash",
                     "updated_by",
                     "updated_at",
@@ -2626,7 +2717,7 @@ def split_fulfillment_delivery(
     _ensure_warehouse_authorized(delivery_warehouse_ref, authorized_warehouses)
     customer = _default_customer_snapshot(fulfillment.customer_ref)
     if receiver or reference:
-        customer = _resolve_customer_snapshots({fulfillment.customer_ref}).get(fulfillment.customer_ref, customer)
+        customer = _stored_customer_snapshot(fulfillment)
     delivery = DeliveryOrder.objects.create(
         fulfillment=fulfillment,
         delivery_number=allocate_sequence_number(DELIVERY_SEQUENCE_NAME, actor=actor),
@@ -2650,7 +2741,7 @@ def split_fulfillment_delivery(
         str(line.id): line
         for line in fulfillment.lines.select_for_update().filter(id__in=requested_line_ids)
     }
-    item_snapshots = _resolve_line_item_snapshots(list(fulfillment_lines.values()))
+    item_snapshots = _stored_line_item_snapshots(list(fulfillment_lines.values()))
     physical_fulfillment_lines = physical_fulfillment_lines_from_snapshots(list(fulfillment_lines.values()), item_snapshots)
     line_metrics = _line_metrics(physical_fulfillment_lines)
     planned_in_this_delivery: dict = defaultdict(lambda: ZERO)
@@ -2958,7 +3049,7 @@ def check_fulfillment_stock_for_split(
         str(line.id): line
         for line in fulfillment.lines.filter(id__in=requested_line_ids)
     }
-    item_snapshots = _resolve_line_item_snapshots(list(fulfillment_lines.values()))
+    item_snapshots = _stored_line_item_snapshots(list(fulfillment_lines.values()))
     physical_lines = physical_fulfillment_lines_from_snapshots(list(fulfillment_lines.values()), item_snapshots)
     metrics = _line_metrics(physical_lines)
     packed_by_key = _packed_quantities_for_keys(
@@ -3981,9 +4072,9 @@ def expedition_queue(
         return []
 
     customer_refs = set(_lookup_candidates(customer_ref)) if customer_ref else set()
+    customer_document = _digits(customer_dni)
     if customer_dni:
-        customer_refs.update(customer_refs_for_dni(customer_dni))
-        if not customer_refs:
+        if not customer_document:
             return []
 
     filters = Q()
@@ -3996,6 +4087,8 @@ def expedition_queue(
         )
     if customer_refs:
         filters &= Q(customer_ref__in=customer_refs)
+    if customer_document:
+        filters &= Q(customer_document=customer_document)
 
     def fulfillment_queryset():
         queryset = (
@@ -4016,19 +4109,6 @@ def expedition_queue(
 
     fulfillment_qs = fulfillment_queryset()
     fulfillments = list(fulfillment_qs[:100])
-    if not fulfillments:
-        fallback_order_numbers = _ensure_legacy_orders_available_for_expedition(
-            sales_order_number=sales_order_number,
-            customer_refs=customer_refs if not sales_order_number else None,
-        )
-        if sales_order_number and fallback_order_numbers:
-            filters |= Q(legacy_sales_order_number__in=fallback_order_numbers)
-        fulfillments = list(fulfillment_queryset()[:100])
-
-    if fulfillments:
-        processed_impacts = refresh_legacy_impacts_for_fulfillments(fulfillments, actor="expedition.search")
-        if processed_impacts:
-            fulfillments = list(fulfillment_queryset()[:100])
 
     lines = [
         line
@@ -4036,14 +4116,13 @@ def expedition_queue(
         for line in list(fulfillment.lines.all())
     ]
     metrics = _line_metrics(lines, target_warehouse_ref=target_warehouse_ref)
-    customers = _resolve_customer_snapshots({fulfillment.customer_ref for fulfillment in fulfillments})
-    item_snapshots = _resolve_line_item_snapshots(lines)
+    item_snapshots = _stored_line_item_snapshots(lines)
     movement_context = _build_movement_context(fulfillments)
     return [
         _serialize_fulfillment(
             fulfillment,
             line_metrics=metrics,
-            customer_snapshot=customers.get(fulfillment.customer_ref),
+            customer_snapshot=_stored_customer_snapshot(fulfillment),
             item_snapshots=item_snapshots,
             movement_context=movement_context,
             target_warehouse_ref=target_warehouse_ref,

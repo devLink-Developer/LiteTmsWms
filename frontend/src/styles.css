@@ -103,6 +103,31 @@ th[data-sortable-table-header="true"][data-sort-direction="desc"]::after {
   grid-area: side;
 }
 
+.delivery-expedition-side-body {
+  display: flex;
+  flex-direction: column;
+}
+
+.delivery-summary-panel {
+  order: 0;
+}
+
+.delivery-expedition-delivery-list {
+  order: 1;
+}
+
+.delivery-expedition-traceability {
+  order: 2;
+}
+
+.delivery-summary-meta {
+  grid-template-columns: repeat(auto-fit, minmax(10.5rem, 1fr));
+}
+
+.delivery-summary-lines-table {
+  min-width: 30rem;
+}
+
 @media (min-width: 1024px) {
   .delivery-expedition-page {
     overflow: hidden;
@@ -127,6 +152,18 @@ th[data-sortable-table-header="true"][data-sort-direction="desc"]::after {
     grid-template-areas: "orders main side";
     grid-template-columns: 320px minmax(0, 1fr) 360px;
     grid-template-rows: minmax(0, 1fr);
+  }
+
+  .delivery-summary-panel {
+    order: 1;
+  }
+
+  .delivery-expedition-delivery-list {
+    order: 0;
+  }
+
+  .delivery-expedition-traceability {
+    order: 2;
   }
 
   .delivery-expedition-side-toggle {
