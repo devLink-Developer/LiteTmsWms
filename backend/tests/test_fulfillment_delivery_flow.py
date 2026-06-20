@@ -558,6 +558,61 @@ class DeliveryPreparationFlowTests(TestCase):
         self.assertIn("Devolucion recibida", labels)
         self.assertIn("Stock ingresado", labels)
 
+    def test_return_impact_reduces_effective_pending_qty_when_delivery_is_not_local(self):
+        self.fulfillment_line.ordered_qty = Decimal("1")
+        self.fulfillment_line.save(update_fields=["ordered_qty", "updated_at"])
+        impact = FulfillmentOrderImpact.objects.create(
+            fulfillment=self.fulfillment,
+            impact_type=FulfillmentOrderImpact.ImpactType.RETURN,
+            status=FulfillmentOrderImpact.ImpactStatus.PENDING,
+            impact_sales_order_number="DEV-SO-1",
+            impact_transaction_number="TX-DEV-1",
+            legacy_sales_order_number="SO-1",
+            warehouse_ref="W001",
+            source_table="transactions_orders_transaction",
+            source_pk="DEV-SO-1-PENDING",
+            created_by="tester",
+        )
+        FulfillmentOrderImpactLine.objects.create(
+            impact=impact,
+            fulfillment_line=self.fulfillment_line,
+            item_ref="ITEM-1",
+            warehouse_ref="W001",
+            legacy_sales_order_number="SO-1",
+            legacy_line_id="10",
+            source_table="transactions_orders_retailLineItem",
+            source_pk="DEV-SO-1-PENDING-L1",
+            quantity=Decimal("1"),
+            uom="UN",
+        )
+        _apply_order_impact(impact, actor="tester")
+
+        with patch("apps.fulfillment.services._resolve_customer_snapshots", return_value={}):
+            result = expedition_queue(sales_order_number="SO-1", authorized_warehouses=["W001"])
+            stock_check = check_fulfillment_stock_for_split(
+                fulfillment_id=str(self.fulfillment.id),
+                lines=[{"fulfillment_line_id": str(self.fulfillment_line.id), "split_qty": "1"}],
+                authorized_warehouses=["W001"],
+            )
+
+        line = result[0]["lines"][0]
+        self.assertEqual(line["returned_qty"], "1")
+        self.assertEqual(Decimal(line["pending_qty"]), Decimal("0"))
+        self.assertEqual(Decimal(line["max_dispatchable_qty"]), Decimal("0"))
+        self.assertFalse(stock_check["can_confirm"])
+        self.assertEqual(Decimal(stock_check["lines"][0]["available_qty"]), Decimal("0"))
+        with self.assertRaisesRegex(FulfillmentRuleError, "solo permite 0"):
+            split_fulfillment_delivery(
+                fulfillment_id=str(self.fulfillment.id),
+                lines=[{"fulfillment_line_id": str(self.fulfillment_line.id), "split_qty": "1"}],
+                delivery_mode="home",
+                planned_date=timezone.localdate(),
+                reason="test",
+                idempotency_key="split-returned-line",
+                actor="tester",
+                authorized_warehouses=["W001"],
+            )
+
     def test_expedition_queue_matches_normalized_indexed_filters(self):
         customer = {"customer_ref": "CUST-1", "name": "Cliente Test", "document_number": "", "address": {}}
         with patch("apps.fulfillment.services._resolve_customer_snapshots", return_value={"CUST-1": customer}):

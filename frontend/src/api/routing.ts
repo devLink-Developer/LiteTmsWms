@@ -14,6 +14,7 @@ export type RoutingDelivery = {
   planned_date: string | null;
   warehouse_ref: string;
   customer_ref: string;
+  customer_name?: string;
   sales_order_number: string;
   address_snapshot: Record<string, string>;
   lat: string | null;

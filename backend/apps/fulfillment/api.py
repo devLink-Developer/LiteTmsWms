@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from django.conf import settings
 from django.db.models import Count, Q
 from django.http import HttpResponse
@@ -8,7 +10,7 @@ from django.views.decorators.http import require_GET, require_POST
 
 from apps.common.api import error_response, json_response, parse_json_body, require_idempotency_key
 from apps.fulfillment.delivery_modes import delivery_mode_filter_q, is_shipping_delivery_mode, shipping_delivery_mode_q
-from apps.fulfillment.models import DeliveryDocument, DeliveryOrder, DeliveryPreparationTask, FulfillmentOrder
+from apps.fulfillment.models import DeliveryDocument, DeliveryOrder, DeliveryPreparationTask, FulfillmentOrder, FulfillmentOrderLine
 from apps.fulfillment.services import (
     FulfillmentAuthorizationError,
     FulfillmentRuleError,
@@ -30,11 +32,12 @@ from apps.fulfillment.services import (
     validate_delivery_stock,
     _capacity_totals,
     _delivery_unit_qty_from_commercial,
+    _effective_pending_qty,
     _delivery_line_operational_qty,
     _delivery_line_snapshot,
     _display_uom,
     _line_metrics,
-    _max_dispatchable_from_values,
+    _max_dispatchable_from_effective_pending,
     _resolve_line_item_snapshots,
     _with_display_uom,
 )
@@ -401,20 +404,29 @@ def _serialize_reparto_fulfillment(
     all_lines = list(row.lines.all())
     if item_snapshots is None:
         item_snapshots = _resolve_line_item_snapshots(all_lines)
-    lines = [line for line in physical_fulfillment_lines_from_snapshots(all_lines, item_snapshots) if line.pending_qty > 0]
+    physical_lines = physical_fulfillment_lines_from_snapshots(all_lines, item_snapshots)
     snapshots = item_snapshots
-    metrics = line_metrics if line_metrics is not None else _line_metrics(lines)
+    metrics = line_metrics if line_metrics is not None else _line_metrics(physical_lines)
+    lines: list[tuple[FulfillmentOrderLine, Decimal]] = []
+    for line in physical_lines:
+        metric = metrics.get(line.id, {})
+        effective_pending_qty = _effective_pending_qty(
+            line,
+            open_remito_qty=metric.get("open_remito_qty", 0),
+            returned_qty=metric.get("returned_qty", 0),
+        )
+        if effective_pending_qty > 0:
+            lines.append((line, effective_pending_qty))
     serialized_lines = []
     total_weight_kg = 0
     total_volume_m3 = 0
-    for line in lines:
+    for line, split_qty in lines:
         snapshot = _with_display_uom(snapshots.get(line.id, {}), fallback_uom=line.uom)
-        split_qty = line.pending_qty
         delivery_unit_qty = _delivery_unit_qty_from_commercial(split_qty, snapshot)
         planned_weight_kg, planned_volume_m3 = _capacity_totals(split_qty, snapshot)
         metric = metrics.get(line.id, {})
-        max_dispatchable_qty = _max_dispatchable_from_values(
-            line,
+        max_dispatchable_qty = _max_dispatchable_from_effective_pending(
+            effective_pending_qty=split_qty,
             already_planned=metric.get("planned_qty", 0),
             packed_qty=metric.get("packed_qty", 0),
         )
@@ -455,7 +467,7 @@ def _serialize_reparto_fulfillment(
         "customer_ref": row.customer_ref,
         "documents_count": 0,
         "lines_count": len(lines),
-        "total_qty": str(sum((line.pending_qty for line in lines), start=0)),
+        "total_qty": str(sum((split_qty for _, split_qty in lines), start=0)),
         "total_weight_kg": str(total_weight_kg),
         "total_volume_m3": str(total_volume_m3),
         "address_snapshot": row.address_snapshot,

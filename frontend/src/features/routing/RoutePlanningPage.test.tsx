@@ -245,8 +245,9 @@ describe("RoutePlanningPage", () => {
                 planned_date: "2026-04-27",
                 warehouse_ref: "W001",
                 customer_ref: "CUST-1",
+                customer_name: "Cliente Uno",
                 sales_order_number: "SO-1",
-                address_snapshot: { street: "Calle 1" },
+                address_snapshot: { formatted: "Calle 1, Posadas, Misiones", street: "Calle", street_number: "1", city: "Posadas" },
                 lat: "-34.60",
                 lng: "-58.38",
                 planned_weight_kg: "9",
@@ -263,6 +264,9 @@ describe("RoutePlanningPage", () => {
     renderWithQuery();
 
     await waitFor(() => expect(screen.getAllByText("DEL-1").length).toBeGreaterThan(0));
+    expect(screen.getByText("Pedido SO-1")).toBeInTheDocument();
+    expect(screen.getAllByText("Cliente Uno").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Calle 1, Posadas, Misiones").length).toBeGreaterThan(0);
     expect(screen.getAllByTestId("route-marker").length).toBeGreaterThan(0);
 
     fireEvent.click(screen.getByRole("button", { name: /Optimizar/i }));

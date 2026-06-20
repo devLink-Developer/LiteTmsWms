@@ -630,6 +630,7 @@ def pending_reparto_deliveries(*, warehouse_ref: str = "", planned_date=None, au
                 "planned_date": delivery.planned_date.isoformat() if delivery.planned_date else None,
                 "warehouse_ref": delivery.warehouse_ref,
                 "customer_ref": delivery.fulfillment.customer_ref,
+                "customer_name": _delivery_customer_name(delivery, delivery.fulfillment.customer_ref),
                 "sales_order_number": delivery.legacy_sales_order_number,
                 "address_snapshot": delivery.address_snapshot,
                 "lat": str(lat) if lat is not None else None,

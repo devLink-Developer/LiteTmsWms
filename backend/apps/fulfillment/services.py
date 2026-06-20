@@ -792,8 +792,13 @@ def _max_dispatchable_from_values(
     return min(remaining_qty, packed_remaining)
 
 
-def _effective_pending_qty(fulfillment_line: FulfillmentOrderLine, *, open_remito_qty: Decimal = ZERO) -> Decimal:
-    documented_qty = max(fulfillment_line.delivered_qty, open_remito_qty)
+def _effective_pending_qty(
+    fulfillment_line: FulfillmentOrderLine,
+    *,
+    open_remito_qty: Decimal = ZERO,
+    returned_qty: Decimal = ZERO,
+) -> Decimal:
+    documented_qty = max(fulfillment_line.delivered_qty, open_remito_qty, returned_qty)
     return max(ZERO, fulfillment_line.ordered_qty - documented_qty - fulfillment_line.cancelled_qty)
 
 
@@ -898,7 +903,7 @@ def _serialize_fulfillment_line(
         packed_qty = metric["packed_qty"]
         returned_qty = metric.get("returned_qty", Decimal("0"))
     open_remito_qty = metric.get("open_remito_qty", ZERO) if metric is not None else _open_remito_qty_for_fulfillment_line(line)
-    effective_pending_qty = _effective_pending_qty(line, open_remito_qty=open_remito_qty)
+    effective_pending_qty = _effective_pending_qty(line, open_remito_qty=open_remito_qty, returned_qty=returned_qty)
     item_snapshot = _with_display_uom(item_snapshot or _default_item_snapshot(line.item_ref, line.uom), fallback_uom=line.uom)
     conversion_factor = _item_conversion_factor(item_snapshot)
     planned_delivery_unit_qty = _delivery_unit_qty_from_commercial(planned_qty, item_snapshot)
@@ -2677,6 +2682,7 @@ def split_fulfillment_delivery(
         effective_pending_qty = _effective_pending_qty(
             fulfillment_line,
             open_remito_qty=metric.get("open_remito_qty", ZERO),
+            returned_qty=metric.get("returned_qty", ZERO),
         )
         if target_warehouse_ref:
             packed_qty = _packed_quantity_for_key(
@@ -2990,6 +2996,7 @@ def check_fulfillment_stock_for_split(
         effective_pending_qty = _effective_pending_qty(
             fulfillment_line,
             open_remito_qty=metric.get("open_remito_qty", ZERO),
+            returned_qty=metric.get("returned_qty", ZERO),
         )
         if target_warehouse_ref:
             max_qty = min(max(ZERO, effective_pending_qty - metric.get("planned_qty", ZERO)), packed_by_key.get(key, ZERO))

@@ -102,25 +102,41 @@ function addressPart(value: unknown) {
   return typeof value === "string" ? value.trim() : "";
 }
 
-function stopAddressText(stop: RouteStop) {
-  const address = stop.address_snapshot ?? {};
+function addressSnapshotText(address: Record<string, string> | undefined) {
+  address = address ?? {};
   const formatted = addressPart(address.formatted) || addressPart(address.description) || addressPart(address.reference);
   if (formatted) return formatted;
   const streetLine = [addressPart(address.street), addressPart(address.street_number)].filter(Boolean).join(" ");
   return [streetLine, addressPart(address.city), addressPart(address.state), addressPart(address.zip_code)].filter(Boolean).join(", ");
 }
 
-function stopCustomerName(stop: RouteStop) {
-  const address = stop.address_snapshot ?? {};
+function stopAddressText(stop: RouteStop) {
+  return addressSnapshotText(stop.address_snapshot);
+}
+
+function deliveryAddressText(delivery: RoutingDelivery) {
+  return addressSnapshotText(delivery.address_snapshot);
+}
+
+function customerNameText(customerRef: string, customerName: string | undefined, address: Record<string, string> | undefined) {
+  address = address ?? {};
   const candidates = [
-    stop.customer_name,
+    customerName,
     address.customer_name,
     address.name,
     address.receiver,
     address.attention_to,
-    stop.customer_ref,
+    customerRef,
   ];
-  return candidates.map(addressPart).find((value) => value && value !== stop.customer_ref) || stop.customer_ref || "Sin cliente";
+  return candidates.map(addressPart).find((value) => value && value !== customerRef) || customerRef || "Sin cliente";
+}
+
+function stopCustomerName(stop: RouteStop) {
+  return customerNameText(stop.customer_ref, stop.customer_name, stop.address_snapshot);
+}
+
+function deliveryCustomerName(delivery: RoutingDelivery) {
+  return customerNameText(delivery.customer_ref, delivery.customer_name, delivery.address_snapshot);
 }
 
 function stopPosition(stop: RouteStop): [number, number] | null {
@@ -714,6 +730,8 @@ export function RoutePlanningPage() {
               {(deliveriesQuery.data ?? []).map((delivery) => {
                 const position = deliveryPosition(delivery);
                 const selected = selectedIds.includes(delivery.id);
+                const customerName = deliveryCustomerName(delivery);
+                const address = deliveryAddressText(delivery);
                 return (
                   <button
                     key={delivery.id}
@@ -727,10 +745,14 @@ export function RoutePlanningPage() {
                     <div className="flex items-start justify-between gap-2">
                       <div className="min-w-0">
                         <div className="truncate font-mono text-[12px] font-semibold text-night">{delivery.delivery_number}</div>
-                        <div className="mt-1 truncate text-[11px] text-secondaryText">{delivery.customer_ref}</div>
+                        <div className="mt-1 truncate text-[11px] text-secondaryText">
+                          Pedido {delivery.sales_order_number || "sin pedido"}
+                        </div>
                       </div>
                       <StatusBadge label={position ? "ubicada" : "sin coord."} tone={position ? "success" : "danger"} />
                     </div>
+                    <div className="mt-2 truncate text-[11px] font-semibold text-night">{customerName}</div>
+                    <div className="mt-0.5 text-[11px] leading-snug text-secondaryText">{address || "Sin direccion"}</div>
                     <div className="mt-2 flex gap-2 font-mono text-[11px] text-secondaryText">
                       <span>{formatNumber(delivery.planned_weight_kg)} kg</span>
                       <span>{formatNumber(delivery.planned_volume_m3, 4)} m3</span>

@@ -239,6 +239,8 @@ class RouteExecutionFlowTests(TestCase):
         pending = pending_reparto_deliveries(warehouse_ref="W001", planned_date=timezone.localdate())
         self.assertEqual([row["delivery_number"] for row in pending], ["DEL-R-1"])
         self.assertEqual(pending[0]["status"], DeliveryOrder.DeliveryStatus.CONFIRMED)
+        self.assertEqual(pending[0]["sales_order_number"], "SO-R-1")
+        self.assertEqual(pending[0]["customer_name"], "Cliente Uno")
 
         route = optimize_route(
             payload={

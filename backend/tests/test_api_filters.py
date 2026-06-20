@@ -13,7 +13,13 @@ from django.contrib.auth import get_user_model
 from django.test import TestCase
 from django.utils import timezone
 
-from apps.fulfillment.models import DeliveryOrder, DeliveryPreparationTask, FulfillmentOrder
+from apps.fulfillment.models import (
+    DeliveryOrder,
+    DeliveryPreparationTask,
+    FulfillmentOrder,
+    FulfillmentOrderImpact,
+    FulfillmentOrderImpactLine,
+)
 from apps.inventory.models import (
     InventoryBalance,
     InventoryLedgerEntry,
@@ -764,6 +770,58 @@ class ApiFilterTests(TestCase):
             )
 
         refresh_impacts.assert_called_once()
+        self.assertEqual(results, [])
+
+    @patch("apps.fulfillment.api.employee_delivery_permissions")
+    def test_reparto_confirmation_queue_excludes_fully_returned_uncreated_fulfillment(self, employee_delivery_permissions):
+        employee_delivery_permissions.return_value = {"authorized_warehouses": ["WH-A"]}
+        planned_date = timezone.localdate()
+        fulfillment = FulfillmentOrder.objects.create(
+            fulfillment_number="FUL-103",
+            customer_ref="CUST-1",
+            delivery_mode="Repart Prg",
+            warehouse_ref="WH-A",
+            requested_date=planned_date,
+            legacy_sales_order_number="VENT8-103",
+        )
+        line = fulfillment.lines.create(
+            ordered_qty=Decimal("1"),
+            uom="UN",
+            item_ref="ITEM-1",
+            warehouse_ref="WH-A",
+            legacy_sales_order_number="VENT8-103",
+            legacy_line_id="10",
+        )
+        impact = FulfillmentOrderImpact.objects.create(
+            fulfillment=fulfillment,
+            impact_type=FulfillmentOrderImpact.ImpactType.RETURN,
+            status=FulfillmentOrderImpact.ImpactStatus.APPLIED,
+            impact_sales_order_number="DEV-103",
+            legacy_sales_order_number="VENT8-103",
+            warehouse_ref="WH-A",
+            source_table="transactions_orders_transaction",
+            source_pk="DEV-103",
+        )
+        FulfillmentOrderImpactLine.objects.create(
+            impact=impact,
+            fulfillment_line=line,
+            item_ref="ITEM-1",
+            warehouse_ref="WH-A",
+            legacy_sales_order_number="VENT8-103",
+            legacy_line_id="10",
+            source_table="transactions_orders_retailLineItem",
+            source_pk="DEV-103-L1",
+            quantity=Decimal("1"),
+            applied_qty=Decimal("1"),
+            uom="UN",
+        )
+
+        with patch("apps.fulfillment.api.refresh_legacy_impacts_for_fulfillments", return_value=0):
+            results = self._results(
+                "/api/v1/fulfillment/reparto-confirmation/",
+                {"planned_date": planned_date.isoformat()},
+            )
+
         self.assertEqual(results, [])
 
     @patch("apps.fulfillment.api.employee_delivery_permissions")
